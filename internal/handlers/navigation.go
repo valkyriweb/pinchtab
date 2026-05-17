@@ -578,6 +578,13 @@ func (h *Handlers) runNavigate(w http.ResponseWriter, r *http.Request, ex navExe
 	}
 	h.recordResolvedURL(r, navURL)
 
+	// F3 (SMI-81 hardening): snapshot the open-tab list to
+	// <profileDir>/tabs.json so pod rolls can restore it. Best-effort:
+	// failures here never affect the nav response. Every navigate path
+	// funnels through runNavigate, so this one call covers new and
+	// existing tabs.
+	h.persistTabStateAfterNav()
+
 	httpx.JSON(w, 200, navResponse(ex.tabID, navURL, title, route, !ex.isNewTab))
 }
 
