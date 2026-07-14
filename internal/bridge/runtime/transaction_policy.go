@@ -13,7 +13,10 @@ const (
 	transactionPolicyRulesetID   = "pinchtab_transaction_policy"
 	transactionPolicyExtensionID = "amadgaedoaaekpjejecafmbdhacgmlig"
 	transactionPolicyManifestKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuinfEBuVQwc6FKF/tVRTn6rfITooe1jQaIMYk/rTRwYg4Pe1GqvFafjT7ghbL58Tjf55M+VhVhvEMSIzCPzjRfp7m8cUgm8/Qz7b86DRkyBzz+ovEMvtZLtN8f8xLIaR1dWVt++Lti1QOMBDNB6DVdGIDGUJm5xXVWhQTh1pRRBY2Fcbg5BgH4SG8/VAOXbVnXuXvniKf1skZlO3lUZeTVBlF8Rly4Drgep/B5wQEVhIiiomm+LV6saes6nKHbMysFlgfAOxL7wiEt6oqtFvGfh+QiVe8pazpA1N6Xf8Q47ljG2oTEtdGaPouHdOcnNwC0WtZ8p8LfhL7zqVqpCkpQIDAQAB"
-	maxTransactionPolicyRules    = 25000
+	// Chrome accepts at most 1,000 regex rules in one static ruleset. Exceeding
+	// that limit makes Chrome ignore later rules, so reject instead of launching
+	// a partially enforced transaction policy.
+	maxTransactionPolicyRegexRules = 1000
 )
 
 type transactionPolicyManifest struct {
@@ -48,8 +51,10 @@ type dnrAction struct {
 	Type string `json:"type"`
 }
 type dnrCondition struct {
-	RegexFilter              string   `json:"regexFilter"`
+	RegexFilter              string   `json:"regexFilter,omitempty"`
+	URLFilter                string   `json:"urlFilter,omitempty"`
 	IsURLFilterCaseSensitive bool     `json:"isUrlFilterCaseSensitive"`
+	RequestDomains           []string `json:"requestDomains,omitempty"`
 	RequestMethods           []string `json:"requestMethods,omitempty"`
 	ExcludedRequestMethods   []string `json:"excludedRequestMethods,omitempty"`
 }
@@ -94,30 +99,70 @@ func compileTransactionPolicy(policy config.TransactionPolicyConfig) (transactio
 	sort.Strings(hosts)
 	hosts = compactStrings(hosts)
 	manifest := transactionPolicyManifest{ManifestVersion: 3, Name: "PinchTab Transaction Policy", Version: "1.0", Key: transactionPolicyManifestKey, Permissions: []string{"declarativeNetRequest"}, HostPermissions: transactionHostPermissions(hosts), DeclarativeNetRequest: dnrSpec{RuleResources: []dnrResource{{ID: transactionPolicyRulesetID, Enabled: true, Path: "rules.json"}}}, Background: dnrBackground{ServiceWorker: "background.js"}}
-	rules := make([]dnrRule, 0, len(hosts)*(len(policy.DenyRules)+len(policy.AllowRules)+1))
+	rules := make([]dnrRule, 0, len(policy.DenyRules)+len(policy.AllowRules)+1)
 	id := 1
 	appendRules := func(source []config.TransactionPolicyRule, priority int, action string, encodePath bool) error {
+		type group struct {
+			condition dnrCondition
+			wildcard  bool
+			methods   map[string]struct{}
+		}
+		groups := make([]group, 0, len(source))
+		byCondition := make(map[string]int, len(source))
+		domainScoped := action == "block"
+		hostPatterns := []string{"[^/?#]+"}
+		if !domainScoped {
+			hostPatterns = make([]string, len(hosts))
+			for i, host := range hosts {
+				hostPatterns[i] = regexp.QuoteMeta(host)
+			}
+		}
 		for _, rule := range source {
-			for _, host := range hosts {
-				regexes, err := transactionRuleRegexes(host, rule, encodePath)
+			method := strings.ToLower(strings.TrimSpace(rule.Method))
+			for _, pattern := range hostPatterns {
+				conditions, err := transactionRuleConditions(pattern, hosts, rule, encodePath, domainScoped)
 				if err != nil {
 					return err
 				}
-				for _, regex := range regexes {
-					if err := validateDNRRegex(regex); err != nil {
-						return err
+				for _, condition := range conditions {
+					key := condition.RegexFilter + "\x00" + condition.URLFilter + "\x00" + strings.Join(condition.RequestDomains, "\x00")
+					index, ok := byCondition[key]
+					if !ok {
+						index = len(groups)
+						byCondition[key] = index
+						groups = append(groups, group{condition: condition, methods: make(map[string]struct{})})
 					}
-					condition := dnrCondition{RegexFilter: regex, IsURLFilterCaseSensitive: false}
-					if method := strings.ToLower(strings.TrimSpace(rule.Method)); method != "*" {
-						condition.RequestMethods = []string{method}
+					if method == "*" {
+						groups[index].wildcard = true
+					} else {
+						groups[index].methods[method] = struct{}{}
 					}
-					rules = append(rules, dnrRule{ID: id, Priority: priority, Action: dnrAction{Type: action}, Condition: condition})
-					id++
 				}
 			}
 		}
+		for _, group := range groups {
+			condition := group.condition
+			if !group.wildcard {
+				condition.RequestMethods = make([]string, 0, len(group.methods))
+				for method := range group.methods {
+					condition.RequestMethods = append(condition.RequestMethods, method)
+				}
+				sort.Strings(condition.RequestMethods)
+			}
+			rules = append(rules, dnrRule{ID: id, Priority: priority, Action: dnrAction{Type: action}, Condition: condition})
+			id++
+		}
 		return nil
 	}
+	// Unsafe requests with percent escapes are ambiguous at the DNR/raw-URL
+	// boundary. Block them before explicit allows; callers can use canonical raw
+	// unreserved paths/queries and put arbitrary data in the request body.
+	encodedUnsafeRegex := "^(https?|wss?)://([^/?#@]*@)?[^/?#]+(:[0-9]+)?[^#]*%[0-9A-F]{2}"
+	if err := validateDNRRegex(encodedUnsafeRegex); err != nil {
+		return transactionPolicyManifest{}, nil, err
+	}
+	rules = append(rules, dnrRule{ID: id, Priority: 3, Action: dnrAction{Type: "block"}, Condition: dnrCondition{RegexFilter: encodedUnsafeRegex, IsURLFilterCaseSensitive: false, RequestDomains: append([]string(nil), hosts...), RequestMethods: []string{"connect", "delete", "other", "patch", "post", "put"}}})
+	id++
 	// Denies use an encoding-tolerant path representation. This only broadens a
 	// block, never an allow, so URL serialization ambiguities fail closed.
 	if err := appendRules(policy.DenyRules, 3, "block", true); err != nil {
@@ -126,18 +171,28 @@ func compileTransactionPolicy(policy config.TransactionPolicyConfig) (transactio
 	if err := appendRules(policy.AllowRules, 2, "allow", false); err != nil {
 		return transactionPolicyManifest{}, nil, err
 	}
-	for _, host := range hosts {
-		regex := "^(https?|wss?)://([^/?#@]*@)?" + regexp.QuoteMeta(host) + "(\\.)?(:[0-9]+)?(/|$)"
-		if err := validateDNRRegex(regex); err != nil {
-			return transactionPolicyManifest{}, nil, err
-		}
-		rules = append(rules, dnrRule{ID: id, Priority: 1, Action: dnrAction{Type: "block"}, Condition: dnrCondition{RegexFilter: regex, IsURLFilterCaseSensitive: false, ExcludedRequestMethods: []string{"get", "head", "options"}}})
-		id++
+	regex := "^(https?|wss?)://([^/?#@]*@)?[^/?#]+(:[0-9]+)?(/|$)"
+	if err := validateDNRRegex(regex); err != nil {
+		return transactionPolicyManifest{}, nil, err
 	}
-	if len(rules) > maxTransactionPolicyRules {
-		return transactionPolicyManifest{}, nil, fmt.Errorf("policy produces %d rules, maximum is %d", len(rules), maxTransactionPolicyRules)
+	rules = append(rules, dnrRule{ID: id, Priority: 1, Action: dnrAction{Type: "block"}, Condition: dnrCondition{RegexFilter: regex, IsURLFilterCaseSensitive: false, RequestDomains: append([]string(nil), hosts...), ExcludedRequestMethods: []string{"get", "head", "options"}}})
+	if err := validateTransactionPolicyRuleCounts(rules); err != nil {
+		return transactionPolicyManifest{}, nil, err
 	}
 	return manifest, rules, nil
+}
+
+func validateTransactionPolicyRuleCounts(rules []dnrRule) error {
+	regexRules := 0
+	for _, rule := range rules {
+		if rule.Condition.RegexFilter != "" {
+			regexRules++
+		}
+	}
+	if regexRules > maxTransactionPolicyRegexRules {
+		return fmt.Errorf("policy produces %d static regex rules, Chrome maximum is %d", regexRules, maxTransactionPolicyRegexRules)
+	}
+	return nil
 }
 
 func validateDNRRegex(regex string) error {
@@ -159,12 +214,65 @@ func transactionHostPermissions(hosts []string) []string {
 	return permissions
 }
 
-// transactionRuleRegexes describes the raw network URL. Denies get one raw
-// regex plus one variant for each single percent-encoded unreserved byte.
-// Separate simple regexes stay within Chrome DNR's RE2 memory limit; a single
-// regex with an alternation at every byte is rejected for ordinary route names.
-func transactionRuleRegexes(host string, rule config.TransactionPolicyRule, encodePath bool) ([]string, error) {
-	base, positions, err := transactionRuleRegexVariant(host, rule, encodePath, -1)
+func transactionRuleConditions(hostPattern string, hosts []string, rule config.TransactionPolicyRule, encodePath bool, domainScoped bool) ([]dnrCondition, error) {
+	method := strings.ToUpper(strings.TrimSpace(rule.Method))
+	guardedUnsafeMethod := method == "CONNECT" || method == "DELETE" || method == "OTHER" || method == "PATCH" || method == "POST" || method == "PUT"
+	rootSegment := strings.TrimSpace(rule.PathPrefix) == "/" && strings.TrimSpace(rule.PathSegment) != "" && strings.TrimSpace(rule.QueryParam) == ""
+
+	regexEncodePath := encodePath && !guardedUnsafeMethod && !(method == "*" && rootSegment)
+	regexes, err := transactionRuleRegexes(hostPattern, rule, regexEncodePath)
+	if err != nil {
+		return nil, err
+	}
+	conditions := make([]dnrCondition, 0, len(regexes))
+	for _, regex := range regexes {
+		if err := validateDNRRegex(regex); err != nil {
+			return nil, err
+		}
+		condition := dnrCondition{RegexFilter: regex, IsURLFilterCaseSensitive: false}
+		if domainScoped {
+			condition.RequestDomains = append([]string(nil), hosts...)
+		}
+		conditions = append(conditions, condition)
+	}
+	if encodePath && method == "*" && rootSegment {
+		for _, filter := range transactionRuleEncodedSegmentURLFilters(rule) {
+			conditions = append(conditions, dnrCondition{
+				URLFilter:                filter,
+				IsURLFilterCaseSensitive: false,
+				RequestDomains:           append([]string(nil), hosts...),
+			})
+		}
+	}
+	return conditions, nil
+}
+
+func transactionRuleEncodedSegmentURLFilters(rule config.TransactionPolicyRule) []string {
+	segment := strings.TrimSpace(rule.PathSegment)
+	filters := make([]string, 0, len(segment))
+	for position := range len(segment) {
+		var b strings.Builder
+		b.WriteString("*")
+		for index := range len(segment) {
+			if index == position {
+				fmt.Fprintf(&b, "%%%02X", segment[index])
+			} else {
+				b.WriteByte(segment[index])
+			}
+		}
+		b.WriteString("*")
+		filters = append(filters, b.String())
+	}
+	return filters
+}
+
+// transactionRuleRegexes describes the raw network URL. Denies get the raw
+// spelling plus one variant for each single percent-encoded unreserved byte.
+// transactionRuleConditions moves only root-segment wildcard variants into
+// block-only URL filters and relies on the unsafe percent guard for explicit
+// mutation methods, keeping the static regex ruleset below Chrome's hard cap.
+func transactionRuleRegexes(hostPattern string, rule config.TransactionPolicyRule, encodePath bool) ([]string, error) {
+	base, positions, err := transactionRuleRegexVariant(hostPattern, rule, encodePath, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +281,7 @@ func transactionRuleRegexes(host string, rule config.TransactionPolicyRule, enco
 		return regexes, nil
 	}
 	for position := 0; position < positions; position++ {
-		variant, _, err := transactionRuleRegexVariant(host, rule, true, position)
+		variant, _, err := transactionRuleRegexVariant(hostPattern, rule, true, position)
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +290,7 @@ func transactionRuleRegexes(host string, rule config.TransactionPolicyRule, enco
 	return regexes, nil
 }
 
-func transactionRuleRegexVariant(host string, rule config.TransactionPolicyRule, encodePath bool, encodeAt int) (string, int, error) {
+func transactionRuleRegexVariant(hostPattern string, rule config.TransactionPolicyRule, encodePath bool, encodeAt int) (string, int, error) {
 	prefix := strings.TrimSuffix(strings.TrimSpace(rule.PathPrefix), "/")
 	if prefix == "" {
 		prefix = "/"
@@ -197,8 +305,6 @@ func transactionRuleRegexVariant(host string, rule config.TransactionPolicyRule,
 		for i := 0; i < len(value); i++ {
 			c := value[i]
 			if c == '/' {
-				// A run covers the serialized root slash followed by an encoded
-				// separator without adding per-byte regex alternations.
 				b.WriteString("(/|%2F)+")
 				continue
 			}
@@ -241,7 +347,7 @@ func transactionRuleRegexVariant(host string, rule config.TransactionPolicyRule,
 			query = "\\?" + regexp.QuoteMeta(rule.QueryParam) + "=" + regexp.QuoteMeta(rule.QueryValue) + "(#.*)?$"
 		}
 	}
-	regex := "^(https?|wss?)://([^/?#@]*@)?" + regexp.QuoteMeta(host) + "(\\.)?(:[0-9]+)?" + pathPart + query
+	regex := "^(https?|wss?)://([^/?#@]*@)?" + hostPattern + "(\\.)?(:[0-9]+)?" + pathPart + query
 	return regex, position, nil
 }
 func pathPrefixHasSegment(prefix, segment string) bool {
