@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -95,8 +96,33 @@ fetch('/read'); fetch('/read',{method:'HEAD'});
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer allocCancel()
-	defer browserCancel()
+	// Register Chrome teardown via t.Cleanup so it runs in LIFO order relative
+	// to t.TempDir() cleanup: because ProfileDir/StateDir TempDirs were
+	// registered first, this cleanup runs before them, ensuring the browser
+	// process (and its renderer/GPU children) have fully released the profile
+	// directory before the Go test runner tries to RemoveAll it.
+	t.Cleanup(func() {
+		browserCancel()
+		allocCancel()
+		// Chrome's SingletonLock is the last file-system artifact removed by the
+		// browser process on exit.  Poll until it is gone, then allow a short
+		// grace period for any in-flight renderer-process writes to drain.
+		const (
+			shutdownTimeout   = 10 * time.Second
+			pollInterval      = 50 * time.Millisecond
+			rendererGracePeriod = 200 * time.Millisecond
+		)
+		lock := filepath.Join(cfg.ProfileDir, "SingletonLock")
+		deadline := time.Now().Add(shutdownTimeout)
+		for time.Now().Before(deadline) {
+			if _, err := os.Lstat(lock); os.IsNotExist(err) {
+				time.Sleep(rendererGracePeriod)
+				return
+			}
+			time.Sleep(pollInterval)
+		}
+		t.Logf("chrome profile SingletonLock still present after %v; TempDir cleanup may log a spurious RemoveAll warning", shutdownTimeout)
+	})
 	if err := chromedp.Run(browserCtx, chromedp.Navigate(server.URL)); err != nil {
 		t.Fatal(err)
 	}
