@@ -279,7 +279,13 @@ For Linux container compatibility, use the runtime-managed path instead of `brow
 
 `security.transactionPolicy` is an operator-configured, restart-only browser network policy for supplier hosts. On each managed PinchTab launch, PinchTab compiles it into an unpacked Manifest V3 `declarativeNetRequest` extension under `server.stateDir` before Chrome starts. The extension permits GET/HEAD/OPTIONS reads by default (including existing order history, status, and invoices), permits explicit `allowRules` such as cart mutations and login POSTs, and blocks all other methods on listed hosts. `denyRules` take precedence over allows and the default block, and are required for enabled policies; a `method: "*"` deny can block GET navigation too. It covers managed pages, popups, workers, redirects, and WebSocket handshakes at the browser network layer.
 
-Hosts are exact (no subdomain expansion), with the DNS-equivalent trailing-dot spelling covered too. Paths, segments, and query pairs are case-insensitive but deliberately limited to unescaped unreserved ASCII so DNR's raw-URL matching cannot broaden a decoded allow rule. Unsafe query allows match the **entire** query exactly (`?key=value`, with an optional fragment): extra, duplicate, conflicting, or empty parameters do not inherit the allow. A deny query condition matches its exact pair anywhere in the query, including one single percent-encoded unreserved byte per request; extra or conflicting parameters cannot bypass the deny. Deny paths likewise cover one single percent-encoded unreserved byte per request plus encoded separators, which can only broaden a block. The policy is not raw-HTTP protection and does not terminate messages on an already-open allowed WebSocket. Policy changes are saved but take effect only after a full PinchTab restart. Enabled policy requires a PinchTab-managed launch with an explicitly configured Chromium or Chrome for Testing `browser.binary`; attached browsers and Google Chrome Stable are rejected. It also rejects `browser.extensionPaths`: policy mode loads only its generated extension.
+Allows use exact configured hosts, including their DNS-equivalent trailing-dot spelling. Blocks use Chrome's `requestDomains` scope so one compact path regex can cover every configured host; Chrome also applies that deny/default-block scope to subdomains. This fail-closed expansion can block matching requests on a supplier subdomain, but never broadens an allow. Otherwise-identical method rules are combined. Exact-host allows are emitted per host because large host-alternation regexes exceed Chrome's regex memory limit.
+
+Chrome permits at most 1,000 static regex rules. PinchTab counts only rules with `regexFilter`, fails compilation above that limit, then asks the launched Chrome to validate every generated regex and confirms the exact ruleset is enabled with no disabled rules. Paths, segments, and query pairs are case-insensitive and limited to unescaped unreserved ASCII so DNR raw-URL matching cannot broaden a decoded allow. Unsafe query allows match the **entire** query exactly (`?key=value`, with an optional fragment): extra, duplicate, conflicting, or empty parameters do not inherit the allow.
+
+Any percent escape on a configured supplier domain is blocked for `CONNECT`, `DELETE`, `OTHER`, `PATCH`, `POST`, and `PUT` before explicit allows. Callers must use canonical raw paths and queries for mutations and put encoded data in the request body. This guard closes multi-byte encoded mutation bypasses. Wildcard deny query conditions retain raw plus single-byte encoded regex variants. Root-prefix path-segment denies retain an anchored raw regex and use block-only, case-insensitive `urlFilter` conditions for each single encoded segment byte. Those substring filters are scoped with `requestDomains`, but can conservatively block the encoded token elsewhere in a URL or on a subdomain; they never broaden an allow. Safe-method URLs with multiple encoded bytes are outside this mutation guard.
+
+The policy is not raw-HTTP protection and does not terminate messages on an already-open allowed WebSocket. Policy changes are saved but take effect only after a full PinchTab restart. Enabled policy requires a PinchTab-managed launch with an explicitly configured Chromium or Chrome for Testing `browser.binary`; attached browsers and Google Chrome Stable are rejected. It also rejects `browser.extensionPaths`: policy mode loads only its generated extension.
 
 Example suitable for a mounted lue-kube `config.json`:
 
@@ -292,7 +298,16 @@ Example suitable for a mounted lue-kube `config.json`:
       "denyRules": [
         {"method": "*", "pathPrefix": "/", "pathSegment": "checkout"},
         {"method": "*", "pathPrefix": "/", "pathSegment": "payment"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "place"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "buy"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "pay"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "submit"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "confirm"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "reorder"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "amend"},
         {"method": "*", "pathPrefix": "/", "pathSegment": "cancel"},
+        {"method": "POST", "pathPrefix": "/", "pathSegment": "order"},
+        {"method": "POST", "pathPrefix": "/", "pathSegment": "purchase"},
         {"method": "*", "pathPrefix": "/checkout"},
         {"method": "*", "pathPrefix": "/payment"},
         {"method": "POST", "pathPrefix": "/orders/place"},

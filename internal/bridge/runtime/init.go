@@ -343,16 +343,18 @@ func verifyTransactionPolicyExtension(browserCtx context.Context) error {
 	}
 	const probe = `(async () => {
 		const rules = await (await fetch(chrome.runtime.getURL('rules.json'), {cache: 'no-store'})).json();
-		const support = await Promise.all(rules.map(async rule => ({
-			id: rule.id,
-			result: await chrome.declarativeNetRequest.isRegexSupported({
+		const regexRules = rules.filter(rule => typeof rule.condition.regexFilter === 'string');
+		const unsupported = [];
+		for (const rule of regexRules) {
+			const result = await chrome.declarativeNetRequest.isRegexSupported({
 				regex: rule.condition.regexFilter,
 				isCaseSensitive: rule.condition.isUrlFilterCaseSensitive
-			})
-		})));
+			});
+			if (!result.isSupported) unsupported.push(rule.id);
+		}
 		return {
 			enabled: Array.from(await chrome.declarativeNetRequest.getEnabledRulesets()),
-			unsupported: support.filter(item => !item.result.isSupported).map(item => item.id),
+			unsupported,
 			disabled: Array.from(await chrome.declarativeNetRequest.getDisabledRuleIds({rulesetId: 'pinchtab_transaction_policy'})),
 			ruleCount: rules.length
 		};

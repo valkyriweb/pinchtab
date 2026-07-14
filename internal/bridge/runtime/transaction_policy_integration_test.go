@@ -33,10 +33,13 @@ func TestTransactionPolicyDNRIntegration(t *testing.T) {
 	}
 	var mu sync.Mutex
 	counts := map[string]int{}
+	methodCounts := map[string]int{}
 	count := func(path string) int { mu.Lock(); defer mu.Unlock(); return counts[path] }
+	methodCount := func(method, path string) int { mu.Lock(); defer mu.Unlock(); return methodCounts[method+" "+path] }
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		counts[r.URL.Path]++
+		methodCounts[r.Method+" "+r.URL.Path]++
 		mu.Unlock()
 		switch r.URL.Path {
 		case "/worker.js":
@@ -78,16 +81,18 @@ new Worker('/worker.js'); new SharedWorker('/shared-worker.js'); navigator.servi
 fetch('/redirect',{method:'POST'}).catch(()=>{});
 new WebSocket(location.origin.replace(/^http/,'ws')+'/ws-forbidden'); new WebSocket(location.origin.replace(/^http/,'ws')+'/ws-allowed');
 fetch('/cart/add',{method:'POST'}); fetch('/cart/update',{method:'POST'}); fetch('/cart/remove',{method:'POST'});
+fetch('/orders'); fetch('/orders',{method:'POST'}); fetch('/orders/%6F%72der',{method:'POST'});
+fetch('/cart/preparation',{method:'POST'}); fetch('/cart/123/order',{method:'POST'}); fetch('/cart/123/%6Frder',{method:'POST'}); fetch('/cart/123/%6F%72der',{method:'POST'}); fetch('/cart/123/%2Forder',{method:'POST'}); fetch('/cart/preorder',{method:'POST'});
 fetch('/checkout',{method:'POST'}); fetch('/chec%6bout',{method:'POST'});
-const trailing = location.origin.replace('//127.0.0.1:', '//127.0.0.1.:'); fetch(trailing+'/trailing-read'); fetch(trailing+'/trailing-forbidden',{method:'POST'});
+const trailing = location.origin.replace('//127.0.0.1:', '//127.0.0.1.:'); fetch(trailing+'/trailing-read'); fetch(trailing+'/trailing-forbidden',{method:'POST'}); fetch(trailing+'/ord%65r',{method:'POST'}); fetch(trailing+'/%6F%72der',{method:'POST'});
 fetch('/?wc-ajax=add_to_cart',{method:'POST'}); fetch('/?wc-ajax=add_to_cart&action=checkout',{method:'POST'});
-fetch('/?action=checkout'); fetch('/?%61ction=checkout'); fetch('/?action=%63heckout'); fetch('/?action=cart');
+fetch('/?action=checkout'); fetch('/?%61ction=checkout'); fetch('/?action=%63heckout'); fetch('/?%61%63tion=checkout',{method:'POST'}); fetch('/?action=cart');
 fetch('/read'); fetch('/read',{method:'HEAD'});
 </script>`))
 		}
 	}))
 	defer server.Close()
-	cfg := &config.RuntimeConfig{StateDir: t.TempDir(), ProfileDir: t.TempDir(), ChromeBinary: binary, Headless: true, TransactionPolicy: config.TransactionPolicyConfig{Enabled: true, Hosts: []string{"127.0.0.1"}, DenyRules: []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/page-forbidden"}, {Method: "*", PathPrefix: "/form-forbidden"}, {Method: "*", PathPrefix: "/popup-initial-forbidden"}, {Method: "*", PathPrefix: "/worker-forbidden"}, {Method: "*", PathPrefix: "/shared-worker-forbidden"}, {Method: "*", PathPrefix: "/service-worker-forbidden"}, {Method: "*", PathPrefix: "/redirect-forbidden"}, {Method: "*", PathPrefix: "/ws-forbidden"}, {Method: "*", PathPrefix: "/checkout"}, {Method: "*", PathPrefix: "/trailing-forbidden"}, {Method: "*", PathPrefix: "/", QueryParam: "action", QueryValue: "checkout"}}, AllowRules: []config.TransactionPolicyRule{{Method: "POST", PathPrefix: "/cart"}, {Method: "POST", PathPrefix: "/redirect"}, {Method: "*", PathPrefix: "/ws-allowed"}, {Method: "POST", PathPrefix: "/checkout"}, {Method: "POST", PathPrefix: "/", QueryParam: "wc-ajax", QueryValue: "add_to_cart"}}}}
+	cfg := &config.RuntimeConfig{StateDir: t.TempDir(), ProfileDir: t.TempDir(), ChromeBinary: binary, Headless: true, TransactionPolicy: config.TransactionPolicyConfig{Enabled: true, Hosts: []string{"127.0.0.1"}, DenyRules: []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/page-forbidden"}, {Method: "*", PathPrefix: "/form-forbidden"}, {Method: "*", PathPrefix: "/popup-initial-forbidden"}, {Method: "*", PathPrefix: "/worker-forbidden"}, {Method: "*", PathPrefix: "/shared-worker-forbidden"}, {Method: "*", PathPrefix: "/service-worker-forbidden"}, {Method: "*", PathPrefix: "/redirect-forbidden"}, {Method: "*", PathPrefix: "/ws-forbidden"}, {Method: "*", PathPrefix: "/checkout"}, {Method: "*", PathPrefix: "/trailing-forbidden"}, {Method: "POST", PathPrefix: "/orders"}, {Method: "POST", PathPrefix: "/", PathSegment: "order"}, {Method: "*", PathPrefix: "/", QueryParam: "action", QueryValue: "checkout"}}, AllowRules: []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/cart"}, {Method: "POST", PathPrefix: "/redirect"}, {Method: "*", PathPrefix: "/ws-allowed"}, {Method: "POST", PathPrefix: "/checkout"}, {Method: "POST", PathPrefix: "/", QueryParam: "wc-ajax", QueryValue: "add_to_cart"}}}}
 	launch, err := PrepareTransactionPolicyExtension(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -108,8 +113,8 @@ fetch('/read'); fetch('/read',{method:'HEAD'});
 		// browser process on exit.  Poll until it is gone, then allow a short
 		// grace period for any in-flight renderer-process writes to drain.
 		const (
-			shutdownTimeout   = 10 * time.Second
-			pollInterval      = 50 * time.Millisecond
+			shutdownTimeout     = 10 * time.Second
+			pollInterval        = 50 * time.Millisecond
 			rendererGracePeriod = 200 * time.Millisecond
 		)
 		lock := filepath.Join(cfg.ProfileDir, "SingletonLock")
@@ -126,7 +131,7 @@ fetch('/read'); fetch('/read',{method:'HEAD'});
 	if err := chromedp.Run(browserCtx, chromedp.Navigate(server.URL)); err != nil {
 		t.Fatal(err)
 	}
-	need := []string{"/", "/trailing-read", "/cart/add", "/cart/update", "/cart/remove", "/redirect", "/worker.js", "/worker-ran", "/shared-worker.js", "/shared-worker-ran", "/service-worker.js", "/service-worker-ran", "/page-ran", "/form-ran", "/ws-allowed"}
+	need := []string{"/", "/trailing-read", "/orders", "/cart/add", "/cart/update", "/cart/remove", "/cart/preparation", "/cart/preorder", "/redirect", "/worker.js", "/worker-ran", "/shared-worker.js", "/shared-worker-ran", "/service-worker.js", "/service-worker-ran", "/page-ran", "/form-ran", "/ws-allowed"}
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		ready := true
@@ -141,7 +146,7 @@ fetch('/read'); fetch('/read',{method:'HEAD'});
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	for _, path := range []string{"/page-forbidden", "/form-forbidden", "/popup-initial-forbidden", "/worker-forbidden", "/shared-worker-forbidden", "/service-worker-forbidden", "/redirect-forbidden", "/ws-forbidden", "/checkout", "/trailing-forbidden"} {
+	for _, path := range []string{"/page-forbidden", "/form-forbidden", "/popup-initial-forbidden", "/worker-forbidden", "/shared-worker-forbidden", "/service-worker-forbidden", "/redirect-forbidden", "/ws-forbidden", "/checkout", "/trailing-forbidden", "/cart/123/order"} {
 		if got := count(path); got != 0 {
 			t.Errorf("forbidden request %s reached fixture %d times", path, got)
 		}
@@ -156,6 +161,22 @@ fetch('/read'); fetch('/read',{method:'HEAD'});
 	}
 	if got := count("/read"); got < 2 {
 		t.Errorf("allowed GET/HEAD reads did not reach fixture twice: %d", got)
+	}
+	if got := methodCount(http.MethodGet, "/orders"); got != 1 {
+		t.Errorf("GET /orders did not reach fixture exactly once: %d", got)
+	}
+	if got := methodCount(http.MethodPost, "/orders"); got != 0 {
+		t.Errorf("POST /orders reached fixture despite deny: %d", got)
+	}
+	for _, path := range []string{"/cart/123/order", "/cart/123//order", "/order"} {
+		if got := methodCount(http.MethodPost, path); got != 0 {
+			t.Errorf("POST %s reached fixture despite raw/encoded order deny: %d", path, got)
+		}
+	}
+	for _, path := range []string{"/cart/preparation", "/cart/preorder"} {
+		if got := methodCount(http.MethodPost, path); got != 1 {
+			t.Errorf("allowed POST %s did not reach fixture exactly once: %d", path, got)
+		}
 	}
 	if t.Failed() {
 		mu.Lock()
