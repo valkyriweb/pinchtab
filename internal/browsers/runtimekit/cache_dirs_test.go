@@ -52,3 +52,20 @@ func TestLaunchConfigCarriesCacheFlags(t *testing.T) {
 		t.Fatalf("launch config missing per-instance cache dir: %v", launch.ExtraFlags)
 	}
 }
+
+func TestInstanceCacheDirMatchesLaunchFlag(t *testing.T) {
+	const base = "/cache"
+	const profile = "/data/pinchtab-profiles/prof_3807ed40"
+
+	flags := browserCacheFlags(base, profile)
+	if len(flags) == 0 {
+		t.Fatal("expected cache flags")
+	}
+	wantFlag := "--disk-cache-dir=" + InstanceCacheDir(base, profile)
+	if flags[0] != wantFlag {
+		t.Fatalf("disk cache flag = %q, want %q", flags[0], wantFlag)
+	}
+	if got := InstanceCacheDir("", profile); got != "" {
+		t.Fatalf("InstanceCacheDir with no base = %q, want empty", got)
+	}
+}

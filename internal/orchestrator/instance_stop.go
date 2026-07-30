@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pinchtab/pinchtab/internal/browsers/providerhooks"
+	"github.com/pinchtab/pinchtab/internal/browsers/runtimekit"
 	"github.com/pinchtab/pinchtab/internal/config"
 )
 
@@ -184,9 +185,9 @@ func (o *Orchestrator) cleanupStoppedProfile(profileName, browser string) {
 		browser = config.BrowserChrome
 	}
 	providerhooks.CleanupProfile(browser, profilePath)
+	o.removeInstanceCacheDir(profileName)
 
 	if strings.HasPrefix(profileName, "instance-") {
-		profilePath := filepath.Join(o.baseDir, profileName)
 		if err := os.RemoveAll(profilePath); err != nil {
 			slog.Warn("failed to delete temporary profile directory", "name", profileName, "err", err)
 		} else {
@@ -254,5 +255,35 @@ func (o *Orchestrator) ForceShutdown() {
 			_ = killProcessGroup(pid, sigKILL)
 		}
 		o.markStopped(inst.ID)
+	}
+}
+
+// removeInstanceCacheDir deletes the browser cache this profile was using.
+// browser.cacheBaseDir points at a size-limited node-local volume that nothing
+// else prunes, so a cache left behind by a stopped instance is never reclaimed
+// and kubelet eventually evicts the pod.
+// resolveProfilePath returns the directory a profile actually launched from,
+// the same way instance launch resolves it. Named profiles live in prof_<id>
+// directories, so the cache key derived from baseDir+name would not match the
+// one the browser was started with.
+func (o *Orchestrator) resolveProfilePath(profileName string) string {
+	if o.profiles != nil {
+		if resolved, err := o.profiles.ProfilePath(profileName); err == nil {
+			return resolved
+		}
+	}
+	return filepath.Join(o.baseDir, profileName)
+}
+
+func (o *Orchestrator) removeInstanceCacheDir(profileName string) {
+	if o == nil || o.runtimeCfg == nil {
+		return
+	}
+	dir := runtimekit.InstanceCacheDir(o.runtimeCfg.BrowserCacheBaseDir, o.resolveProfilePath(profileName))
+	if dir == "" {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Warn("failed to remove instance cache dir", "dir", dir, "err", err)
 	}
 }

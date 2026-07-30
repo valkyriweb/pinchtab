@@ -478,7 +478,8 @@ every concurrent instance on one cache.
 
 Size the target volume for the number of concurrent instances: caches are capped
 per instance by `--disk-cache-size`/`--media-cache-size` in `browser.extraFlags`,
-not globally.
+not globally. Stopping an instance removes its cache directory, so the base only
+holds caches for instances that currently exist.
 
 By default, PinchTab looks for unpacked Chrome extensions in `<server.stateDir>/extensions`. On a normal local install that means the OS-specific PinchTab config directory plus `extensions/`, for example:
 

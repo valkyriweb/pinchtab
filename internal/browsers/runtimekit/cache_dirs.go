@@ -21,11 +21,23 @@ func browserCacheFlags(cacheBaseDir, profileDir string) []string {
 	if base == "" {
 		return nil
 	}
-	instanceDir := filepath.Join(base, instanceCacheKey(profileDir))
+	instanceDir := InstanceCacheDir(base, profileDir)
 	return []string{
 		"--disk-cache-dir=" + instanceDir,
 		"--media-cache-dir=" + filepath.Join(instanceDir, "media"),
 	}
+}
+
+// InstanceCacheDir returns the cache directory an instance with this profile
+// path will use, or "" when no cache base is configured. Callers that tear an
+// instance down use it to remove the cache with the instance: nothing else
+// prunes the base directory, and it lives on a size-limited volume.
+func InstanceCacheDir(cacheBaseDir, profileDir string) string {
+	base := strings.TrimSpace(cacheBaseDir)
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, instanceCacheKey(profileDir))
 }
 
 // instanceCacheKey derives a stable, filesystem-safe directory name from the
