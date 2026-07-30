@@ -234,6 +234,7 @@ func (fc FileConfig) MarshalJSON() ([]byte, error) {
 				AllowSchemes:     copyStringSlice(fc.Security.Attach.AllowSchemes),
 				ForwardProxyAuth: fc.Security.Attach.ForwardProxyAuth,
 			},
+			TransactionPolicy: fc.Security.TransactionPolicy,
 			IDPI: idpiConfigJSON{
 				Enabled:         fc.Security.IDPI.Enabled,
 				StrictMode:      fc.Security.IDPI.StrictMode,
@@ -513,7 +514,8 @@ func FileConfigFromRuntime(cfg *RuntimeConfig) FileConfig {
 				AllowSchemes:     append([]string(nil), cfg.AttachAllowSchemes...),
 				ForwardProxyAuth: &attachForwardProxyAuth,
 			},
-			IDPI: cfg.IDPI,
+			IDPI:              cfg.IDPI,
+			TransactionPolicy: cfg.TransactionPolicy,
 		},
 		Profiles: ProfilesConfig{
 			BaseDir:        cfg.ProfilesBaseDir,

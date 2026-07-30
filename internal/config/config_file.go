@@ -208,6 +208,7 @@ func DefaultFileConfig() FileConfig {
 				AllowSchemes:     []string{"ws", "wss", "http", "https"},
 				ForwardProxyAuth: &attachForwardProxyAuth,
 			},
+			TransactionPolicy: TransactionPolicyConfig{Enabled: false, Hosts: []string{}, DenyRules: []TransactionPolicyRule{}, AllowRules: []TransactionPolicyRule{}},
 			IDPI: IDPIConfig{
 				Enabled:        true,
 				StrictMode:     true,

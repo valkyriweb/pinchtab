@@ -87,6 +87,12 @@ func (c *ConfigAPI) restartReasonsFor(next config.FileConfig) []string {
 	if !reflect.DeepEqual(c.boot.Security, next.Security) {
 		reasons = append(reasons, "Security policy")
 	}
+	// Named separately from the generic security reason: the transaction policy
+	// is compiled into a browser extension at launch, so an edit here is inert
+	// until restart even though the file on disk says otherwise.
+	if !reflect.DeepEqual(c.boot.Security.TransactionPolicy, next.Security.TransactionPolicy) {
+		reasons = append(reasons, "Transaction policy")
+	}
 	if c.boot.Server.Port != next.Server.Port || c.boot.Server.Bind != next.Server.Bind {
 		reasons = append(reasons, "Server address")
 	}

@@ -23,6 +23,10 @@ import (
 // bridge in place (upsert). Non-bridge duplicates still return an error.
 func (o *Orchestrator) attachExternalInstance(name string, inst bridge.Instance, authToken string) (*bridge.Instance, bool, error) {
 	o.mu.Lock()
+	if o.runtimeCfg != nil && o.runtimeCfg.TransactionPolicy.Enabled {
+		o.mu.Unlock()
+		return nil, false, fmt.Errorf("transaction policy requires a PinchTab-managed browser launch; attached browsers are not protected")
+	}
 	for _, existing := range o.instances {
 		if existing.ProfileName == name && instanceIsActive(existing) {
 			if existing.Attached && inst.AttachType == "bridge" && existing.AttachType == "bridge" {
@@ -82,6 +86,14 @@ func (o *Orchestrator) AttachWithProvider(name, cdpURL, provider string) (*bridg
 }
 
 func (o *Orchestrator) AttachWithOptions(name, cdpURL string, opts AttachOptions) (*bridge.Instance, error) {
+	// Checked ahead of the attach toggle so the refusal names the policy, which
+	// is the reason the answer can never become yes while it is enabled.
+	o.mu.RLock()
+	policyEnabled := o.runtimeCfg != nil && o.runtimeCfg.TransactionPolicy.Enabled
+	o.mu.RUnlock()
+	if policyEnabled {
+		return nil, fmt.Errorf("transaction policy requires a PinchTab-managed browser launch; attached browsers are not protected")
+	}
 	if err := profiles.ValidateProfileName(name); err != nil {
 		return nil, err
 	}

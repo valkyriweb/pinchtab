@@ -288,8 +288,18 @@ func LoadConfig() (*RuntimeConfig, []LoadDiagnostic, error) {
 	if res.UnknownFields != nil {
 		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config has unrecognized fields that will be ignored", []any{"path", res.Path, "error", res.UnknownFields}})
 	}
+	// A transaction policy must never start partially configured: a guard that
+	// silently degrades is worse than no guard. Unrelated validation errors stay
+	// non-fatal warnings.
+	invalidTransactionPolicy := false
 	for _, e := range res.ValidationErrs {
 		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config validation error", []any{"path", res.Path, "error", e}})
+		if validationErr, ok := e.(ValidationError); ok && strings.HasPrefix(validationErr.Field, "security.transactionPolicy") {
+			invalidTransactionPolicy = true
+		}
+	}
+	if invalidTransactionPolicy {
+		return cfg, diags, fmt.Errorf("invalid security.transactionPolicy in %s", res.Path)
 	}
 
 	applyFileConfig(cfg, res.FC)
@@ -432,6 +442,7 @@ func applyFileConfig(cfg *RuntimeConfig, fc *FileConfig) {
 		cfg.TrustLoopbackProxy = *fc.Security.TrustLoopbackProxy
 	}
 	// IDPI – copy the whole struct; individual fields have safe zero-value defaults.
+	cfg.TransactionPolicy = fc.Security.TransactionPolicy
 	cfg.IDPI = fc.Security.IDPI
 	cfg.AllowedDomains = effectiveSecurityAllowedDomains(fc.Security)
 	if fc.Observability.Activity.Enabled != nil {
@@ -796,7 +807,11 @@ func ApplyFileConfigToRuntime(cfg *RuntimeConfig, fc *FileConfig) {
 		return
 	}
 
+	// Transaction policy is restart-only. The configuration API may persist it,
+	// but must not turn a network guard on or off in a running process.
+	transactionPolicy := cfg.TransactionPolicy
 	applyFileConfig(cfg, fc)
+	cfg.TransactionPolicy = transactionPolicy
 	finalizeProfileConfig(cfg)
 }
 
