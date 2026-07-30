@@ -271,6 +271,13 @@ func (b *Bridge) EnsureBrowser(cfg *config.RuntimeConfig) error {
 		}
 	}
 
+	// Generating the policy extension rewrites ExtensionPaths, so launch from the
+	// returned config rather than the caller's.
+	cfg, err := bridgeruntime.PrepareTransactionPolicyExtension(cfg)
+	if err != nil {
+		return fmt.Errorf("prepare transaction policy: %w", err)
+	}
+
 	slog.Info("starting browser with confirmed profile", "headless", cfg.Headless, "profile", cfg.ProfileDir)
 	b.ensureStealthBundle()
 	allocCtx, allocCancel, browserCtx, browserCancel, launchMode, err := InitBrowser(cfg, b.StealthBundle)

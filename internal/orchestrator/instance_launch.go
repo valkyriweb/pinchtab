@@ -23,6 +23,12 @@ func (o *Orchestrator) Launch(name, port string, headless bool, extensionPaths [
 }
 
 func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts LaunchOptions) (*bridge.Instance, error) {
+	o.mu.RLock()
+	policyEnabled := o.runtimeCfg != nil && o.runtimeCfg.TransactionPolicy.Enabled
+	o.mu.RUnlock()
+	if policyEnabled && len(opts.ExtensionPaths) > 0 {
+		return nil, fmt.Errorf("request-supplied extensionPaths are not allowed while transaction policy is enabled")
+	}
 	// Validate profile name to prevent path traversal attacks
 	if err := profiles.ValidateProfileName(name); err != nil {
 		return nil, err

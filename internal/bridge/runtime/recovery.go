@@ -141,6 +141,11 @@ func shouldRetryBrowserStartupWithDirectLaunch(parentCtx context.Context, err er
 }
 
 func startBrowserWithRemoteAllocator(parentCtx context.Context, cfg *config.RuntimeConfig, bundle *stealth.Bundle, debugPort int, injectedStealthScript string, geoAlignment launchGeoAlignment) (context.Context, context.CancelFunc, stealth.LaunchMode, error) {
+	// The direct fallback launches the browser itself, so it must re-run the
+	// same guard as the primary path instead of inheriting its result.
+	if err := validateTransactionPolicyLaunch(cfg); err != nil {
+		return nil, nil, stealth.LaunchModeUninitialized, err
+	}
 	plan, err := resolveProviderLaunchPlan(cfg, providerLaunchConfig(cfg, strings.TrimSpace(cfg.BrowserBinary), debugPort))
 	if err != nil {
 		return nil, nil, stealth.LaunchModeUninitialized, err
@@ -198,6 +203,15 @@ func startBrowserWithRemoteAllocator(parentCtx context.Context, cfg *config.Runt
 		remoteAllocCancel()
 		killAndReap()
 		return nil, nil, stealth.LaunchModeUninitialized, fmt.Errorf("failed to connect/inject via remote: %w", err)
+	}
+
+	if cfg.TransactionPolicy.Enabled {
+		if err := verifyTransactionPolicyExtension(browserCtx); err != nil {
+			browserCancel()
+			remoteAllocCancel()
+			killAndReap()
+			return nil, nil, stealth.LaunchModeUninitialized, fmt.Errorf("transaction policy extension did not activate: %w", err)
+		}
 	}
 
 	return browserCtx, func() {

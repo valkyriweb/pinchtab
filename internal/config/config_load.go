@@ -332,8 +332,15 @@ func LoadConfig() (*RuntimeConfig, []LoadDiagnostic, error) {
 	if res.UnknownFields != nil {
 		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config has unrecognized fields that will be ignored", []any{"path", res.Path, "error", res.UnknownFields}})
 	}
+	invalidTransactionPolicy := false
 	for _, e := range res.ValidationErrs {
 		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config validation error", []any{"path", res.Path, "error", e}})
+		if validationErr, ok := e.(ValidationError); ok && strings.HasPrefix(validationErr.Field, "security.transactionPolicy") {
+			invalidTransactionPolicy = true
+		}
+	}
+	if invalidTransactionPolicy {
+		return cfg, diags, fmt.Errorf("invalid security.transactionPolicy in %s", res.Path)
 	}
 	// Reported at load like the rest, but from the non-gating list: the file says
 	// something inert, which is worth knowing and is nobody's blocker.
@@ -499,6 +506,7 @@ func applySecurityConfig(cfg *RuntimeConfig, s SecurityConfig) {
 	if s.TrustLoopbackProxy != nil {
 		cfg.TrustLoopbackProxy = *s.TrustLoopbackProxy
 	}
+	cfg.TransactionPolicy = s.TransactionPolicy
 	cfg.IDPI = s.IDPI
 	cfg.AllowedDomains = effectiveSecurityAllowedDomains(s)
 	if s.Attach.Enabled != nil {
@@ -871,7 +879,9 @@ func ApplyFileConfigToRuntime(cfg *RuntimeConfig, fc *FileConfig) {
 		return
 	}
 
+	transactionPolicy := cfg.TransactionPolicy
 	EmitLoadDiagnostics(applyFileConfig(cfg, fc))
+	cfg.TransactionPolicy = transactionPolicy
 	finalizeProfileConfig(cfg)
 }
 

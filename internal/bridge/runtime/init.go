@@ -56,7 +56,13 @@ type Hooks struct {
 // allocator + browser context; the external browser process is left alive.
 func InitBrowser(cfg *config.RuntimeConfig, bundle *stealth.Bundle, hooks Hooks) (context.Context, context.CancelFunc, context.Context, context.CancelFunc, stealth.LaunchMode, error) {
 	if cfg != nil && strings.TrimSpace(cfg.CDPAttachURL) != "" {
+		if cfg.TransactionPolicy.Enabled {
+			return nil, nil, nil, nil, stealth.LaunchModeUninitialized, fmt.Errorf("transaction policy requires a PinchTab-managed browser launch; attached browsers cannot load the required extension")
+		}
 		return initBrowserFromExistingCDP(cfg, bundle)
+	}
+	if err := validateTransactionPolicyLaunch(cfg); err != nil {
+		return nil, nil, nil, nil, stealth.LaunchModeUninitialized, err
 	}
 
 	launchCfg, effective := effectiveLaunchTarget(cfg)
@@ -92,6 +98,14 @@ func InitBrowser(cfg *config.RuntimeConfig, bundle *stealth.Bundle, hooks Hooks)
 	// domain fallback for browsers without CapRuntimeConsoleEvents — can reach
 	// the launched browser.
 	cfg.BrowserDebugPort = debugPort
+
+	if launchCfg.TransactionPolicy.Enabled {
+		if err := verifyTransactionPolicyExtension(browserCtx); err != nil {
+			browserCancel()
+			allocCancel()
+			return nil, nil, nil, nil, stealth.LaunchModeUninitialized, fmt.Errorf("transaction policy extension did not activate: %w", err)
+		}
+	}
 
 	if ProxyAuthEnabled(launchCfg.Proxy) {
 		if err := EnableProxyAuth(browserCtx, launchCfg.Proxy, nil); err != nil {
@@ -146,6 +160,12 @@ func ensureStealthBundle(cfg *config.RuntimeConfig, bundle *stealth.Bundle) *ste
 }
 
 func setupAllocator(cfg *config.RuntimeConfig, binary string, bundle *stealth.Bundle, hooks Hooks, geoAlignment launchGeoAlignment) (context.Context, context.CancelFunc, []chromedp.ExecAllocatorOption, int, error) {
+	// Recheck immediately before building allocator arguments. If the generated
+	// directory vanished after the first check, do not silently launch with
+	// profile extensions or an unprotected browser.
+	if err := validateTransactionPolicyLaunch(cfg); err != nil {
+		return nil, nil, nil, 0, err
+	}
 	opts := []chromedp.ExecAllocatorOption{
 		chromedp.NoFirstRun,
 		chromedp.NoDefaultBrowserCheck,
