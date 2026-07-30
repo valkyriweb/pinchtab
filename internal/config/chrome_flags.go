@@ -5,6 +5,17 @@ import (
 	"strings"
 )
 
+// chromeNoSandboxEnvVar opts a runtime into --no-sandbox when container
+// detection cannot see it. PinchTab infers "in a container" from /.dockerenv,
+// which containerd/CRI-O runtimes (k3s, Kubernetes) never create, so a
+// non-root browser there would launch with a sandbox it cannot use.
+const chromeNoSandboxEnvVar = "PINCHTAB_CHROME_NO_SANDBOX"
+
+// ChromeNoSandboxEnvVar is the env var that forces the browser sandbox off.
+func ChromeNoSandboxEnvVar() string {
+	return chromeNoSandboxEnvVar
+}
+
 // AllowedBrowserExtraFlags returns the subset of browser.extraFlags that are
 // allowed to reach the browser process after security and ownership checks.
 func AllowedBrowserExtraFlags(raw string) []string {
