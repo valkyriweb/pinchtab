@@ -195,6 +195,7 @@ Current nested file-config shape:
     "binary": "/path/to/chrome",
     "remoteDebuggingPort": null,
     "extraFlags": "--disable-gpu",
+    "cacheBaseDir": "",
     "cloak": {
       "fingerprintSeed": "42069",
       "platform": "windows",
@@ -248,6 +249,12 @@ Current nested file-config shape:
     "maxRedirects": -1,
     "trustedProxyCIDRs": [],
     "trustedResolveCIDRs": [],
+    "transactionPolicy": {
+      "enabled": false,
+      "hosts": [],
+      "denyRules": [],
+      "allowRules": []
+    },
     "attach": {
       "enabled": false,
       "allowHosts": ["127.0.0.1", "localhost", "::1"],
@@ -480,6 +487,26 @@ Use the dedicated config fields instead:
 
 For Linux container compatibility, use the runtime-managed path instead of `browser.extraFlags`. PinchTab enables `--no-sandbox` automatically when needed.
 
+`--no-sandbox` is enabled automatically on Linux when running as root or inside a
+container that exposes `/.dockerenv`. Runtimes that do not create that marker —
+containerd and CRI-O, so Kubernetes and k3s — must set
+`PINCHTAB_CHROME_NO_SANDBOX=1`, which is forwarded to per-instance browsers.
+
+### `browser.cacheBaseDir`
+
+Absolute path for browser HTTP and media caches. Empty (the default) leaves them
+inside each profile directory.
+
+Set it to move cache churn off slow or replicated profile storage. Each instance
+gets its own subdirectory derived from its profile path, because Chromium
+resolves `--disk-cache-dir` against the profile subdirectory it is using — which
+is `Default` for every instance — so a single shared directory would collide
+every concurrent instance on one cache.
+
+Size the target volume for the number of concurrent instances: caches are capped
+per instance by `--disk-cache-size`/`--media-cache-size` in `browser.extraFlags`,
+not globally.
+
 By default, PinchTab looks for unpacked Chrome extensions in `<server.stateDir>/extensions`. On a normal local install that means the OS-specific PinchTab config directory plus `extensions/`, for example:
 
 - macOS: `~/.pinchtab/extensions`
@@ -530,12 +557,47 @@ Rationale: humanized input is useful for compatibility with pages that react poo
 | `server` | HTTP server settings, engine selection, proxy trust, and network buffer defaults |
 | `browser` | Chrome executable, version pin, extra flags, and extension paths |
 | `instanceDefaults` | Default behavior for managed instances |
-| `security` | Sensitive feature gates, transfer limits, attach policy, and IDPI |
+| `security` | Sensitive feature gates, transfer limits, transaction policy, attach policy, and IDPI |
 | `profiles` | Profile storage defaults |
 | `multiInstance` | Orchestrator strategy, allocation, port range, and restart policy |
 | `timeouts` | Action, navigation, shutdown, and navigation wait delays |
 | `scheduler` | Optional task queue |
 | `observability` | Activity logging, source selection, and retention |
+
+## Transaction policy
+
+`security.transactionPolicy` is an operator-configured, restart-only browser network policy for supplier hosts. On each managed PinchTab launch, PinchTab compiles it into an unpacked Manifest V3 `declarativeNetRequest` extension under `server.stateDir` before Chrome starts. The extension permits GET/HEAD/OPTIONS reads by default (including existing order history, status, and invoices), permits explicit `allowRules` such as cart mutations and login POSTs, and blocks all other methods on listed hosts. `denyRules` take precedence over allows and the default block, and are required for enabled policies; a `method: "*"` deny can block GET navigation too. It covers managed pages, popups, workers, redirects, and WebSocket handshakes at the browser network layer.
+
+Hosts are exact (no subdomain expansion), with the DNS-equivalent trailing-dot spelling covered too. Paths, segments, and query pairs are case-insensitive but deliberately limited to unescaped unreserved ASCII so DNR's raw-URL matching cannot broaden a decoded allow rule. Unsafe query allows match the **entire** query exactly (`?key=value`, with an optional fragment): extra, duplicate, conflicting, or empty parameters do not inherit the allow. A deny query condition matches its exact pair anywhere in the query, including one single percent-encoded unreserved byte per request; extra or conflicting parameters cannot bypass the deny. Deny paths likewise cover one single percent-encoded unreserved byte per request plus encoded separators, which can only broaden a block. The policy is not raw-HTTP protection and does not terminate messages on an already-open allowed WebSocket. Policy changes are saved but take effect only after a full PinchTab restart. Enabled policy requires a PinchTab-managed launch with an explicitly configured Chromium or Chrome for Testing `browser.binary`; attached browsers and Google Chrome Stable are rejected. It also rejects `browser.extensionPaths`: policy mode loads only its generated extension.
+
+Example suitable for a mounted lue-kube `config.json`:
+
+```json
+{
+  "security": {
+    "transactionPolicy": {
+      "enabled": true,
+      "hosts": ["supplier.example"],
+      "denyRules": [
+        {"method": "*", "pathPrefix": "/", "pathSegment": "checkout"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "payment"},
+        {"method": "*", "pathPrefix": "/", "pathSegment": "cancel"},
+        {"method": "*", "pathPrefix": "/checkout"},
+        {"method": "*", "pathPrefix": "/payment"},
+        {"method": "POST", "pathPrefix": "/orders/place"},
+        {"method": "POST", "pathPrefix": "/orders/confirm"},
+        {"method": "POST", "pathPrefix": "/orders/reorder"},
+        {"method": "POST", "pathPrefix": "/orders/amend"},
+        {"method": "POST", "pathPrefix": "/orders/cancel"}
+      ],
+      "allowRules": [
+        {"method": "*", "pathPrefix": "/cart"},
+        {"method": "POST", "pathPrefix": "/", "queryParam": "wc-ajax", "queryValue": "add_to_cart"}
+      ]
+    }
+  }
+}
+```
 
 ## `config get` And `config set` Support
 
