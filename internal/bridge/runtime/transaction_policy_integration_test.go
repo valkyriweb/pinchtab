@@ -91,7 +91,7 @@ fetch('/read'); fetch('/read',{method:'HEAD'});
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, allocCancel, browserCtx, browserCancel, _, err := InitChrome(launch, nil, Hooks{})
+	_, allocCancel, browserCtx, browserCancel, _, err := InitBrowser(launch, nil, Hooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
