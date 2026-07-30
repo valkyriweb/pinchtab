@@ -566,6 +566,7 @@ func applyFileConfig(cfg *RuntimeConfig, fc *FileConfig) {
 	if fc.Browser.BrowserExtraFlags != "" {
 		cfg.BrowserExtraFlags = SanitizeBrowserExtraFlags(fc.Browser.BrowserExtraFlags)
 	}
+	cfg.BrowserCacheBaseDir = strings.TrimSpace(fc.Browser.CacheBaseDir)
 	applyCloakBrowserConfigToRuntime(cfg, fc.Browser.Cloak)
 	// Assigned unconditionally (see Targets above): removing browser.proxy
 	// from the file must clear the runtime proxy — leaving stale credentials

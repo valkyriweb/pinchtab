@@ -35,6 +35,7 @@ type browserConfigJSON struct {
 	BrowserBinary     string                  `json:"binary"`
 	BrowserDebugPort  *int                    `json:"remoteDebuggingPort,omitempty"`
 	BrowserExtraFlags string                  `json:"extraFlags"`
+	CacheBaseDir      string                  `json:"cacheBaseDir,omitempty"`
 	Cloak             *cloakBrowserConfigJSON `json:"cloak,omitempty"`
 	ExtensionPaths    []string                `json:"extensionPaths"`
 	// Pointer so omitempty drops the field for legacy configs (byte-identical round-trip).

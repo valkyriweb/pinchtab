@@ -12,6 +12,7 @@ import (
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 
+	"github.com/pinchtab/pinchtab/internal/browsers/runtimekit"
 	"github.com/pinchtab/pinchtab/internal/config"
 )
 
@@ -106,4 +107,10 @@ func verifyTransactionPolicyExtension(browserCtx context.Context) error {
 		return fmt.Errorf("generated ruleset is incomplete (rules=%d unsupported=%v disabled=%v)", state.RuleCount, state.Unsupported, state.Disabled)
 	}
 	return nil
+}
+
+// buildAllocatorExtraFlags mirrors the flag list setupAllocator hands to the
+// browser, so a test can assert the cache flags survive that path.
+func buildAllocatorExtraFlags(cfg *config.RuntimeConfig) []string {
+	return runtimekit.AppendBrowserCacheFlags(config.AllowedBrowserExtraFlags(cfg.BrowserExtraFlags), cfg)
 }

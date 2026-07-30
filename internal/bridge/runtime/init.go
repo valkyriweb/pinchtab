@@ -258,6 +258,7 @@ func setupAllocator(cfg *config.RuntimeConfig, bundle *stealth.Bundle, hooks Hoo
 		// --in-process-gpu so a crash loop can't repeat after retry.
 		extraFlags = stripInProcessGPUFlag(extraFlags)
 	}
+	extraFlags = runtimekit.AppendBrowserCacheFlags(extraFlags, cfg)
 	opts = appendExecAllocatorFlags(opts, extraFlags)
 	for _, flag := range appendBrowserCompatibilityFlags(nil) {
 		opts = appendExecAllocatorFlag(opts, flag)

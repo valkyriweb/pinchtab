@@ -96,6 +96,8 @@ func setBrowserField(b *BrowserConfig, field, value string) error {
 		b.BrowserBinary = value
 	case "extraFlags":
 		b.BrowserExtraFlags = value
+	case "cacheBaseDir":
+		b.CacheBaseDir = value
 	case "defaultTarget":
 		b.DefaultTarget = value
 	case "fallbackOrder":

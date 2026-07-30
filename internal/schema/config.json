@@ -244,6 +244,10 @@
         "extraFlags": {
           "type": "string"
         },
+        "cacheBaseDir": {
+          "type": "string",
+          "description": "Absolute path for per-instance browser HTTP/media caches. Empty keeps caches inside the profile directory."
+        },
         "cloak": {
           "$ref": "#/definitions/cloakBrowser"
         },

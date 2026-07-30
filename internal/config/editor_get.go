@@ -80,6 +80,8 @@ func getBrowserField(b *BrowserConfig, field string) (string, error) {
 		return b.BrowserBinary, nil
 	case "extraFlags":
 		return b.BrowserExtraFlags, nil
+	case "cacheBaseDir":
+		return b.CacheBaseDir, nil
 	case "defaultTarget":
 		return b.DefaultTarget, nil
 	case "fallbackOrder":
@@ -314,6 +316,11 @@ func getSecurityField(s *SecurityConfig, field string) (string, error) {
 	if strings.HasPrefix(field, "idpi.") {
 		return getIDPIField(&s.IDPI, strings.TrimPrefix(field, "idpi."))
 	}
+	// Read-only through the editor: the rule lists are structured, and a
+	// half-typed edit to a live guard is exactly what must not be possible.
+	if field == "transactionPolicy" || strings.HasPrefix(field, "transactionPolicy.") {
+		return getTransactionPolicyField(&s.TransactionPolicy, strings.TrimPrefix(strings.TrimPrefix(field, "transactionPolicy"), "."))
+	}
 
 	switch field {
 	case "allowEvaluate":
@@ -470,4 +477,21 @@ func formatIntPtr(n *int) string {
 		return ""
 	}
 	return strconv.Itoa(*n)
+}
+
+func getTransactionPolicyField(p *TransactionPolicyConfig, field string) (string, error) {
+	switch field {
+	case "":
+		return fmt.Sprintf("enabled=%t hosts=%d denyRules=%d allowRules=%d", p.Enabled, len(p.Hosts), len(p.DenyRules), len(p.AllowRules)), nil
+	case "enabled":
+		return strconv.FormatBool(p.Enabled), nil
+	case "hosts":
+		return strings.Join(p.Hosts, ","), nil
+	case "denyRules":
+		return strconv.Itoa(len(p.DenyRules)), nil
+	case "allowRules":
+		return strconv.Itoa(len(p.AllowRules)), nil
+	default:
+		return "", fmt.Errorf("unknown field security.transactionPolicy.%s", field)
+	}
 }

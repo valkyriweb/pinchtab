@@ -52,7 +52,7 @@ func LaunchConfigFromRuntime(cfg *config.RuntimeConfig, binary string, debugPort
 		Binary:         binary,
 		ProfileDir:     cfg.ProfileDir,
 		Proxy:          RuntimeProxyConfig(cfg),
-		ExtraFlags:     config.AllowedBrowserExtraFlags(cfg.BrowserExtraFlags),
+		ExtraFlags:     AppendBrowserCacheFlags(config.AllowedBrowserExtraFlags(cfg.BrowserExtraFlags), cfg),
 		Headless:       cfg.Headless,
 		Timezone:       cfg.Timezone,
 		ExtensionPaths: cfg.ExtensionPaths,

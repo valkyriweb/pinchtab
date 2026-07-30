@@ -61,6 +61,9 @@ type RuntimeConfig struct {
 	BrowserBinary       string
 	BrowserDebugPort    int
 	BrowserExtraFlags   string
+	// BrowserCacheBaseDir gives each instance its own HTTP/media cache root
+	// outside the profile directory. Empty keeps caches inside the profile.
+	BrowserCacheBaseDir string
 	// CDPAttachURL: when set, the bridge skips launching its own Chrome and
 	// connects to an already-running Chrome whose browser-level CDP
 	// WebSocket URL is provided here (e.g.
@@ -330,6 +333,7 @@ type BrowserConfig struct {
 	BrowserBinary     string             `json:"binary,omitempty"`
 	BrowserDebugPort  *int               `json:"remoteDebuggingPort,omitempty"`
 	BrowserExtraFlags string             `json:"extraFlags,omitempty"`
+	CacheBaseDir      string             `json:"cacheBaseDir,omitempty"`
 	Cloak             CloakBrowserConfig `json:"cloak,omitempty"`
 	ExtensionPaths    []string           `json:"extensionPaths,omitempty"`
 

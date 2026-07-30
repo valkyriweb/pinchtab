@@ -26,6 +26,9 @@ func (e ValidationError) Error() string {
 // ValidateFileConfig validates a FileConfig and returns all errors found.
 func ValidateFileConfig(fc *FileConfig) []error {
 	var errs []error
+	if base := strings.TrimSpace(fc.Browser.CacheBaseDir); base != "" && !filepath.IsAbs(base) {
+		errs = append(errs, ValidationError{Field: "browser.cacheBaseDir", Message: "must be an absolute path"})
+	}
 	errs = append(errs, validateTransactionPolicyConfig(fc.Security.TransactionPolicy)...)
 	// An unvetted extension can undo the request guard from inside the browser.
 	if fc.Security.TransactionPolicy.Enabled && len(fc.Browser.ExtensionPaths) != 0 {
