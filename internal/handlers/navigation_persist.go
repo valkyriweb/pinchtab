@@ -41,9 +41,6 @@ func (h *Handlers) persistTabStateAfterNav() {
 		Tabs: make([]tabstate.PersistedTab, 0, len(targets)),
 	}
 	for _, t := range targets {
-		if t == nil {
-			continue
-		}
 		url := t.URL
 		// Skip about:blank, chrome://, devtools:// — they're not useful
 		// to restore. about:blank in particular is the placeholder used

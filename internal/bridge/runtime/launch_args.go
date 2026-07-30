@@ -45,6 +45,9 @@ func appendBrowserCompatibilityFlags(args []string) []string {
 }
 
 func launchNeedsNoSandbox() bool {
+	if v := os.Getenv(config.ChromeNoSandboxEnvVar()); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
 	_, err := os.Stat(containerMarkerPath)
 	return runtimekit.ChromeNeedsNoSandbox(runtimeGOOS, osGeteuid(), err == nil)
 }

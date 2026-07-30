@@ -395,3 +395,28 @@ func TestBuildBrowserArgs_MalformedProxyFailsClosed(t *testing.T) {
 		t.Fatalf("expected exactly one --proxy-server flag, got %d in %v", count, args)
 	}
 }
+
+func TestLaunchNeedsNoSandboxHonoursContainerCompatEnv(t *testing.T) {
+	oldMarker := containerMarkerPath
+	oldGOOS := runtimeGOOS
+	oldEuid := osGeteuid
+	defer func() {
+		containerMarkerPath = oldMarker
+		runtimeGOOS = oldGOOS
+		osGeteuid = oldEuid
+	}()
+
+	// Non-root linux with no /.dockerenv: exactly what a containerd (k3s) pod
+	// looks like, where detection alone gets it wrong.
+	containerMarkerPath = t.TempDir() + "/missing-dockerenv"
+	runtimeGOOS = "linux"
+	osGeteuid = func() int { return 1000 }
+
+	if launchNeedsNoSandbox() {
+		t.Fatal("no marker, non-root: expected sandbox to stay on without the env override")
+	}
+	t.Setenv("PINCHTAB_CHROME_NO_SANDBOX", "1")
+	if !launchNeedsNoSandbox() {
+		t.Fatal("PINCHTAB_CHROME_NO_SANDBOX=1 must force --no-sandbox")
+	}
+}

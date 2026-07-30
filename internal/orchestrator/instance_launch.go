@@ -151,6 +151,14 @@ func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts 
 	if o.internalToken != "" {
 		envOverrides["PINCHTAB_INTERNAL_TOKEN"] = o.internalToken
 	}
+	// filterEnvWithPrefixes strips every PINCHTAB_-prefixed var from the
+	// parent environment, so this container-compat override has to be
+	// re-forwarded explicitly. Without it the always-on bridge (which
+	// inherits the container env directly) works while every per-profile
+	// instance fails to launch its browser.
+	if v := os.Getenv(config.ChromeNoSandboxEnvVar()); v != "" {
+		envOverrides[config.ChromeNoSandboxEnvVar()] = v
+	}
 	env := mergeEnvWithOverrides(filterEnvWithPrefixes(os.Environ(), "PINCHTAB_"), envOverrides)
 
 	if opts.Browser != "" {
