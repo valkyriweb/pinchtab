@@ -110,7 +110,15 @@ func (h *Handlers) executeLiteAction(ctx context.Context, req bridge.ActionReque
 		if err := h.Router.Lite().Type(ctx, req.TabID, req.Ref, text); err != nil {
 			return nil, "lite", err
 		}
-		if h.Router.Lite().FieldSensitive(req.TabID, req.Ref) {
+		// Never echo the plaintext back for credential fields (SMI-3579).
+		// Fails closed when the engine cannot report sensitivity.
+		sensitive := true
+		if probe, ok := h.Router.Lite().(interface {
+			FieldSensitive(tabID, ref string) bool
+		}); ok {
+			sensitive = probe.FieldSensitive(req.TabID, req.Ref)
+		}
+		if sensitive {
 			return bridge.RedactedTextEcho(text), "lite", nil
 		}
 		return map[string]any{"typed": text}, "lite", nil
