@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+
 	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/engine"
 )
