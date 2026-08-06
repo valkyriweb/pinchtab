@@ -31,28 +31,60 @@ func concealedReply(verb string, req ActionRequest, extras map[string]any) map[s
 	return out
 }
 
+// safeReply is concealedReply plus automatic sensitivity detection (SMI-3579).
+// Opt-in `concealed: true` keeps its historical shape. Otherwise the target
+// element is probed: password / OTP / card-style fields get the redacted
+// descriptor ({"<verb>_len": N, "redacted": true}); everything else keeps the
+// plaintext echo. Probing fails closed — an unresolvable target is redacted.
+func safeReply(ctx context.Context, verb string, selector string, nodeID int64, req ActionRequest, extras map[string]any) map[string]any {
+	if req.Concealed {
+		return concealedReply(verb, req, extras)
+	}
+	if fieldIsSensitive(ctx, selector, nodeID) {
+		return redactedEcho(verb, req.Text, extras)
+	}
+	return concealedReply(verb, req, extras)
+}
+
 func (b *Bridge) actionType(ctx context.Context, req ActionRequest) (map[string]any, error) {
 	if req.Text == "" {
 		return nil, fmt.Errorf("text required for type")
 	}
 	if req.Selector != "" {
-		return concealedReply("typed", req, nil), chromedp.Run(ctx,
+		// Probe before typing: the page may swap the node afterwards.
+		echo := safeReply(ctx, "typed", req.Selector, 0, req, nil)
+		if err := chromedp.Run(ctx,
 			chromedp.Click(req.Selector, chromedp.ByQuery),
 			chromedp.SendKeys(req.Selector, req.Text, chromedp.ByQuery),
-		)
+		); err != nil {
+			return nil, err
+		}
+		return echo, nil
 	}
 	if req.NodeID > 0 {
-		return concealedReply("typed", req, nil), TypeByNodeID(ctx, req.NodeID, req.Text)
+		echo := safeReply(ctx, "typed", "", req.NodeID, req, nil)
+		if err := TypeByNodeID(ctx, req.NodeID, req.Text); err != nil {
+			return nil, err
+		}
+		return echo, nil
 	}
 	return nil, fmt.Errorf("need selector or ref")
 }
 
 func (b *Bridge) actionFill(ctx context.Context, req ActionRequest) (map[string]any, error) {
 	if req.Selector != "" {
-		return concealedReply("filled", req, nil), chromedp.Run(ctx, chromedp.SetValue(req.Selector, req.Text, chromedp.ByQuery))
+		echo := safeReply(ctx, "filled", req.Selector, 0, req, nil)
+		if err := chromedp.Run(ctx, chromedp.SetValue(req.Selector, req.Text, chromedp.ByQuery)); err != nil {
+			return nil, err
+		}
+		return echo, nil
 	}
 	if req.NodeID > 0 {
-		return concealedReply("filled", req, nil), FillByNodeID(ctx, req.NodeID, req.Text)
+		echo := safeReply(ctx, "filled", "", req.NodeID, req, nil)
+		if err := FillByNodeID(ctx, req.NodeID, req.Text); err != nil {
+			return nil, err
+		}
+		return echo, nil
 	}
 	return nil, fmt.Errorf("need selector or ref")
 }
@@ -90,7 +122,8 @@ func (b *Bridge) actionHumanType(ctx context.Context, req ActionRequest) (map[st
 		return nil, err
 	}
 
-	return concealedReply("typed", req, map[string]any{"human": true}), nil
+	// Focused above, so the focused element is the target.
+	return safeReply(ctx, "typed", req.Selector, req.NodeID, req, map[string]any{"human": true}), nil
 }
 
 func (b *Bridge) actionKeyboardType(ctx context.Context, req ActionRequest) (map[string]any, error) {
@@ -126,7 +159,8 @@ func (b *Bridge) actionKeyboardType(ctx context.Context, req ActionRequest) (map
 	if err != nil {
 		return nil, err
 	}
-	return concealedReply("typed", req, nil), nil
+	// Dispatches to whatever is focused, so probe the focused element.
+	return safeReply(ctx, "typed", "", 0, req, nil), nil
 }
 
 func (b *Bridge) actionKeyboardInsert(ctx context.Context, req ActionRequest) (map[string]any, error) {
@@ -141,7 +175,7 @@ func (b *Bridge) actionKeyboardInsert(ctx context.Context, req ActionRequest) (m
 	if err != nil {
 		return nil, err
 	}
-	return concealedReply("inserted", req, nil), nil
+	return safeReply(ctx, "inserted", "", 0, req, nil), nil
 }
 
 func (b *Bridge) actionKeyDown(ctx context.Context, req ActionRequest) (map[string]any, error) {
