@@ -155,8 +155,3 @@ func readFieldAttrsByNodeID(ctx context.Context, nodeID int64) (*fieldAttrs, err
 	}
 	return attrs, nil
 }
-
-// isSensitiveField is the bridge-local alias of the shared attribute rule.
-func isSensitiveField(inputType, autocomplete, name, id, ariaLabel string) bool {
-	return engine.IsSensitiveFieldAttrs(inputType, autocomplete, name, id, ariaLabel)
-}
