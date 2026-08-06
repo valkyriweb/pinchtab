@@ -110,6 +110,9 @@ func (h *Handlers) executeLiteAction(ctx context.Context, req bridge.ActionReque
 		if err := h.Router.Lite().Type(ctx, req.TabID, req.Ref, text); err != nil {
 			return nil, "lite", err
 		}
+		if h.Router.Lite().FieldSensitive(req.TabID, req.Ref) {
+			return bridge.RedactedTextEcho(text), "lite", nil
+		}
 		return map[string]any{"typed": text}, "lite", nil
 	default:
 		return nil, "lite", fmt.Errorf("%w: %s", engine.ErrLiteNotSupported, req.Kind)
