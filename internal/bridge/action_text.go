@@ -25,20 +25,20 @@ func (b *Bridge) actionType(ctx context.Context, req ActionRequest) (map[string]
 		return b.actionHumanizedType(ctx, req)
 	}
 	if req.Selector != "" {
-		return textEntryResult("typed", req.Text), chromedp.Run(ctx,
+		return textEcho(ctx, req.Selector, 0, "typed", req.Text, nil), chromedp.Run(ctx,
 			chromedp.Click(req.Selector, chromedp.ByQuery),
 			chromedp.SendKeys(req.Selector, req.Text, chromedp.ByQuery),
 		)
 	}
 	if req.NodeID > 0 {
-		return textEntryResult("typed", req.Text), TypeByNodeID(ctx, req.NodeID, req.Text)
+		return textEcho(ctx, "", req.NodeID, "typed", req.Text, nil), TypeByNodeID(ctx, req.NodeID, req.Text)
 	}
 	return nil, NewInvalidActionRequestError("need selector or ref")
 }
 
 func (b *Bridge) actionFill(ctx context.Context, req ActionRequest) (map[string]any, error) {
 	text, _ := FillText(req)
-	result := textEntryResult("filled", text)
+	result := textEcho(ctx, req.Selector, req.NodeID, "filled", text, nil)
 	if req.Selector != "" {
 		if err := chromedp.Run(ctx,
 			chromedp.Focus(req.Selector, chromedp.ByQuery),
@@ -161,7 +161,7 @@ func (b *Bridge) actionHumanizedType(ctx context.Context, req ActionRequest) (ma
 		return nil, err
 	}
 
-	result := textEntryResult("typed", req.Text)
+	result := textEcho(ctx, req.Selector, req.NodeID, "typed", req.Text, nil)
 	result["human"] = true
 	return result, nil
 }
@@ -231,7 +231,7 @@ func (b *Bridge) keyboardTypePerChar(ctx context.Context, text string) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	return textEntryResult("typed", text), nil
+	return textEcho(ctx, "", 0, "typed", text, nil), nil
 }
 
 // keyboardTypeBatchedEdgeChars is how many characters to type with real
@@ -271,7 +271,7 @@ func (b *Bridge) keyboardTypeBatched(ctx context.Context, text string) (map[stri
 		return nil, err
 	}
 
-	result := textEntryResult("typed", text)
+	result := textEcho(ctx, "", 0, "typed", text, nil)
 	result["batched"] = true
 	return result, nil
 }
@@ -288,7 +288,7 @@ func (b *Bridge) actionKeyboardInsert(ctx context.Context, req ActionRequest) (m
 	if err != nil {
 		return nil, err
 	}
-	return textEntryResult("inserted", req.Text), nil
+	return textEcho(ctx, "", 0, "inserted", req.Text, nil), nil
 }
 
 func (b *Bridge) actionKeyDown(ctx context.Context, req ActionRequest) (map[string]any, error) {
