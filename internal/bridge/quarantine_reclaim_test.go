@@ -301,6 +301,13 @@ var directoryRemovers = []directoryRemover{
 		why:               "removes b.tempProfileDir, a temp-dir path this process created; never under the configured profiles base",
 	},
 	{
+		path:              "internal/bridge/runtime/transaction_policy_state.go",
+		funcs:             []string{"writeTransactionPolicyExtension", "retainTransactionPolicyGenerations"},
+		underProfilesBase: false,
+		route:             "browser startup transaction-policy compilation",
+		why:               "removes only a staging directory created under server.stateDir and old immutable generated-policy directories under that same dedicated root",
+	},
+	{
 		path:              "internal/bridge/cleanup.go",
 		funcs:             []string{"CleanupOrphanedChromeProcesses"},
 		underProfilesBase: false,

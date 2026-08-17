@@ -525,7 +525,10 @@ func setSecurityField(s *SecurityConfig, field, value string) error {
 			if err != nil {
 				return fmt.Errorf("security.transactionPolicy.enabled: %w", err)
 			}
-			s.TransactionPolicy.Enabled = b
+			if b {
+				return fmt.Errorf("security.transactionPolicy.enabled must be enabled atomically with hosts and denyRules via config patch")
+			}
+			s.TransactionPolicy.Enabled = false
 		case "hosts":
 			s.TransactionPolicy.Hosts = parseCSVList(value)
 		case "denyRules":

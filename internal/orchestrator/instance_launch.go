@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,10 @@ func (o *Orchestrator) Launch(name, port string, headless bool, extensionPaths [
 }
 
 func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts LaunchOptions) (*bridge.Instance, error) {
+	stealthLevel := strings.TrimSpace(opts.StealthLevel)
+	if stealthLevel != "" && !slices.Contains(config.ValidStealthLevels(), stealthLevel) {
+		return nil, fmt.Errorf("invalid stealthLevel %q (must be light, medium, or full)", stealthLevel)
+	}
 	o.mu.RLock()
 	policyEnabled := o.runtimeCfg != nil && o.runtimeCfg.TransactionPolicy.Enabled
 	o.mu.RUnlock()
@@ -144,6 +149,14 @@ func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts 
 			}
 		}
 	}
+	if stealthLevel != "" {
+		if effectiveCfg == nil {
+			return nil, fmt.Errorf("cannot apply stealthLevel without runtime configuration")
+		}
+		launchCfg := *effectiveCfg
+		launchCfg.StealthLevel = stealthLevel
+		effectiveCfg = &launchCfg
+	}
 
 	childConfigPath, err := o.writeChildConfig(effectiveCfg, port, cdpPort, profilePath, instanceStateDir, headless, opts.ExtensionPaths, effectivePolicy)
 	if err != nil {
@@ -210,6 +223,7 @@ func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts 
 		logBuf:  logBuf,
 
 		requestedSecurityPolicy: requestedPolicy,
+		requestedStealthLevel:   stealthLevel,
 		requestedProvider:       opts.RequestedProvider,
 		browser:                 opts.Browser,
 		effectiveBinary:         effectiveBinaryFromCfg(effectiveCfg),

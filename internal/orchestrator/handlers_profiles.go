@@ -34,6 +34,7 @@ func (o *Orchestrator) handleStartByID(w http.ResponseWriter, r *http.Request) {
 		Port            string                 `json:"port,omitempty"`
 		Headless        bool                   `json:"headless"`
 		SecurityPolicy  *bridge.SecurityPolicy `json:"securityPolicy,omitempty"`
+		StealthLevel    string                 `json:"stealthLevel,omitempty"`
 		Browser         string                 `json:"browser,omitempty"`
 		FallbackTargets []string               `json:"fallbackTargets,omitempty"`
 	}
@@ -50,6 +51,7 @@ func (o *Orchestrator) handleStartByID(w http.ResponseWriter, r *http.Request) {
 
 	inst, err := o.LaunchWithTargetSelection(name, req.Port, req.Headless, req.Browser, req.FallbackTargets, LaunchOptions{
 		SecurityPolicy: req.SecurityPolicy,
+		StealthLevel:   req.StealthLevel,
 		Browser:        req.Browser,
 	})
 	if err != nil {

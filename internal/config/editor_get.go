@@ -342,6 +342,9 @@ func getSecurityField(s *SecurityConfig, field string) (string, error) {
 		case "enabled":
 			return strconv.FormatBool(s.TransactionPolicy.Enabled), nil
 		case "hosts":
+			if len(s.TransactionPolicy.Hosts) == 0 {
+				return "[]", nil
+			}
 			return strings.Join(s.TransactionPolicy.Hosts, ","), nil
 		case "denyRules":
 			return fmt.Sprint(s.TransactionPolicy.DenyRules), nil

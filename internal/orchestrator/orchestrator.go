@@ -97,6 +97,7 @@ type InstanceInternal struct {
 	logBuf    *ringBuffer
 
 	requestedSecurityPolicy *bridge.SecurityPolicy
+	requestedStealthLevel   string
 
 	requestedProvider string
 	browser           string
@@ -108,6 +109,7 @@ type InstanceInternal struct {
 type LaunchOptions struct {
 	ExtensionPaths []string
 	SecurityPolicy *bridge.SecurityPolicy
+	StealthLevel   string
 
 	RequestedProvider string
 	Browser           string

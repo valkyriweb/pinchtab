@@ -22,6 +22,7 @@ type startInstanceRequest struct {
 	Port            string                 `json:"port,omitempty"`
 	ExtensionPaths  []string               `json:"extensionPaths,omitempty"`
 	SecurityPolicy  *bridge.SecurityPolicy `json:"securityPolicy,omitempty"`
+	StealthLevel    string                 `json:"stealthLevel,omitempty"`
 	Browser         string                 `json:"browser,omitempty"`
 	FallbackTargets []string               `json:"fallbackTargets,omitempty"`
 }
@@ -137,6 +138,7 @@ func (o *Orchestrator) handleStartByInstanceID(w http.ResponseWriter, r *http.Re
 
 	started, err := o.LaunchWithOptions(profileName, port, headless, LaunchOptions{
 		SecurityPolicy: inst.requestedSecurityPolicy,
+		StealthLevel:   inst.requestedStealthLevel,
 	})
 	if err != nil {
 		writeLaunchError(w, err)
@@ -268,6 +270,7 @@ func (o *Orchestrator) startInstanceWithRequest(w http.ResponseWriter, r *http.R
 	opts := LaunchOptions{
 		ExtensionPaths: req.ExtensionPaths,
 		SecurityPolicy: req.SecurityPolicy,
+		StealthLevel:   req.StealthLevel,
 		Browser:        req.Browser,
 	}
 

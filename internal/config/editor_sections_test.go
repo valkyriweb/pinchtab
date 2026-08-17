@@ -294,7 +294,8 @@ func exemptionFor(path string) (reason, key string) {
 // refusedByPolicy are leaves both resolvers KNOW and deliberately refuse, which is a
 // different answer from not knowing them: the operator is told what to use instead.
 var refusedByPolicy = map[string]string{
-	"browser.provider": "removed in favour of browsers.default; both resolvers answer with that redirection rather than an unknown-field refusal",
+	"browser.provider":                   "removed in favour of browsers.default; both resolvers answer with that redirection rather than an unknown-field refusal",
+	"security.transactionPolicy.enabled": "enabling alone would persist an invalid fail-closed policy; use config patch to set enabled, hosts, and denyRules atomically",
 
 	"observability.activity.stateDir": "derived from server.stateDir so two instances cannot share an activity log directory; the setter refuses it by naming the key to set instead, and the getter still reads it",
 }
