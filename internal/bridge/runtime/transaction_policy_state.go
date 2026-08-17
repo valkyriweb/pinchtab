@@ -71,7 +71,7 @@ func writeTransactionPolicyExtension(stateDir string, manifest transactionPolicy
 		if err != nil {
 			return "", err
 		}
-		defer os.RemoveAll(staging)
+		defer func() { _ = os.RemoveAll(staging) }()
 		if err := os.Chmod(staging, 0700); err != nil {
 			return "", err
 		}
@@ -106,7 +106,7 @@ func jsonData(value any) ([]byte, error) {
 func policyDigest(parts ...[]byte) string {
 	h := sha256.New()
 	for _, part := range parts {
-		_, _ = h.Write([]byte(fmt.Sprintf("%d:", len(part))))
+		_, _ = fmt.Fprintf(h, "%d:", len(part))
 		_, _ = h.Write(part)
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -243,14 +243,16 @@ func publishTransactionPolicyCurrent(root, name string) error {
 		return err
 	}
 	tempName := temp.Name()
-	defer os.Remove(tempName)
-	if err := temp.Chmod(0600); err == nil {
-		_, err = temp.WriteString(name + "\n")
+	defer func() { _ = os.Remove(tempName) }()
+	if err := temp.Chmod(0600); err != nil {
+		_ = temp.Close()
+		return err
 	}
-	if closeErr := temp.Close(); err == nil {
-		err = closeErr
+	if _, err := temp.WriteString(name + "\n"); err != nil {
+		_ = temp.Close()
+		return err
 	}
-	if err != nil {
+	if err := temp.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tempName, current)

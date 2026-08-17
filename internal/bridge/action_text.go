@@ -4,18 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/chromedp/chromedp"
 )
-
-func textEntryResult(kind, text string) map[string]any {
-	result := map[string]any{
-		kind:  true,
-		"len": utf8.RuneCountInString(text),
-	}
-	return result
-}
 
 func (b *Bridge) actionType(ctx context.Context, req ActionRequest) (map[string]any, error) {
 	if req.Text == "" {
