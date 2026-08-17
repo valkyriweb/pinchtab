@@ -517,6 +517,26 @@ func setSecurityField(s *SecurityConfig, field, value string) error {
 	if strings.HasPrefix(field, "idpi.") {
 		return setIDPIField(s, strings.TrimPrefix(field, "idpi."), value)
 	}
+	if strings.HasPrefix(field, "transactionPolicy.") {
+		tpField := strings.TrimPrefix(field, "transactionPolicy.")
+		switch tpField {
+		case "enabled":
+			b, err := parseBool(value)
+			if err != nil {
+				return fmt.Errorf("security.transactionPolicy.enabled: %w", err)
+			}
+			s.TransactionPolicy.Enabled = b
+		case "hosts":
+			s.TransactionPolicy.Hosts = parseCSVList(value)
+		case "denyRules":
+			s.TransactionPolicy.DenyRules = []TransactionPolicyRule{{PathPrefix: value}}
+		case "allowRules":
+			s.TransactionPolicy.AllowRules = []TransactionPolicyRule{{PathPrefix: value}}
+		default:
+			return fmt.Errorf("unknown field security.transactionPolicy.%s", tpField)
+		}
+		return nil
+	}
 	if field == "allowedDomains" {
 		domains := parseCSVList(value)
 		if err := validateAllowlistEntries(domains); err != nil {

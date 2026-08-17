@@ -337,6 +337,20 @@ func getSecurityField(s *SecurityConfig, field string) (string, error) {
 	if strings.HasPrefix(field, "idpi.") {
 		return getIDPIField(&s.IDPI, strings.TrimPrefix(field, "idpi."))
 	}
+	if strings.HasPrefix(field, "transactionPolicy.") {
+		switch strings.TrimPrefix(field, "transactionPolicy.") {
+		case "enabled":
+			return strconv.FormatBool(s.TransactionPolicy.Enabled), nil
+		case "hosts":
+			return strings.Join(s.TransactionPolicy.Hosts, ","), nil
+		case "denyRules":
+			return fmt.Sprint(s.TransactionPolicy.DenyRules), nil
+		case "allowRules":
+			return fmt.Sprint(s.TransactionPolicy.AllowRules), nil
+		default:
+			return "", fmt.Errorf("unknown field security.%s", field)
+		}
+	}
 
 	switch field {
 	case "allowEvaluate":
