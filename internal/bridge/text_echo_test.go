@@ -34,12 +34,17 @@ func TestRedactedTextEchoAlwaysRedacts(t *testing.T) {
 	}
 }
 
-func TestPlainEchoKeepsLegacyShape(t *testing.T) {
+func TestPlainEchoKeepsV015ShapeWithoutPlaintext(t *testing.T) {
 	out := plainEcho(echoKeyFilled, "cape town", nil)
-	if out[echoKeyFilled] != "cape town" {
-		t.Fatalf("plainEcho changed shape: %v", out)
+	if out[echoKeyFilled] != true || out["len"] != 9 {
+		t.Fatalf("plainEcho changed v0.15 shape: %v", out)
 	}
 	if _, ok := out["redacted"]; ok {
 		t.Fatalf("plainEcho should not set redacted: %v", out)
+	}
+	for _, value := range out {
+		if value == "cape town" {
+			t.Fatalf("plainEcho leaked caller text: %v", out)
+		}
 	}
 }

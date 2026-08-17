@@ -184,6 +184,7 @@ func (h *Handlers) closeTab(w http.ResponseWriter, r *http.Request, tabID string
 	}
 
 	h.clearCurrentTabReferences(tabID)
+	h.persistTabStateAfterNav()
 	h.recordActivity(r, activity.Update{Action: "tab.close", TabID: tabID})
 	w.Header().Set(activity.HeaderPTTabID, tabID)
 

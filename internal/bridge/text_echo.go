@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"unicode/utf8"
 
 	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/bridge/cdpops"
@@ -36,9 +37,10 @@ func redactedEcho(key, text string, extra map[string]any) map[string]any {
 	return out
 }
 
-// plainEcho keeps the historical shape for non-sensitive fields.
+// plainEcho keeps the v0.15 response shape for non-sensitive fields without
+// reflecting caller-provided text into API responses or downstream logs.
 func plainEcho(key, text string, extra map[string]any) map[string]any {
-	out := map[string]any{key: text}
+	out := map[string]any{key: true, "len": utf8.RuneCountInString(text)}
 	for k, v := range extra {
 		out[k] = v
 	}
