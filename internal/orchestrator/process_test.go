@@ -310,3 +310,24 @@ func TestLogsSince_DeltaAfterAppends(t *testing.T) {
 		t.Fatalf("delta chunk = %q reset = %v, want %q false", chunk, reset, "line2\n")
 	}
 }
+
+func TestChildFailureLinePrefersBridgeErrorOverBrowserNoise(t *testing.T) {
+	logs := strings.Join([]string{
+		`time=2026-08-18T16:12:46.560+02:00 level=ERROR msg=request path=/health code=browser_init_failed error="transaction policy extension did not activate: generated ruleset is incomplete"`,
+		`browser: [4662:4677:ERROR:dbus/bus.cc:405] Failed to connect to the bus: No such file or directory`,
+		`browser: [4662:4662:ERROR:dbus/object_proxy.cc:572] Failed to call method: org.freedesktop.DBus.NameHasOwner`,
+	}, "\n")
+	got := childFailureLine(logs)
+	if !strings.Contains(got, "did not activate") {
+		t.Fatalf("reported browser noise instead of the bridge error: %q", got)
+	}
+}
+
+func TestChildFailureLineFallsBackToTailWhenNoStructuredError(t *testing.T) {
+	if got := childFailureLine("browser: something odd\nlast line here"); got != "last line here" {
+		t.Fatalf("fallback = %q", got)
+	}
+	if got := childFailureLine(""); got != "" {
+		t.Fatalf("empty = %q", got)
+	}
+}
