@@ -14,6 +14,12 @@ const (
 	transactionPolicyExtensionID = "amadgaedoaaekpjejecafmbdhacgmlig"
 	transactionPolicyManifestKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuinfEBuVQwc6FKF/tVRTn6rfITooe1jQaIMYk/rTRwYg4Pe1GqvFafjT7ghbL58Tjf55M+VhVhvEMSIzCPzjRfp7m8cUgm8/Qz7b86DRkyBzz+ovEMvtZLtN8f8xLIaR1dWVt++Lti1QOMBDNB6DVdGIDGUJm5xXVWhQTh1pRRBY2Fcbg5BgH4SG8/VAOXbVnXuXvniKf1skZlO3lUZeTVBlF8Rly4Drgep/B5wQEVhIiiomm+LV6saes6nKHbMysFlgfAOxL7wiEt6oqtFvGfh+QiVe8pazpA1N6Xf8Q47ljG2oTEtdGaPouHdOcnNwC0WtZ8p8LfhL7zqVqpCkpQIDAQAB"
 	maxTransactionPolicyRules    = 25000
+	// Chrome counts regex rules against MAX_NUMBER_OF_REGEX_RULES, which is far
+	// lower than the general rule cap. Exceeding it does not fail compilation:
+	// Chrome silently marks the excess unsupported, the ruleset activates
+	// incomplete, and browser init fails with no usable reason. Validate against
+	// it explicitly so the failure names itself at compile time.
+	maxTransactionPolicyRegexRules = 1000
 )
 
 type transactionPolicyManifest struct {
@@ -50,6 +56,7 @@ type dnrAction struct {
 type dnrCondition struct {
 	RegexFilter              string   `json:"regexFilter"`
 	IsURLFilterCaseSensitive bool     `json:"isUrlFilterCaseSensitive"`
+	RequestDomains           []string `json:"requestDomains,omitempty"`
 	RequestMethods           []string `json:"requestMethods,omitempty"`
 	ExcludedRequestMethods   []string `json:"excludedRequestMethods,omitempty"`
 }
@@ -96,9 +103,20 @@ func compileTransactionPolicy(policy config.TransactionPolicyConfig) (transactio
 	manifest := transactionPolicyManifest{ManifestVersion: 3, Name: "PinchTab Transaction Policy", Version: "1.0", Key: transactionPolicyManifestKey, Permissions: []string{"declarativeNetRequest"}, HostPermissions: transactionHostPermissions(hosts), DeclarativeNetRequest: dnrSpec{RuleResources: []dnrResource{{ID: transactionPolicyRulesetID, Enabled: true, Path: "rules.json"}}}, Background: dnrBackground{ServiceWorker: "background.js"}}
 	rules := make([]dnrRule, 0, len(hosts)*(len(policy.DenyRules)+len(policy.AllowRules)+1))
 	id := 1
+	// hostScope reports the hosts a rule is emitted for. Blocks are emitted once
+	// with a host-agnostic pattern scoped by requestDomains, which cuts rule
+	// count by a factor of len(hosts). Allows keep one exact-host pattern each:
+	// widening a block only ever blocks more, but widening an allow would grant
+	// permission on a host the operator never listed, so allows must not be
+	// collapsed onto a condition whose host semantics are looser than the regex.
 	appendRules := func(source []config.TransactionPolicyRule, priority int, action string, encodePath bool) error {
+		perHost := action == "allow"
 		for _, rule := range source {
-			for _, host := range hosts {
+			targets := []string{""}
+			if perHost {
+				targets = hosts
+			}
+			for _, host := range targets {
 				regexes, err := transactionRuleRegexes(host, rule, encodePath)
 				if err != nil {
 					return err
@@ -108,6 +126,9 @@ func compileTransactionPolicy(policy config.TransactionPolicyConfig) (transactio
 						return err
 					}
 					condition := dnrCondition{RegexFilter: regex, IsURLFilterCaseSensitive: false}
+					if !perHost {
+						condition.RequestDomains = hosts
+					}
 					if method := strings.ToLower(strings.TrimSpace(rule.Method)); method != "*" {
 						condition.RequestMethods = []string{method}
 					}
@@ -126,16 +147,24 @@ func compileTransactionPolicy(policy config.TransactionPolicyConfig) (transactio
 	if err := appendRules(policy.AllowRules, 2, "allow", false); err != nil {
 		return transactionPolicyManifest{}, nil, err
 	}
-	for _, host := range hosts {
-		regex := "^(https?|wss?)://([^/?#@]*@)?" + regexp.QuoteMeta(host) + "(\\.)?(:[0-9]+)?(/|$)"
-		if err := validateDNRRegex(regex); err != nil {
-			return transactionPolicyManifest{}, nil, err
-		}
-		rules = append(rules, dnrRule{ID: id, Priority: 1, Action: dnrAction{Type: "block"}, Condition: dnrCondition{RegexFilter: regex, IsURLFilterCaseSensitive: false, ExcludedRequestMethods: []string{"get", "head", "options"}}})
-		id++
+	// The catch-all block is likewise emitted once and scoped by requestDomains.
+	defaultRegex := "^(https?|wss?)://" + transactionHostPattern("") + "(/|$)"
+	if err := validateDNRRegex(defaultRegex); err != nil {
+		return transactionPolicyManifest{}, nil, err
 	}
+	rules = append(rules, dnrRule{ID: id, Priority: 1, Action: dnrAction{Type: "block"}, Condition: dnrCondition{RegexFilter: defaultRegex, IsURLFilterCaseSensitive: false, RequestDomains: hosts, ExcludedRequestMethods: []string{"get", "head", "options"}}})
+	id++
 	if len(rules) > maxTransactionPolicyRules {
 		return transactionPolicyManifest{}, nil, fmt.Errorf("policy produces %d rules, maximum is %d", len(rules), maxTransactionPolicyRules)
+	}
+	regexRules := 0
+	for _, rule := range rules {
+		if rule.Condition.RegexFilter != "" {
+			regexRules++
+		}
+	}
+	if regexRules > maxTransactionPolicyRegexRules {
+		return transactionPolicyManifest{}, nil, fmt.Errorf("policy produces %d regex rules, maximum is %d", regexRules, maxTransactionPolicyRegexRules)
 	}
 	return manifest, rules, nil
 }
@@ -237,8 +266,19 @@ func transactionRuleRegex(host string, rule config.TransactionPolicyRule, encode
 			query = "\\?" + regexp.QuoteMeta(rule.QueryParam) + "=" + regexp.QuoteMeta(rule.QueryValue) + "(#.*)?$"
 		}
 	}
-	regex := "^(https?|wss?)://([^/?#@]*@)?" + regexp.QuoteMeta(host) + "(\\.)?(:[0-9]+)?" + pathPart + query
+	regex := "^(https?|wss?)://" + transactionHostPattern(host) + pathPart + query
 	return regex, nil
+}
+
+// transactionHostPattern matches the authority. An empty host matches any
+// authority, for rules scoped by requestDomains instead of by the pattern. The
+// character class excludes the path, query and fragment delimiters, so it can
+// never consume part of the path it is anchored against.
+func transactionHostPattern(host string) string {
+	if host == "" {
+		return "[^/?#]*"
+	}
+	return "([^/?#@]*@)?" + regexp.QuoteMeta(host) + "(\\.)?(:[0-9]+)?"
 }
 func pathPrefixHasSegment(prefix, segment string) bool {
 	for _, part := range strings.Split(strings.Trim(prefix, "/"), "/") {

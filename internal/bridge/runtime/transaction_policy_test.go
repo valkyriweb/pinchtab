@@ -308,10 +308,57 @@ func TestDenyRuleCountDoesNotScaleWithPathLength(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deployed-size policy failed to compile: %v", err)
 	}
-	if want := 16 * (120 + 17 + 1); len(rules) != want {
+	// Blocks are emitted once and scoped by requestDomains; only allows are
+	// still per host. 120 denies + (17 allows x 16 hosts) + 1 catch-all block.
+	if want := 120 + 17*16 + 1; len(rules) != want {
 		t.Fatalf("deployed-size policy = %d rules, want %d", len(rules), want)
 	}
-	if len(rules) > maxTransactionPolicyRules/2 {
-		t.Fatalf("deployed-size policy uses %d of %d rules, leaving too little headroom", len(rules), maxTransactionPolicyRules)
+	// Chrome's regex cap, not the general rule cap, is the binding limit.
+	regexRules := 0
+	for _, r := range rules {
+		if r.Condition.RegexFilter != "" {
+			regexRules++
+		}
+	}
+	if regexRules > maxTransactionPolicyRegexRules/2 {
+		t.Fatalf("deployed-size policy uses %d of %d regex rules, leaving too little headroom", regexRules, maxTransactionPolicyRegexRules)
+	}
+}
+
+// TestAllowRulesAreScopedByExactHostNotRequestDomains pins the asymmetry that
+// makes cross-host rule collapsing safe. Blocks may be widened, because a wider
+// block only ever blocks more. Allows may not: requestDomains matches listed
+// domains and their subdomains, so collapsing allows onto it would grant a
+// payment permission on hosts the operator never listed.
+func TestAllowRulesAreScopedByExactHostNotRequestDomains(t *testing.T) {
+	policy := testTransactionPolicy()
+	policy.Hosts = []string{"supplier.example", "other.example"}
+	_, rules, err := compileTransactionPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rulesAtPriority(rules, 2) {
+		if len(r.Condition.RequestDomains) != 0 {
+			t.Fatalf("allow rule scoped by requestDomains: %#v", r.Condition)
+		}
+		if !strings.Contains(r.Condition.RegexFilter, "supplier\\.example") &&
+			!strings.Contains(r.Condition.RegexFilter, "other\\.example") {
+			t.Fatalf("allow rule is not anchored to an exact host: %s", r.Condition.RegexFilter)
+		}
+	}
+	for _, group := range [][]dnrRule{rulesAtPriority(rules, 3), rulesAtPriority(rules, 1)} {
+		for _, r := range group {
+			if len(r.Condition.RequestDomains) != 2 {
+				t.Fatalf("block rule not scoped to both hosts: %#v", r.Condition)
+			}
+		}
+	}
+	// An allow must not leak onto a host that merely shares a suffix.
+	allows := rulesAtPriority(rules, 2)
+	for _, r := range allows {
+		re := regexp.MustCompile(r.Condition.RegexFilter)
+		if re.MatchString("https://evil-supplier.example/cart") {
+			t.Fatalf("allow matched an unlisted host: %s", r.Condition.RegexFilter)
+		}
 	}
 }

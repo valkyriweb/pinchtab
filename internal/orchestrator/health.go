@@ -100,21 +100,23 @@ func (o *Orchestrator) applyStartupOutcome(inst *InstanceInternal, p startupProb
 			} else {
 				inst.Error = "process exited before health check succeeded"
 			}
-			if tail := tailLogLine(inst.logBuf.String()); tail != "" {
+			if tail := childFailureLine(inst.logBuf.String()); tail != "" {
 				inst.Error += " | " + tail
 			}
 			inst.lastFailureReason = ClassifyLaunchFailure(errors.New(inst.Error))
 			eventType = "instance.error"
-			slog.Error("instance exited before ready", "id", inst.ID, "reason", string(inst.lastFailureReason))
+			slog.Error("instance exited before ready", "id", inst.ID, "reason", string(inst.lastFailureReason), "error", inst.Error)
 		} else {
 			inst.Status = "error"
 			inst.Error = fmt.Errorf("health check timeout after %s (%s)", instanceStartupTimeout, p.lastProbe).Error()
-			if tail := tailLogLine(inst.logBuf.String()); tail != "" {
+			if tail := childFailureLine(inst.logBuf.String()); tail != "" {
 				inst.Error += " | " + tail
 			}
 			inst.lastFailureReason = ClassifyLaunchFailure(errors.New(inst.Error))
 			eventType = "instance.error"
-			slog.Error("instance failed to start", "id", inst.ID, "reason", string(inst.lastFailureReason))
+			// Without the error the operator only sees health_check_timeout,
+			// which names the symptom and never the cause.
+			slog.Error("instance failed to start", "id", inst.ID, "reason", string(inst.lastFailureReason), "error", inst.Error)
 		}
 	}
 	// The repository holds a snapshot, so every status transition must re-sync;

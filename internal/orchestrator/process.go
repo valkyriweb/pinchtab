@@ -157,6 +157,35 @@ func (rb *ringBuffer) since(offset uint64) (chunk string, newOffset uint64, rese
 	return string(rb.data[offset-start:]), end, false
 }
 
+// childFailureLine picks the line most likely to explain why a child died.
+//
+// The child's stdout carries the browser's own stderr, which in a container is
+// dominated by dbus and GPU noise emitted after the real failure. Taking the
+// last line therefore reports "Failed to connect to the bus" while the actual
+// cause -- for example a transaction policy that did not activate -- sits
+// further up. Prefer the newest structured error line from the bridge itself,
+// and fall back to the plain tail when there is none.
+func childFailureLine(logs string) string {
+	if logs == "" {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(logs), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || strings.HasPrefix(line, "browser: ") {
+			continue
+		}
+		if strings.Contains(line, "level=ERROR") || strings.Contains(line, "error=") {
+			const max = 400
+			if len(line) > max {
+				return line[:max]
+			}
+			return line
+		}
+	}
+	return tailLogLine(logs)
+}
+
 func tailChildLog(rb *ringBuffer, maxLines int) string {
 	if rb == nil || maxLines <= 0 {
 		return ""
