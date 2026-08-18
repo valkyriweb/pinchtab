@@ -163,32 +163,31 @@ func transactionHostPermissions(hosts []string) []string {
 // regex plus one variant for each single percent-encoded unreserved byte.
 // Separate simple regexes stay within Chrome DNR's RE2 memory limit; a single
 // regex with an alternation at every byte is rejected for ordinary route names.
+// transactionRuleRegexes returns the regexes for one rule against one host.
+//
+// A deny is expressed as a single encoding-tolerant regex rather than one
+// variant per encodable character. Each literal byte becomes an alternation of
+// its plain and percent-encoded forms, so every combination of encoded
+// characters matches at once. That is both smaller and strictly stronger than
+// per-position variants, which only ever covered a single encoded character and
+// let multi-character forms like /%63%68eckout through. Rule count matters: the
+// per-position scheme multiplied each authored rule by its path length and, at
+// 16 hosts x 137 rules, compiled to 25840 rules against Chrome's 25000 limit,
+// which fails closed and leaves the browser unable to initialise.
 func transactionRuleRegexes(host string, rule config.TransactionPolicyRule, encodePath bool) ([]string, error) {
-	base, positions, err := transactionRuleRegexVariant(host, rule, encodePath, -1)
+	regex, err := transactionRuleRegex(host, rule, encodePath)
 	if err != nil {
 		return nil, err
 	}
-	regexes := []string{base}
-	if !encodePath {
-		return regexes, nil
-	}
-	for position := 0; position < positions; position++ {
-		variant, _, err := transactionRuleRegexVariant(host, rule, true, position)
-		if err != nil {
-			return nil, err
-		}
-		regexes = append(regexes, variant)
-	}
-	return regexes, nil
+	return []string{regex}, nil
 }
 
-func transactionRuleRegexVariant(host string, rule config.TransactionPolicyRule, encodePath bool, encodeAt int) (string, int, error) {
+func transactionRuleRegex(host string, rule config.TransactionPolicyRule, encodePath bool) (string, error) {
 	prefix := strings.TrimSuffix(strings.TrimSpace(rule.PathPrefix), "/")
 	if prefix == "" {
 		prefix = "/"
 	}
 	segment := strings.TrimSpace(rule.PathSegment)
-	position := 0
 	literal := func(value string) string {
 		if !encodePath {
 			return regexp.QuoteMeta(value)
@@ -202,12 +201,9 @@ func transactionRuleRegexVariant(host string, rule config.TransactionPolicyRule,
 				b.WriteString("(/|%2F)+")
 				continue
 			}
-			if position == encodeAt {
-				fmt.Fprintf(&b, "%%%02X", c)
-			} else {
-				b.WriteString(regexp.QuoteMeta(string(c)))
-			}
-			position++
+			// Match the byte plain or percent-encoded. Matching is
+			// case-insensitive, so %6B also covers %6b.
+			fmt.Fprintf(&b, "(%s|%%%02X)", regexp.QuoteMeta(string(c)), c)
 		}
 		return b.String()
 	}
@@ -242,7 +238,7 @@ func transactionRuleRegexVariant(host string, rule config.TransactionPolicyRule,
 		}
 	}
 	regex := "^(https?|wss?)://([^/?#@]*@)?" + regexp.QuoteMeta(host) + "(\\.)?(:[0-9]+)?" + pathPart + query
-	return regex, position, nil
+	return regex, nil
 }
 func pathPrefixHasSegment(prefix, segment string) bool {
 	for _, part := range strings.Split(strings.Trim(prefix, "/"), "/") {

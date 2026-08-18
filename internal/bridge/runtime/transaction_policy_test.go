@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,11 +23,14 @@ func TestCompileTransactionPolicyPriorityMethodsAndTrailingDot(t *testing.T) {
 	if manifest.ManifestVersion != 3 || len(manifest.HostPermissions) != 4 {
 		t.Fatalf("manifest = %#v", manifest)
 	}
-	if len(rules) != 12 {
+	// One rule per authored rule per host, plus one default block per host.
+	// Denies are a single encoding-tolerant regex, not one variant per
+	// encodable character; see TestDenyRuleCountDoesNotScaleWithPathLength.
+	if len(rules) != 4 {
 		t.Fatalf("rule count = %d", len(rules))
 	}
 	denies, allows, defaults := rulesAtPriority(rules, 3), rulesAtPriority(rules, 2), rulesAtPriority(rules, 1)
-	if len(denies) != 9 || len(allows) != 2 || len(defaults) != 1 || denies[0].Action.Type != "block" || allows[0].Action.Type != "allow" {
+	if len(denies) != 1 || len(allows) != 2 || len(defaults) != 1 || denies[0].Action.Type != "block" || allows[0].Action.Type != "allow" {
 		t.Fatalf("priorities/actions = %#v", rules)
 	}
 	if got := strings.Join(defaults[0].Condition.ExcludedRequestMethods, ","); got != "get,head,options" {
@@ -45,7 +49,19 @@ func TestDenyRegexCoversChromeEncodedPathForms(t *testing.T) {
 		t.Fatal(err)
 	}
 	denies := rulesAtPriority(rules, 3)
-	for _, url := range []string{"https://supplier.example/checkout", "https://user:password@supplier.example/checkout", "https://supplier.example/chec%6bout", "https://supplier.example/%2Fcheckout", "https://supplier.example./chec%6bout"} {
+	for _, url := range []string{
+		"https://supplier.example/checkout",
+		"https://user:password@supplier.example/checkout",
+		"https://supplier.example/chec%6bout",
+		"https://supplier.example/%2Fcheckout",
+		"https://supplier.example./chec%6bout",
+		// Multiple encoded characters at once. The previous per-position
+		// scheme emitted one variant per character and encoded exactly one
+		// of them, so these forms bypassed every deny rule it produced.
+		"https://supplier.example/%63%68eckout",
+		"https://supplier.example/%63%68%65%63%6b%6f%75%74",
+		"https://supplier.example/chec%6B%6Fut",
+	} {
 		if !anyRuleMatches(denies, url) {
 			t.Errorf("encoded deny bypass: %s", url)
 		}
@@ -251,5 +267,51 @@ func TestValidateTransactionPolicyLaunchRejectsSpoofedPathAndFallback(t *testing
 	}
 	if _, _, _, err := startBrowserWithRemoteAllocator(t.Context(), cfg, nil, 9222, "", launchGeoAlignment{}); err == nil {
 		t.Fatal("direct fallback bypassed validation")
+	}
+}
+
+// TestDenyRuleCountDoesNotScaleWithPathLength pins the property whose loss took
+// the browser down: deny rules were expanded into one regex per encodable
+// character, so rule count scaled with the length of every configured path. A
+// real 16-host policy compiled to 25840 rules against Chrome's 25000 limit,
+// failed closed, and left every instance unable to initialise its browser.
+func TestDenyRuleCountDoesNotScaleWithPathLength(t *testing.T) {
+	short := config.TransactionPolicyConfig{Enabled: true, Hosts: []string{"supplier.example"}, DenyRules: []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/pay"}}}
+	long := config.TransactionPolicyConfig{Enabled: true, Hosts: []string{"supplier.example"}, DenyRules: []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/a-very-long-checkout-and-payment-confirmation-path"}}}
+
+	_, shortRules, err := compileTransactionPolicy(short)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, longRules, err := compileTransactionPolicy(long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shortRules) != len(longRules) {
+		t.Fatalf("rule count scales with path length: %d vs %d", len(shortRules), len(longRules))
+	}
+
+	// A policy the size of the deployed one must stay well inside the limit.
+	hosts := make([]string, 0, 16)
+	for i := 0; i < 16; i++ {
+		hosts = append(hosts, fmt.Sprintf("supplier%d.example", i))
+	}
+	deny := make([]config.TransactionPolicyRule, 0, 120)
+	for i := 0; i < 120; i++ {
+		deny = append(deny, config.TransactionPolicyRule{Method: "*", PathPrefix: "/", PathSegment: fmt.Sprintf("checkout-step-%d", i)})
+	}
+	allow := make([]config.TransactionPolicyRule, 0, 17)
+	for i := 0; i < 17; i++ {
+		allow = append(allow, config.TransactionPolicyRule{Method: "POST", PathPrefix: fmt.Sprintf("/cart/%d", i)})
+	}
+	_, rules, err := compileTransactionPolicy(config.TransactionPolicyConfig{Enabled: true, Hosts: hosts, DenyRules: deny, AllowRules: allow})
+	if err != nil {
+		t.Fatalf("deployed-size policy failed to compile: %v", err)
+	}
+	if want := 16 * (120 + 17 + 1); len(rules) != want {
+		t.Fatalf("deployed-size policy = %d rules, want %d", len(rules), want)
+	}
+	if len(rules) > maxTransactionPolicyRules/2 {
+		t.Fatalf("deployed-size policy uses %d of %d rules, leaving too little headroom", len(rules), maxTransactionPolicyRules)
 	}
 }
