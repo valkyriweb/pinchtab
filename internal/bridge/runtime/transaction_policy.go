@@ -20,6 +20,15 @@ const (
 	// incomplete, and browser init fails with no usable reason. Validate against
 	// it explicitly so the failure names itself at compile time.
 	maxTransactionPolicyRegexRules = 1000
+	// Chrome compiles each regexFilter into a bounded program. Measured against
+	// Chrome for Testing in the sidecar image: a deny pattern alternating 10
+	// characters activates, 11 does not, and a 60-character literal allow also
+	// fails, so the ceiling is program size rather than rule count or length.
+	// Each "(c|%63)" group costs roughly seven literal characters. Exceed it and
+	// Chrome activates a SILENTLY INCOMPLETE ruleset: the rule is dropped, not
+	// rejected, so a deny simply stops enforcing. Budget of 9 leaves headroom
+	// for the wildcard tail. Verify with a container smoke, not unit tests.
+	maxAlternatedCharsPerRule = 9
 )
 
 type transactionPolicyManifest struct {
@@ -217,8 +226,13 @@ func transactionRuleRegex(host string, rule config.TransactionPolicyRule, encode
 		prefix = "/"
 	}
 	segment := strings.TrimSpace(rule.PathSegment)
-	literal := func(value string) string {
+	// budget is shared across every alternated token in one regex, so a rule
+	// spending it on a query parameter has none left for the value.
+	budget := maxAlternatedCharsPerRule
+	literal := func(value string, wildcard string) string {
 		if !encodePath {
+			// Allows are exact: never widened, never truncated. An allow that
+			// matched more than it names would grant payment permission.
 			return regexp.QuoteMeta(value)
 		}
 		var b strings.Builder
@@ -230,6 +244,17 @@ func transactionRuleRegex(host string, rule config.TransactionPolicyRule, encode
 				b.WriteString("(/|%2F)+")
 				continue
 			}
+			if budget <= 0 {
+				// Out of program budget. Match the rest with a wildcard that
+				// cannot cross a path or parameter boundary. This WIDENS the
+				// deny (confirm_order also blocks confirm_orange) and keeps it
+				// encoding-complete, because the wildcard matches %XX too.
+				// Widening a block fails closed; truncating without the
+				// wildcard would fail OPEN and silently stop blocking.
+				b.WriteString(wildcard)
+				return b.String()
+			}
+			budget--
 			// Match the byte plain or percent-encoded. Matching is
 			// case-insensitive, so %6B also covers %6b.
 			fmt.Fprintf(&b, "(%s|%%%02X)", regexp.QuoteMeta(string(c)), c)
@@ -245,20 +270,24 @@ func transactionRuleRegex(host string, rule config.TransactionPolicyRule, encode
 	case segment == "" && prefix == "/":
 		pathPart = "/[^?]*"
 	case segment == "":
-		pathPart = literal(prefix) + "(" + separator + "[^?]*)?"
+		pathPart = literal(prefix, "[^/?#]*") + "(" + separator + "[^?]*)?"
 	case prefix == "/":
-		pathPart = separator + "([^?]*" + separator + ")?" + literal(segment) + "(" + separator + "[^?]*)?"
+		pathPart = separator + "([^?]*" + separator + ")?" + literal(segment, "[^/?#]*") + "(" + separator + "[^?]*)?"
 	case pathPrefixHasSegment(prefix, segment):
-		pathPart = literal(prefix) + "(" + separator + "[^?]*)?"
+		pathPart = literal(prefix, "[^/?#]*") + "(" + separator + "[^?]*)?"
 	default:
-		pathPart = literal(prefix) + "(" + separator + "[^?]*)?" + separator + literal(segment) + "(" + separator + "[^?]*)?"
+		pathPart = literal(prefix, "[^/?#]*") + "(" + separator + "[^?]*)?" + separator + literal(segment, "[^/?#]*") + "(" + separator + "[^?]*)?"
 	}
 	query := "(\\?[^#]*)?(#.*)?$"
 	if rule.QueryParam != "" {
 		if encodePath {
 			// Denies match the configured pair anywhere in the query. Extra or
 			// conflicting parameters cannot turn a forbidden action into an allow.
-			pair := literal(rule.QueryParam) + "=" + literal(rule.QueryValue)
+			// The parameter NAME is not alternated. Spending budget on it would
+			// starve the value, and a name is as encodable as a value, so
+			// pinning it buys no safety. Matching the forbidden value under any
+			// parameter name is the wider, fail-closed reading.
+			pair := "[^#&=]*=" + literal(rule.QueryValue, "[^#&]*")
 			query = "\\?([^#&]*&)*" + pair + "(&[^#]*)?(#.*)?$"
 		} else {
 			// Allows must have exactly this whole query. A query condition is not a

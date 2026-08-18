@@ -93,6 +93,11 @@ func TestDenyQueryMatchesExactPairWithoutBroadeningPath(t *testing.T) {
 		"https://supplier.example/?x=1&action=checkout",
 		"https://supplier.example/?action=checkout&x=1",
 		"https://supplier.example/?action=cancel&action=checkout",
+		// Deliberately widened: the parameter NAME is not alternated, so the
+		// forbidden value is blocked under any name. A name is as encodable as
+		// a value, so pinning it bought no safety, and Chrome's per-rule regex
+		// budget cannot afford to alternate both.
+		"https://supplier.example/?xaction=checkout",
 		"https://supplier.example/?%61ction=checkout",
 		"https://supplier.example/?action=%63heckout",
 		"wss://supplier.example/?action=checkout",
@@ -105,7 +110,6 @@ func TestDenyQueryMatchesExactPairWithoutBroadeningPath(t *testing.T) {
 		"https://supplier.example/",
 		"https://supplier.example/?action=cart",
 		"https://supplier.example/?action=checkout-now",
-		"https://supplier.example/?xaction=checkout",
 		"https://supplier.example/?return=action%3Dcheckout",
 	} {
 		if anyRuleMatches(denies, url) {
@@ -359,6 +363,88 @@ func TestAllowRulesAreScopedByExactHostNotRequestDomains(t *testing.T) {
 		re := regexp.MustCompile(r.Condition.RegexFilter)
 		if re.MatchString("https://evil-supplier.example/cart") {
 			t.Fatalf("allow matched an unlisted host: %s", r.Condition.RegexFilter)
+		}
+	}
+}
+
+// countAlternations counts "(x|%XX)" groups, the unit Chrome's per-rule regex
+// program budget is spent on.
+func countAlternations(regex string) int {
+	// "(/|%2F)" separators also contain "|%" but are fixed structural cost that
+	// the measured budget already accounts for; only per-character groups count.
+	return strings.Count(regex, "|%") - strings.Count(regex, "(/|%2F)")
+}
+
+// A deny whose token exceeds the budget must still match the token and every
+// percent-encoded spelling of it. Truncating without the wildcard tail would
+// fail OPEN: the rule would quietly stop blocking the thing it names.
+func TestOverBudgetDenyStaysEncodingCompleteAndFailsClosed(t *testing.T) {
+	policy := testTransactionPolicy()
+	policy.DenyRules = []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/", PathSegment: "confirm_order"}}
+	_, rules, err := compileTransactionPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denies := rulesAtPriority(rules, 3)
+	for _, url := range []string{
+		"https://supplier.example/confirm_order",
+		"https://supplier.example/%63onfirm_order",
+		"https://supplier.example/confirm_%6Frder",
+		"https://supplier.example/%63%6F%6E%66%69%72%6D%5F%6F%72%64%65%72",
+		"https://supplier.example/shop/confirm_order",
+		"https://supplier.example/confirm_order?x=1",
+	} {
+		if !anyRuleMatches(denies, url) {
+			t.Errorf("over-budget deny failed open: %s", url)
+		}
+	}
+	// The widening is bounded: it cannot cross a path boundary.
+	for _, url := range []string{
+		"https://supplier.example/confirm",
+		"https://supplier.example/cart",
+	} {
+		if anyRuleMatches(denies, url) {
+			t.Errorf("widened deny escaped its path segment: %s", url)
+		}
+	}
+}
+
+// Every generated rule must stay inside the measured Chrome budget. Over it,
+// Chrome does not reject the rule, it activates a ruleset with the rule
+// missing, so this is the only thing standing between us and a silent no-op.
+func TestNoRuleExceedsChromeRegexBudget(t *testing.T) {
+	policy := testTransactionPolicy()
+	policy.DenyRules = []config.TransactionPolicyRule{
+		{Method: "*", PathPrefix: "/", PathSegment: "confirm_order"},
+		{Method: "*", PathPrefix: "/", QueryParam: "wc-ajax", QueryValue: "confirm_order"},
+		{Method: "*", PathPrefix: "/a_very_long_prefix_indeed", PathSegment: "place_order"},
+	}
+	_, rules, err := compileTransactionPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rules {
+		if n := countAlternations(r.Condition.RegexFilter); n > maxAlternatedCharsPerRule {
+			t.Errorf("rule %d has %d alternations, budget is %d: %s", r.ID, n, maxAlternatedCharsPerRule, r.Condition.RegexFilter)
+		}
+	}
+}
+
+// Allows must never be widened or truncated. A widened allow grants payment
+// permission on a URL nobody approved.
+func TestAllowsAreNeverWidenedByTheBudget(t *testing.T) {
+	policy := testTransactionPolicy()
+	policy.AllowRules = []config.TransactionPolicyRule{{Method: "*", PathPrefix: "/customer/account/login/extra/long/path"}}
+	_, rules, err := compileTransactionPolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rulesAtPriority(rules, 4) {
+		if strings.Contains(r.Condition.RegexFilter, "[^/?#]*(") || countAlternations(r.Condition.RegexFilter) > 0 {
+			t.Errorf("allow was widened or alternated: %s", r.Condition.RegexFilter)
+		}
+		if !strings.Contains(r.Condition.RegexFilter, regexp.QuoteMeta("/customer/account/login/extra/long/path")) {
+			t.Errorf("allow lost its exact path: %s", r.Condition.RegexFilter)
 		}
 	}
 }
