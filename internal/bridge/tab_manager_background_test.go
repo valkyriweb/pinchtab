@@ -18,6 +18,15 @@ import (
 )
 
 func TestCreateTabRequestsRenderedTargetWithoutWindowFocus(t *testing.T) {
+	testCreateTabBrowserExecutor(t, false)
+}
+
+func TestCreateTabUsesBrowserExecutorAfterRootTargetIsClosed(t *testing.T) {
+	testCreateTabBrowserExecutor(t, true)
+}
+
+func testCreateTabBrowserExecutor(t *testing.T, closeRoot bool) {
+	t.Helper()
 	created := make(chan json.RawMessage, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -27,6 +36,7 @@ func TestCreateTabRequestsRenderedTargetWithoutWindowFocus(t *testing.T) {
 		}
 		defer func() { _ = conn.Close() }()
 
+		rootClosed := false
 		for {
 			payload, op, err := wsutil.ReadClientData(conn)
 			if err != nil {
@@ -46,10 +56,32 @@ func TestCreateTabRequestsRenderedTargetWithoutWindowFocus(t *testing.T) {
 				return
 			}
 
+			// A closed target cannot answer commands on its old session, while
+			// browser-scoped commands must remain usable.
+			if rootClosed && command.SessionID == "session-existing-tab" {
+				continue
+			}
 			result := `{}`
 			switch command.Method {
+			case "Target.closeTarget":
+				var params struct {
+					TargetID string `json:"targetId"`
+				}
+				if json.Unmarshal(command.Params, &params) != nil {
+					return
+				}
+				if params.TargetID == "existing-tab" {
+					rootClosed = true
+				}
+				result = `{"success":true}`
 			case "Target.attachToTarget":
-				result = `{"sessionId":"session-existing"}`
+				var params struct {
+					TargetID string `json:"targetId"`
+				}
+				if json.Unmarshal(command.Params, &params) != nil {
+					return
+				}
+				result = fmt.Sprintf(`{"sessionId":%q}`, "session-"+params.TargetID)
 			case "Runtime.evaluate":
 				result = `{"result":{"type":"object","className":"Window"}}`
 			case "Page.getFrameTree":
@@ -57,6 +89,9 @@ func TestCreateTabRequestsRenderedTargetWithoutWindowFocus(t *testing.T) {
 			case "DOM.getDocument":
 				result = `{"root":{"nodeId":1,"backendNodeId":1,"nodeType":9,"nodeName":"#document","localName":"","nodeValue":""}}`
 			case "Target.createTarget":
+				if command.SessionID != "" {
+					t.Errorf("Target.createTarget must use browser executor, got target session %q", command.SessionID)
+				}
 				created <- append(json.RawMessage(nil), command.Params...)
 				result = `{"targetId":"created-tab"}`
 			}
@@ -81,6 +116,16 @@ func TestCreateTabRequestsRenderedTargetWithoutWindowFocus(t *testing.T) {
 	defer browserCancel()
 	if err := chromedp.Run(browserCtx); err != nil {
 		t.Fatalf("initialize browser context: %v", err)
+	}
+
+	if closeRoot {
+		execCtx, err := browserExecutorContext(browserCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := target.CloseTarget(target.ID("existing-tab")).Do(execCtx); err != nil {
+			t.Fatalf("close original browser target: %v", err)
+		}
 	}
 
 	setupCalled := false

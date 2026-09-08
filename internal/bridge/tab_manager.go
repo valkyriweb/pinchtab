@@ -292,7 +292,8 @@ func (tm *TabManager) createTab(url, browserContextID string) (string, context.C
 				params = params.WithBrowserContextID(cdp.BrowserContextID(browserContextID))
 			}
 			var err error
-			targetID, err = params.Do(ctx)
+			// Target creation must survive closure of the context's original tab.
+			targetID, err = params.Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
 			return err
 		}),
 	); err != nil {
