@@ -1,6 +1,9 @@
 package urls
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalize(t *testing.T) {
 	tests := []struct {
@@ -133,6 +136,9 @@ func TestRedactForLog(t *testing.T) {
 		{"https://user:pass@Example.COM:8443/callback?code=secret#done", "https://example.com:8443/callback"},
 		{"example.com/path?q=1", "https://example.com/path"},
 		{"about:blank#frag", "about:blank"},
+		{"https://example.com/" + strings.Repeat("a", 492), "https://example.com/" + strings.Repeat("a", 492)},
+		{"https://example.com/" + strings.Repeat("a", 493), "https://example.com/" + strings.Repeat("a", 489) + "..."},
+		{"https://user:pass@EXAMPLE.COM/" + strings.Repeat("a", 492) + "?token=secret#private", "https://example.com/" + strings.Repeat("a", 492)},
 		{"", ""},
 		{"://bad-url", ""},
 	}
