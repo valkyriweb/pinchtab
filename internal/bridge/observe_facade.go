@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"time"
 
 	bridgeobserve "github.com/pinchtab/pinchtab/internal/bridge/observe"
 )
@@ -30,6 +31,8 @@ type NetworkFilter = bridgeobserve.NetworkFilter
 type NetworkMonitor = bridgeobserve.NetworkMonitor
 type MemoryMetrics = bridgeobserve.MemoryMetrics
 
+type PageMetrics = bridgeobserve.PageMetrics
+
 func frameIDs(tree RawFrameTree) []string {
 	return bridgeobserve.FrameIDs(tree)
 }
@@ -44,6 +47,39 @@ func FrameOwnerMap(ctx context.Context, tree RawFrameTree) map[string]int64 {
 
 func FetchFrameTree(ctx context.Context) (RawFrameTree, error) {
 	return bridgeobserve.FetchFrameTree(ctx)
+}
+
+type FrameContext = bridgeobserve.FrameContext
+
+func FetchFrameContext(ctx context.Context) (FrameContext, error) {
+	return bridgeobserve.FetchFrameContext(ctx)
+}
+
+func WaitForQuietWindow(ctx context.Context, quiet, ceiling time.Duration) (time.Duration, error) {
+	return bridgeobserve.WaitForQuietWindow(ctx, quiet, ceiling)
+}
+
+func WaitForReadyState(ctx context.Context, ceiling time.Duration) (string, error) {
+	return bridgeobserve.WaitForReadyState(ctx, ceiling)
+}
+
+type BoundingBox = bridgeobserve.BoundingBox
+type ViewportInfo = bridgeobserve.ViewportInfo
+
+func FetchLayout(ctx context.Context) (ViewportInfo, error) {
+	return bridgeobserve.FetchLayout(ctx)
+}
+
+func AnnotateBounds(ctx context.Context, nodes []A11yNode, pageCoords bool, vp ViewportInfo) error {
+	return bridgeobserve.AnnotateBounds(ctx, nodes, pageCoords, vp)
+}
+
+func ElementBorderBox(ctx context.Context, backendNodeID int64) (BoundingBox, bool) {
+	return bridgeobserve.ElementBorderBox(ctx, backendNodeID)
+}
+
+func IsOnScreen(box BoundingBox, vp ViewportInfo) bool {
+	return bridgeobserve.IsOnScreen(box, vp)
 }
 
 func FetchAXTree(ctx context.Context) ([]RawAXNode, error) {
@@ -90,18 +126,14 @@ func matchStatusRange(status int, pattern string) bool {
 	return bridgeobserve.MatchStatusRange(status, pattern)
 }
 
-func GetResponseBodyDirect(ctx context.Context, requestID string) (string, bool, error) {
-	return bridgeobserve.GetResponseBodyDirect(ctx, requestID)
-}
-
-func (b *Bridge) GetMemoryMetrics(tabID string) (*MemoryMetrics, error) {
-	return b.GetAggregatedMemoryMetrics()
-}
-
-func (b *Bridge) GetBrowserMemoryMetrics() (*MemoryMetrics, error) {
-	return b.GetAggregatedMemoryMetrics()
+func GetResponseBody(ctx context.Context, requestID string) (string, bool, error) {
+	return bridgeobserve.GetResponseBody(ctx, requestID)
 }
 
 func (b *Bridge) GetAggregatedMemoryMetrics() (*MemoryMetrics, error) {
-	return bridgeobserve.GetAggregatedMemoryMetrics(b.BrowserCtx)
+	var targets map[string]context.Context
+	if tm, err := b.tabManager(); err == nil {
+		targets = tm.LiveTabContexts()
+	}
+	return bridgeobserve.GetAggregatedMemoryMetrics(b.BrowserCtx, targets)
 }

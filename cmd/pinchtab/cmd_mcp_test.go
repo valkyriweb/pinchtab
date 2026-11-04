@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pinchtab/pinchtab/internal/server"
 )
 
 func TestIsServerHealthy_ReturnsTrue(t *testing.T) {
@@ -57,6 +59,21 @@ func TestIsServerHealthy_SendsAuthHeader(t *testing.T) {
 	}
 }
 
+func TestIsServerHealthy_SendsSessionAuthHeader(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Session ses_testtoken" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if !isServerHealthy(ts.URL, "ses_testtoken") {
+		t.Fatal("expected healthy server with session token to return true")
+	}
+}
+
 func TestWaitForServer_ImmediatelyHealthy(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -79,8 +96,8 @@ func TestEnsureServerNoopWhenHealthy(t *testing.T) {
 			started = true
 			return nil
 		},
-		func(baseURL, token string) bool {
-			return true
+		func(baseURL, token string) server.HealthProbe {
+			return server.HealthProbe{Reachable: true, StatusCode: http.StatusOK}
 		},
 		time.Second,
 	)
@@ -105,9 +122,12 @@ func TestEnsureServerStartsAndWaits(t *testing.T) {
 			started = true
 			return nil
 		},
-		func(baseURL, token string) bool {
+		func(baseURL, token string) server.HealthProbe {
 			healthChecks++
-			return started && healthChecks >= 2
+			if started && healthChecks >= 2 {
+				return server.HealthProbe{Reachable: true, StatusCode: http.StatusOK}
+			}
+			return server.HealthProbe{}
 		},
 		time.Second,
 	)
@@ -135,8 +155,8 @@ func TestEnsureServerDoesNotStartWhenAutoStartDisabled(t *testing.T) {
 			started = true
 			return nil
 		},
-		func(baseURL, token string) bool {
-			return false
+		func(baseURL, token string) server.HealthProbe {
+			return server.HealthProbe{}
 		},
 		time.Second,
 	)
@@ -170,8 +190,8 @@ func TestEnsureServerReturnsStartError(t *testing.T) {
 		func() error {
 			return wantErr
 		},
-		func(baseURL, token string) bool {
-			return false
+		func(baseURL, token string) server.HealthProbe {
+			return server.HealthProbe{}
 		},
 		time.Second,
 	)

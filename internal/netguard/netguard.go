@@ -24,6 +24,29 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("198.18.0.0/15"),
 }
 
+var nat64WellKnownPrefix = netip.MustParsePrefix("64:ff9b::/96")
+
+// embeddedIPv4 extracts the IPv4 address carried inside an IPv6 transition
+// address (6to4 2002::/16, NAT64 64:ff9b::/96). These wrappers are globally
+// scoped, so IsPrivate/IsLoopback/IsLinkLocalUnicast all report false while the
+// traffic still reaches the embedded IPv4 — 64:ff9b::a9fe:a9fe is the cloud
+// metadata service. The embedded address is decoded rather than the prefixes
+// being banned outright so transition addresses wrapping a public IPv4 keep
+// working.
+func embeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
+	if !addr.Is6() {
+		return netip.Addr{}, false
+	}
+	b := addr.As16()
+	if b[0] == 0x20 && b[1] == 0x02 {
+		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
+	}
+	if nat64WellKnownPrefix.Contains(addr) {
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	}
+	return netip.Addr{}, false
+}
+
 func NormalizeHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
@@ -71,6 +94,9 @@ func ValidatePublicIP(ip net.IP) error {
 			return ErrPrivateInternalIP
 		}
 	}
+	if v4, ok := embeddedIPv4(addr); ok {
+		return ValidatePublicIP(net.IP(v4.AsSlice()))
+	}
 	return nil
 }
 
@@ -81,11 +107,11 @@ func ResolveAndValidatePublicIPs(ctx context.Context, host string) ([]netip.Addr
 	}
 
 	if ip := net.ParseIP(host); ip != nil {
-		addr, err := publicAddr(ip)
-		if err != nil {
-			return nil, err
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			return nil, ErrPrivateInternalIP
 		}
-		return []netip.Addr{addr}, nil
+		return ValidateResolvedPublicAddrs([]netip.Addr{addr})
 	}
 
 	ips, err := ResolveHostIPs(ctx, "ip", host)
@@ -93,11 +119,29 @@ func ResolveAndValidatePublicIPs(ctx context.Context, host string) ([]netip.Addr
 		return nil, ErrResolveHost
 	}
 
+	addrs := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			return nil, ErrPrivateInternalIP
+		}
+		addrs = append(addrs, addr)
+	}
+	return ValidateResolvedPublicAddrs(addrs)
+}
+
+func ValidateResolvedPublicAddrs(ips []netip.Addr) ([]netip.Addr, error) {
+	if len(ips) == 0 {
+		return nil, ErrResolveHost
+	}
 	seen := make(map[netip.Addr]struct{}, len(ips))
 	out := make([]netip.Addr, 0, len(ips))
-	for _, ip := range ips {
-		addr, err := publicAddr(ip)
-		if err != nil {
+	for _, addr := range ips {
+		if !addr.IsValid() {
+			return nil, ErrPrivateInternalIP
+		}
+		addr = addr.Unmap()
+		if err := ValidatePublicIP(net.IP(addr.AsSlice())); err != nil {
 			return nil, err
 		}
 		if _, ok := seen[addr]; ok {
@@ -122,6 +166,12 @@ func NormalizeRemoteIP(raw string) string {
 func ValidateRemoteIPAddress(raw string) error {
 	raw = NormalizeRemoteIP(raw)
 	if raw == "" {
+		// Accepted by design: CDP reports no remote IP for cache- and
+		// service-worker-served responses, so erroring here would break
+		// legitimate cached navigations. This post-connect check is the last
+		// of several layers (URL validation, resolve-time checks with pinned
+		// IPs, dial-time enforcement on the static path); the residual
+		// exposure is a cached/SW response for an already-validated target.
 		return nil
 	}
 	ip := net.ParseIP(raw)
@@ -181,12 +231,4 @@ func ipInCIDRs(ip net.IP, cidrs []*net.IPNet) bool {
 		}
 	}
 	return false
-}
-
-func publicAddr(ip net.IP) (netip.Addr, error) {
-	if err := ValidatePublicIP(ip); err != nil {
-		return netip.Addr{}, err
-	}
-	addr, _ := netip.AddrFromSlice(ip)
-	return addr.Unmap(), nil
 }

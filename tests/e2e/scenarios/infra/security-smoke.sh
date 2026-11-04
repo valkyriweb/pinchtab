@@ -5,21 +5,11 @@ GROUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${GROUP_DIR}/../../helpers/api.sh"
 
 secure_get() {
-  local path="$1"
-  shift
-  local old_url="$E2E_SERVER"
-  E2E_SERVER="$E2E_SECURE_SERVER"
-  pt_get "$path" "$@"
-  E2E_SERVER="$old_url"
+  with_server "$E2E_SECURE_SERVER" pt_get "$@"
 }
 
 secure_post() {
-  local path="$1"
-  shift
-  local old_url="$E2E_SERVER"
-  E2E_SERVER="$E2E_SECURE_SERVER"
-  pt_post "$path" "$@"
-  E2E_SERVER="$old_url"
+  with_server "$E2E_SECURE_SERVER" pt_post "$@"
 }
 
 PIVOT_URL="http://pivot-target:80/index.html"
@@ -63,7 +53,7 @@ fi
 end_test
 
 # ─────────────────────────────────────────────────────────────────
-start_test "security: instance-scoped wildcard widens one strict instance only"
+start_test "security: an instance-scoped bare wildcard grants no private-IP override"
 
 secure_post /instances/start -d '{"mode":"headless","securityPolicy":{"allowedDomains":["*"]}}'
 assert_http_status 201 "start wildcard instance"
@@ -77,13 +67,8 @@ if [ -n "$SECURE_WILDCARD_INST_ID" ] && wait_for_orchestrator_instance_status "$
   fi
 
   secure_post "/instances/${SECURE_WILDCARD_INST_ID}/tabs/open" "{\"url\":\"${PIVOT_URL}\"}"
-  assert_ok "wildcard instance can open pivot-target"
-  WILDCARD_TAB_ID=$(echo "$RESULT" | jq -r '.tabId // empty')
-  if [ -n "$WILDCARD_TAB_ID" ]; then
-    secure_get "/tabs/${WILDCARD_TAB_ID}/text"
-    assert_ok "wildcard instance text works on pivot-target"
-    assert_contains "$RESULT" "Welcome to the E2E test fixtures." "wildcard instance reaches non-baseline host"
-  fi
+  assert_http_status 403 "wildcard instance is refused the private pivot-target"
+  assert_contains "$RESULT" "private/internal IP" "the refusal names the private-IP guard, not the domain allowlist"
 fi
 
 secure_post /navigate -d "{\"url\":\"${PIVOT_URL}\"}"

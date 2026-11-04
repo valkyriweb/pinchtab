@@ -7,33 +7,45 @@ import (
 	"path/filepath"
 )
 
-func (pm *ProfileManager) Import(name, sourcePath string) error {
+// preflightProfileDestination validates name, ensures no existing profile or
+// destination directory collides, and returns the derived profile id and
+// destination path. Callers must hold pm.mu. dirConflictMsg formats the
+// directory-collision message (receiving the profile name); pass nil to reuse
+// the name-collision wording.
+func (pm *ProfileManager) preflightProfileDestination(name string, dirConflictMsg func(string) string) (id, dest string, err error) {
 	if err := ValidateProfileName(name); err != nil {
-		return err
+		return "", "", err
 	}
+	if _, err := pm.findProfileDirByName(name); err == nil {
+		return "", "", tagged(ErrProfileExists, fmt.Sprintf("profile %q already exists", name))
+	}
+	id = profileID(name)
+	dest = filepath.Join(pm.baseDir, id)
+	if _, err := os.Stat(dest); err == nil {
+		if dirConflictMsg != nil {
+			return "", "", tagged(ErrProfileDirExists, dirConflictMsg(name))
+		}
+		return "", "", tagged(ErrProfileExists, fmt.Sprintf("profile %q already exists", name))
+	}
+	return id, dest, nil
+}
+
+func (pm *ProfileManager) Import(name, sourcePath string) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	if _, err := pm.findProfileDirByName(name); err == nil {
-		return fmt.Errorf("profile %q already exists", name)
-	}
-	dest := filepath.Join(pm.baseDir, profileID(name))
-	if _, err := os.Stat(dest); err == nil {
-		return fmt.Errorf("profile %q already exists", name)
-	}
-
-	resolvedSourcePath, err := resolveImportSourcePath(sourcePath)
+	id, _, err := pm.preflightProfileDestination(name, nil)
 	if err != nil {
 		return err
 	}
 
-	if _, err := os.Stat(filepath.Join(resolvedSourcePath, "Default")); err != nil {
-		if _, err2 := os.Stat(filepath.Join(resolvedSourcePath, "Preferences")); err2 != nil {
-			return fmt.Errorf("source doesn't look like a Chrome user data dir (no Default/ or Preferences found)")
-		}
+	source, err := openImportSource(sourcePath)
+	if err != nil {
+		return err
 	}
+	defer func() { _ = source.root.Close() }()
 
-	srcInfo, err := os.Lstat(resolvedSourcePath)
+	srcInfo, err := source.root.Lstat(source.relative)
 	if err != nil {
 		return fmt.Errorf("source path invalid: %w", err)
 	}
@@ -43,19 +55,52 @@ func (pm *ProfileManager) Import(name, sourcePath string) error {
 	if !srcInfo.IsDir() {
 		return fmt.Errorf("source path must be a directory")
 	}
+	if _, err := source.root.Stat(source.child("Default")); err != nil {
+		if _, err2 := source.root.Stat(source.child("Preferences")); err2 != nil {
+			return fmt.Errorf("source doesn't look like a Chrome user data dir (no Default/ or Preferences found)")
+		}
+	}
 
-	slog.Info("importing profile", "name", name, "source", resolvedSourcePath)
-	if err := copyDir(resolvedSourcePath, dest); err != nil {
+	slog.Info("importing profile", "name", name, "source", source.displayPath)
+	// Import is all-or-nothing. The rooted Mkdir claims the preflighted id
+	// atomically, so anything under it is ours to remove on failure.
+	baseRoot, err := os.OpenRoot(pm.baseDir)
+	if err != nil {
+		return fmt.Errorf("open profile root: %w", err)
+	}
+	defer func() { _ = baseRoot.Close() }()
+	if err := baseRoot.Mkdir(id, srcInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("create profile destination: %w", err)
+	}
+	destRoot, err := baseRoot.OpenRoot(id)
+	if err != nil {
+		_ = baseRoot.RemoveAll(id)
+		return fmt.Errorf("open profile destination: %w", err)
+	}
+	cleanup := func() {
+		_ = destRoot.Close()
+		_ = baseRoot.RemoveAll(id)
+	}
+	if err := copyDir(source, destRoot); err != nil {
+		cleanup()
 		return fmt.Errorf("copy failed: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dest, ".pinchtab-imported"), []byte(resolvedSourcePath), 0600); err != nil {
+	if err := destRoot.WriteFile(".pinchtab-imported", []byte(source.displayPath), 0600); err != nil {
 		slog.Warn("failed to write import marker", "err", err)
 	}
-	return writeProfileMeta(dest, ProfileMeta{
-		ID:   profileID(name),
+	if err := writeProfileMetaRoot(destRoot, ProfileMeta{
+		ID:   id,
 		Name: name,
-	})
+	}); err != nil {
+		cleanup()
+		return err
+	}
+	if err := destRoot.Close(); err != nil {
+		_ = baseRoot.RemoveAll(id)
+		return fmt.Errorf("close profile destination: %w", err)
+	}
+	return nil
 }
 
 func (pm *ProfileManager) ImportWithMeta(name, sourcePath string, meta ProfileMeta) error {
@@ -73,24 +118,18 @@ func (pm *ProfileManager) ImportWithMeta(name, sourcePath string, meta ProfileMe
 }
 
 func (pm *ProfileManager) Create(name string) error {
-	if err := ValidateProfileName(name); err != nil {
-		return err
-	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	if _, err := pm.findProfileDirByName(name); err == nil {
-		return fmt.Errorf("profile %q already exists", name)
-	}
-	dest := filepath.Join(pm.baseDir, profileID(name))
-	if _, err := os.Stat(dest); err == nil {
-		return fmt.Errorf("profile %q already exists", name)
+	id, dest, err := pm.preflightProfileDestination(name, nil)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Join(dest, "Default"), 0755); err != nil {
 		return err
 	}
 	return writeProfileMeta(dest, ProfileMeta{
-		ID:   profileID(name),
+		ID:   id,
 		Name: name,
 	})
 }
@@ -119,6 +158,9 @@ func (pm *ProfileManager) Reset(name string) error {
 	dir, err := pm.findProfileDirByName(name)
 	if err != nil {
 		return err
+	}
+	if holder, held := pm.profileHolder(profileID(name), dir); held {
+		return tagged(ErrProfileInUse, fmt.Sprintf("profile %q is in use by %s; stop it before resetting", name, holder))
 	}
 
 	resetProfileDir(dir)
@@ -159,17 +201,40 @@ func resetProfileDir(dir string) {
 }
 
 func (pm *ProfileManager) Delete(name string) error {
+	_, err := pm.remove(name, false)
+	return err
+}
+
+// ForceDelete skips the in-use refusal. profiles is a leaf and cannot stop
+// instances, so a held profile is removed anyway and the holder is returned
+// for the response to report as orphaned — a browser left running on a
+// deleted directory must never be silent.
+func (pm *ProfileManager) ForceDelete(name string) (orphanedInstance string, err error) {
+	return pm.remove(name, true)
+}
+
+func (pm *ProfileManager) remove(name string, force bool) (string, error) {
 	if err := ValidateProfileName(name); err != nil {
-		return err
+		return "", err
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	dir, err := pm.findProfileDirByName(name)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return os.RemoveAll(dir)
+	holder, held := pm.profileHolder(profileID(name), dir)
+	if held && !force {
+		return "", tagged(ErrProfileInUse, fmt.Sprintf("profile %q is in use by %s; delete with force=true to remove it anyway", name, holder))
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if held {
+		return holder, nil
+	}
+	return "", nil
 }
 
 func (pm *ProfileManager) UpdateMeta(name string, meta map[string]string) error {
@@ -185,7 +250,10 @@ func (pm *ProfileManager) UpdateMeta(name string, meta map[string]string) error 
 		return err
 	}
 
-	existing := readProfileMeta(dir)
+	existing, err := readProfileMetaForUpdate(dir)
+	if err != nil {
+		return err
+	}
 	if existing.Name == "" {
 		existing.Name = name
 	}
@@ -219,26 +287,26 @@ func (pm *ProfileManager) Rename(oldName, newName string) error {
 		return err
 	}
 
-	if _, err := pm.findProfileDirByName(newName); err == nil {
-		return fmt.Errorf("profile %q already exists", newName)
+	newID, newDir, err := pm.preflightProfileDestination(newName, func(n string) string {
+		return fmt.Sprintf("profile directory for %q already exists", n)
+	})
+	if err != nil {
+		return err
 	}
 
-	newDir := filepath.Join(pm.baseDir, profileID(newName))
-	if _, err := os.Stat(newDir); err == nil {
-		return fmt.Errorf("profile directory for %q already exists", newName)
-	}
-
-	meta := readProfileMeta(oldDir)
-	meta.ID = profileID(newName)
+	original := readProfileMeta(oldDir)
+	meta := original
+	meta.ID = newID
 	meta.Name = newName
 	if err := writeProfileMeta(oldDir, meta); err != nil {
 		return fmt.Errorf("failed to update profile metadata: %w", err)
 	}
 
 	if err := os.Rename(oldDir, newDir); err != nil {
-		meta.ID = profileID(oldName)
-		meta.Name = oldName
-		_ = writeProfileMeta(oldDir, meta)
+		// Restore what was read, not a recomputed equivalent: an imported profile
+		// can carry an id that is not profileID(oldName), and the listing asserts
+		// identity on that id.
+		_ = writeProfileMeta(oldDir, original)
 		return fmt.Errorf("failed to rename profile directory: %w", err)
 	}
 

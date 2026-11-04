@@ -33,11 +33,10 @@ func decodeIntegrationResponse(t *testing.T, w *httptest.ResponseRecorder) map[s
 func TestAgentSessionAPI_Me_UsesContextSessionAfterMiddlewareAuth(t *testing.T) {
 	store := newIntegrationSessionStore()
 	mux := http.NewServeMux()
-	dashboard.NewSessionAPI(store).RegisterHandlers(mux)
+	dashboard.NewSessionAPI(store, nil).RegisterHandlers(mux)
 
-	sessionID, token, _ := store.Create("agent-1", "my-session")
-	handler := handlers.AuthMiddlewareWithSessions(
-		&config.RuntimeConfig{Token: "dashboard-token"},
+	sessionID, token, _ := store.Create("agent-1", "my-session", "")
+	handler := handlers.AuthMiddlewareWithSessions(config.NewLive(&config.RuntimeConfig{Token: "dashboard-token"}),
 		nil,
 		store,
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,11 +64,10 @@ func TestAgentSessionAPI_Me_UsesContextSessionAfterMiddlewareAuth(t *testing.T) 
 func TestAgentSessionAPI_Revoke_UsesContextSessionAfterMiddlewareAuth(t *testing.T) {
 	store := newIntegrationSessionStore()
 	mux := http.NewServeMux()
-	dashboard.NewSessionAPI(store).RegisterHandlers(mux)
+	dashboard.NewSessionAPI(store, nil).RegisterHandlers(mux)
 
-	sessionID, token, _ := store.Create("agent-1", "")
-	handler := handlers.AuthMiddlewareWithSessions(
-		&config.RuntimeConfig{Token: "dashboard-token"},
+	sessionID, token, _ := store.Create("agent-1", "", "")
+	handler := handlers.AuthMiddlewareWithSessions(config.NewLive(&config.RuntimeConfig{Token: "dashboard-token"}),
 		nil,
 		store,
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

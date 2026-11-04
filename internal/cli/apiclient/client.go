@@ -1,236 +1,224 @@
 package apiclient
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/pinchtab/pinchtab/internal/api/types"
 )
 
-func DoGet(client *http.Client, base, token, path string, params url.Values) map[string]any {
-	u := base + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
-	req, _ := http.NewRequest("GET", u, nil)
-	setClientHeaders(req, token)
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal("Request failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
+const (
+	vocabHeader      = types.HeaderVocab
+	vocabTabIDHeader = types.HeaderTabID
+	vocabStoreLimit  = 16
+)
 
-	if resp.StatusCode >= 400 {
-		handleAPIError(resp.StatusCode, body)
-		os.Exit(1)
-	}
-
-	return printAndDecode(body)
+// vocabEntry pairs a snapshot's vocabulary token with the tab the server
+// actually resolved it for, so a later action echoes the token only when it
+// targets that same tab.
+type vocabEntry struct {
+	TabID string `json:"tabId"`
+	Token string `json:"token"`
 }
 
-func DoGetRaw(client *http.Client, base, token, path string, params url.Values) []byte {
-	u := base + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
+// vocabStore is one server's token records plus the tab the last implicit
+// snapshot resolved, so an implicit action can echo that tab's token and tag it.
+type vocabStore struct {
+	Current string       `json:"current"`
+	Entries []vocabEntry `json:"entries"`
+}
+
+// VocabForAction returns the tab id to tag and the token to echo for an action.
+// An explicit --tab X uses X's own record; an implicit action uses the current
+// pointer's tab. The returned tab is sent as VocabTabHeader so the server can
+// ignore the token when the action resolves a different tab.
+func VocabForAction(base, requestedTab string) (vocabTab, token string) {
+	store := loadVocabStore(base)
+	tab := requestedTab
+	if tab == "" {
+		tab = store.Current
 	}
-	req, _ := http.NewRequest("GET", u, nil)
-	setClientHeaders(req, token)
-	resp, err := client.Do(req)
+	if tab == "" {
+		return "", ""
+	}
+	for _, e := range store.Entries {
+		if e.TabID == tab {
+			return tab, e.Token
+		}
+	}
+	return tab, ""
+}
+
+// VocabTokenFor returns the token stored for a resolved tab id, or "".
+func VocabTokenFor(base, tabID string) string {
+	if tabID == "" {
+		return ""
+	}
+	_, token := VocabForAction(base, tabID)
+	return token
+}
+
+func storeVocabToken(base, tabID, token string, implicit bool) {
+	if tabID == "" || token == "" {
+		return
+	}
+	store := loadVocabStore(base)
+	kept := store.Entries[:0]
+	for _, e := range store.Entries {
+		if e.TabID != tabID {
+			kept = append(kept, e)
+		}
+	}
+	kept = append(kept, vocabEntry{TabID: tabID, Token: token})
+	if len(kept) > vocabStoreLimit {
+		kept = kept[len(kept)-vocabStoreLimit:]
+	}
+	store.Entries = kept
+	if implicit {
+		store.Current = tabID
+	}
+	writeVocabStore(base, store)
+}
+
+func loadVocabStore(base string) vocabStore {
+	data, err := os.ReadFile(vocabStorePath(base))
 	if err != nil {
-		fatal("Request failed: %v", err)
-		return nil
+		return vocabStore{}
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		fmt.Fprintf(os.Stderr, "Error %d: %s\n", resp.StatusCode, string(body))
-		os.Exit(1)
+	var store vocabStore
+	if err := json.Unmarshal(data, &store); err != nil {
+		return vocabStore{}
 	}
+	return store
+}
+
+func writeVocabStore(base string, store vocabStore) {
+	path := vocabStorePath(base)
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	data, err := json.Marshal(store)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0600)
+}
+
+func vocabStorePath(base string) string {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir != "" {
+		dir += "/pinchtab"
+	} else if home, err := os.UserHomeDir(); err == nil {
+		dir = home + "/.local/state/pinchtab"
+	} else {
+		dir = "/tmp/pinchtab"
+	}
+	return filepath.Join(dir, "vocab-"+fileSlug(base))
+}
+
+func fileSlug(s string) string {
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "http://"), "https://")
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			return r
+		default:
+			return '-'
+		}
+	}, strings.Trim(s, "/"))
+	if s == "" {
+		return "default"
+	}
+	return s
+}
+
+// execute applies the standard fatal-on-transport-error + exit-on-HTTP-error
+// policy and returns the body.
+func execute(client *http.Client, token string, r request) []byte {
+	status, body := mustRequest(client, token, r)
+	exitOnAPIError(r, status, body)
 	return body
 }
 
-// DoGetRawAndPrint fetches and prints the raw response body (for --snap flag).
-func DoGetRawAndPrint(client *http.Client, base, token, pathWithQuery string) {
-	req, _ := http.NewRequest("GET", base+pathWithQuery, nil)
-	setClientHeaders(req, token)
-	resp, err := client.Do(req)
+// executeE is execute's returning twin: long-running commands use it when they
+// need to release resources before reporting a request failure.
+func executeE(client *http.Client, token string, r request) ([]byte, error) {
+	status, body, err := doRequest(client, token, r)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "snapshot failed: %v\n", err)
-		return
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		fmt.Fprintf(os.Stderr, "snapshot error %d: %s\n", resp.StatusCode, string(body))
-		return
+	if status >= http.StatusBadRequest {
+		return nil, &StatusError{Status: status, Body: body, message: strings.TrimSpace(renderAPIError(r, status, body))}
 	}
-	fmt.Println(string(body))
+	return body, nil
 }
 
-func DoPost(client *http.Client, base, token, path string, body map[string]any) map[string]any {
-	return DoPostWithHeaders(client, base, token, path, body, nil)
+func render(r request, body []byte) map[string]any {
+	if r.quiet {
+		return decodeObject(body)
+	}
+	return printAndDecode(body)
+}
+
+// decodeObject populates a map from an object response; array/scalar responses
+// leave it nil, so callers that need a map should branch on result == nil.
+func decodeObject(body []byte) map[string]any {
+	var result map[string]any
+	_ = json.Unmarshal(body, &result)
+	return result
+}
+
+func prepend(first RequestOption, opts []RequestOption) []RequestOption {
+	return append([]RequestOption{first}, opts...)
+}
+
+func DoGet(client *http.Client, base, token, path string, params url.Values, opts ...RequestOption) map[string]any {
+	r := newRequest(http.MethodGet, base, path, prepend(WithQuery(params), opts)...)
+	return render(r, execute(client, token, r))
+}
+
+func DoGetRaw(client *http.Client, base, token, path string, params url.Values, opts ...RequestOption) []byte {
+	return execute(client, token, newRequest(http.MethodGet, base, path, prepend(WithQuery(params), opts)...))
+}
+
+func DoPost(client *http.Client, base, token, path string, body map[string]any, opts ...RequestOption) map[string]any {
+	r := newRequest(http.MethodPost, base, path, prepend(WithBody(body), opts)...)
+	return render(r, execute(client, token, r))
 }
 
 // DoPostQuiet is like DoPost but does not print the response body. Callers are
 // responsible for rendering whatever output is appropriate (e.g. a single
 // field for machine-friendly piping).
-func DoPostQuiet(client *http.Client, base, token, path string, body map[string]any) map[string]any {
-	return DoPostQuietWithHeaders(client, base, token, path, body, nil)
+func DoPostQuiet(client *http.Client, base, token, path string, body map[string]any, opts ...RequestOption) map[string]any {
+	return DoPost(client, base, token, path, body, prepend(Quiet(), opts)...)
 }
 
 // DoPostRaw sends a POST and returns the raw response body without printing.
 // Exits on HTTP errors.
-func DoPostRaw(client *http.Client, base, token, path string, body map[string]any) []byte {
-	statusCode, respBody, _ := doPostQuietWithStatus(client, base, token, path, body, nil)
-	if statusCode >= 400 {
-		handleAPIError(statusCode, respBody)
-		os.Exit(1)
-	}
-	return respBody
+func DoPostRaw(client *http.Client, base, token, path string, body map[string]any, opts ...RequestOption) []byte {
+	return execute(client, token, newRequest(http.MethodPost, base, path, prepend(WithBody(body), opts)...))
 }
 
-func DoPostQuietWithStatus(client *http.Client, base, token, path string, body map[string]any) (int, []byte, map[string]any) {
-	return doPostQuietWithStatus(client, base, token, path, body, nil)
-}
-
-// DoPostQuietWithHeaders is like DoPostQuiet but allows custom headers.
-func DoPostQuietWithHeaders(client *http.Client, base, token, path string, body map[string]any, headers map[string]string) map[string]any {
-	statusCode, respBody, result := doPostQuietWithStatus(client, base, token, path, body, headers)
-	if statusCode >= 400 {
-		handleAPIError(statusCode, respBody)
-		os.Exit(1)
-	}
-	return result
-}
-
-func doPostQuietWithStatus(client *http.Client, base, token, path string, body map[string]any, headers map[string]string) (int, []byte, map[string]any) {
-	data, _ := json.Marshal(body)
-	req, _ := http.NewRequest("POST", base+path, bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	setClientHeaders(req, token)
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal("Request failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(resp.Body)
-
+func DoPostQuietWithStatus(client *http.Client, base, token, path string, body map[string]any, opts ...RequestOption) (int, []byte, map[string]any) {
+	status, respBody := mustRequest(client, token, newRequest(http.MethodPost, base, path, prepend(WithBody(body), opts)...))
 	var result map[string]any
-	if resp.StatusCode < 400 {
-		// Object responses populate result; array/scalar responses leave it nil.
-		// Callers that need a map should branch on result == nil.
-		_ = json.Unmarshal(respBody, &result)
+	if status < http.StatusBadRequest {
+		result = decodeObject(respBody)
 	}
-	return resp.StatusCode, respBody, result
+	return status, respBody, result
 }
 
-func PrintAndDecode(body []byte) map[string]any {
-	return printAndDecode(body)
+func DoDelete(client *http.Client, base, token, path string, params url.Values, opts ...RequestOption) map[string]any {
+	r := newRequest(http.MethodDelete, base, path, prepend(WithQuery(params), opts)...)
+	return render(r, execute(client, token, r))
 }
 
-func ExitWithAPIError(statusCode int, body []byte) {
-	handleAPIError(statusCode, body)
-	os.Exit(1)
-}
-
-func DoPostWithHeaders(client *http.Client, base, token, path string, body map[string]any, headers map[string]string) map[string]any {
-	data, _ := json.Marshal(body)
-	req, _ := http.NewRequest("POST", base+path, bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	setClientHeaders(req, token)
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal("Request failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		handleAPIError(resp.StatusCode, respBody)
-		os.Exit(1)
-	}
-
-	return printAndDecode(respBody)
-}
-
-// DoDelete sends a DELETE request with an optional JSON body (e.g. for ?name= query params, pass nil body and handle params in path).
-func DoDelete(client *http.Client, base, token, path string, params url.Values) map[string]any {
-	u := base + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
-	req, _ := http.NewRequest("DELETE", u, nil)
-	setClientHeaders(req, token)
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal("Request failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		handleAPIError(resp.StatusCode, respBody)
-		os.Exit(1)
-	}
-
-	return printAndDecode(respBody)
-}
-
-// DoDeleteJSON sends a DELETE request with a JSON body.
-func DoDeleteJSON(client *http.Client, base, token, path string, body map[string]any) map[string]any {
-	data, _ := json.Marshal(body)
-	req, _ := http.NewRequest("DELETE", base+path, bytes.NewReader(data))
-	req.Header.Set("Content-Type", "application/json")
-	setClientHeaders(req, token)
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal("Request failed: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		handleAPIError(resp.StatusCode, respBody)
-		os.Exit(1)
-	}
-
-	return printAndDecode(respBody)
-}
-
-// printAndDecode pretty-prints the body when it is JSON, falls back to
-// raw output otherwise, and returns the parsed map (if any) for the
-// suggestion logic. It only warns on genuine JSON decode errors — inherently
-// non-JSON responses like /snapshot's compact text format pass silently.
-func printAndDecode(body []byte) map[string]any {
-	var buf bytes.Buffer
-	isJSON := json.Indent(&buf, body, "", "  ") == nil
-	if isJSON {
-		fmt.Println(buf.String())
-	} else {
-		fmt.Println(string(body))
-	}
-	if !isJSON {
-		return nil
-	}
-	var result map[string]any
-	if err := json.Unmarshal(body, &result); err == nil {
-		return result
-	}
-	// Body is valid JSON but not an object (array, string, number, etc.).
-	// That's fine — many endpoints return arrays. Don't warn.
-	return nil
+func DoRawE(client *http.Client, base, token, method, path string, opts ...RequestOption) ([]byte, error) {
+	return executeE(client, token, newRequest(method, base, path, opts...))
 }
 
 // ResolveInstanceBase fetches the named instance from the orchestrator and returns
@@ -249,53 +237,4 @@ func ResolveInstanceBase(orchBase, token, instanceID, bind string) string {
 		fatal("instance %q has no port assigned (is it still starting?)", instanceID)
 	}
 	return fmt.Sprintf("http://%s:%s", bind, inst.Port)
-}
-
-func setClientHeaders(req *http.Request, token string) {
-	req.Header.Set("X-PinchTab-Source", "client")
-	if token == "" {
-		return
-	}
-	if strings.HasPrefix(token, "ses_") {
-		req.Header.Set("Authorization", "Session "+token)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-}
-
-// handleAPIError parses and displays API error responses with hints
-func handleAPIError(statusCode int, body []byte) {
-	var errResp struct {
-		Error   string         `json:"error"`
-		Code    string         `json:"code"`
-		Details map[string]any `json:"details"`
-	}
-
-	if err := json.Unmarshal(body, &errResp); err != nil {
-		// Fallback to raw output if not valid JSON
-		fmt.Fprintf(os.Stderr, "Error %d: %s\n", statusCode, string(body))
-		return
-	}
-
-	// Print main error
-	if errResp.Error != "" {
-		fmt.Fprintf(os.Stderr, "Error %d: %s\n", statusCode, errResp.Error)
-	} else {
-		fmt.Fprintf(os.Stderr, "Error %d: %s\n", statusCode, string(body))
-	}
-
-	// Print hint and remedy if present
-	if errResp.Details != nil {
-		if hint, ok := errResp.Details["hint"].(string); ok && hint != "" {
-			fmt.Fprintf(os.Stderr, "\n💡 %s\n", hint)
-		}
-		if remedy, ok := errResp.Details["remedy"].(string); ok && remedy != "" {
-			fmt.Fprintf(os.Stderr, "   Remedy: %s\n", remedy)
-		}
-	}
-}
-
-func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

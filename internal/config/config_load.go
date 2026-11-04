@@ -1,44 +1,184 @@
 package config
 
 import (
-	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/pinchtab/pinchtab/internal/autosolver"
+	"github.com/pinchtab/pinchtab/internal/browsers"
 )
 
-var configHintOnce sync.Once
-
-// EmitDefaultConfigHint prints a one-time hint to stderr when PINCHTAB_CONFIG
-// points somewhere other than the default config path AND a default config
-// already exists at that path. The hint is best-effort UX nudge for users
-// who may not realize they're running against a custom config.
-//
-// Scoped to specific commands (health, config) and once-per-process via
-// sync.Once so scripted callers and unrelated CLI commands stay quiet.
-func EmitDefaultConfigHint() {
-	configHintOnce.Do(func() {
-		defaultConfigPath := filepath.Join(userConfigDir(), "config.json")
-		configPath := envOr("PINCHTAB_CONFIG", defaultConfigPath)
-		if configPath == defaultConfigPath {
-			return
-		}
-		if _, err := os.Stat(defaultConfigPath); err != nil {
-			return
-		}
-		fmt.Fprintf(os.Stderr, "HINT: default config exists at %s — you can edit it directly instead of using PINCHTAB_CONFIG\n", defaultConfigPath)
-	})
+// DefaultConfigHint returns the advisory shown when PINCHTAB_CONFIG points
+// somewhere other than the default config path AND a default config already
+// exists there, or "" when it does not apply. It only computes the text; the
+// caller routes it through output.Advisory, which owns suppression and dedupe.
+func DefaultConfigHint() string {
+	defaultConfigPath := filepath.Join(userConfigDir(), "config.json")
+	if envOr("PINCHTAB_CONFIG", defaultConfigPath) == defaultConfigPath {
+		return ""
+	}
+	if _, err := os.Stat(defaultConfigPath); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("default config exists at %s — you can edit it directly instead of using PINCHTAB_CONFIG", defaultConfigPath)
 }
 
-// Load returns the RuntimeConfig with precedence: env vars > config file > defaults.
+// parsedConfigFile is the side-effect-free result of resolving + reading +
+// parsing the config file.
+type parsedConfigFile struct {
+	Path           string
+	DefaultPath    string
+	EnvOverride    bool
+	Found          bool  // file read succeeded
+	ReadErr        error // os.ReadFile error (incl. not-exist); nil when Found
+	Legacy         bool
+	FC             *FileConfig
+	ParseErr       error    // json unmarshal error (legacy or nested)
+	UnknownFields  error    // non-fatal: unrecognized nested fields
+	UnknownKeys    []string // the dotted paths behind UnknownFields
+	ValidationErrs []error  // non-fatal: ValidateFileConfig
+	Advisories     []string // non-gating: FileConfigAdvisories
+}
+
+func resolveConfigPath() (path, defaultPath string, envOverride bool) {
+	defaultPath = filepath.Join(userConfigDir(), "config.json")
+	path = envOr("PINCHTAB_CONFIG", defaultPath)
+	return path, defaultPath, os.Getenv("PINCHTAB_CONFIG") != ""
+}
+
+// ConfigFilePath returns the effective config file path (honoring PINCHTAB_CONFIG),
+// i.e. the path LoadFileConfig reads — exposed so callers can stat it for change
+// detection without performing a full load.
+func ConfigFilePath() string {
+	path, _, _ := resolveConfigPath()
+	return path
+}
+
+// readAndParseConfigFile resolves, reads, detects legacy format, and parses the
+// config file with no side effects (no logging, no os.Exit). Callers decide how
+// to surface the outcome.
+func readAndParseConfigFile() parsedConfigFile {
+	path, defaultPath, override := resolveConfigPath()
+	res := parsedConfigFile{Path: path, DefaultPath: defaultPath, EnvOverride: override}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		res.ReadErr = err
+		return res
+	}
+	res.Found = true
+
+	if isLegacyConfig(data) {
+		res.Legacy = true
+		var lc legacyFileConfig
+		if err := json.Unmarshal(data, &lc); err != nil {
+			res.ParseErr = err
+			return res
+		}
+		res.FC = convertLegacyConfig(&lc)
+	} else {
+		fc := &FileConfig{}
+		if err := json.Unmarshal(data, fc); err != nil {
+			res.ParseErr = err
+			return res
+		}
+		res.FC = fc
+		if keys := UnknownFileConfigKeys(data); len(keys) > 0 {
+			res.UnknownKeys = keys
+			res.UnknownFields = &UnknownConfigKeysError{Keys: keys}
+		}
+	}
+	if res.FC != nil {
+		res.ValidationErrs = ValidateFileConfig(res.FC)
+		res.Advisories = FileConfigAdvisories(res.FC)
+	}
+	return res
+}
+
+// LoadDiagnostic is a non-fatal config-load message for the caller to emit.
+type LoadDiagnostic struct {
+	Level   slog.Level
+	Message string
+	Attrs   []any // slog key/value pairs
+}
+
+// Load returns the RuntimeConfig with precedence: env vars > config file >
+// defaults. It is a thin wrapper over LoadConfig that emits the load diagnostics
+// via slog and terminates the process on a fatal config error.
 func Load() *RuntimeConfig {
+	cfg, diags := LoadDeferringDiagnostics()
+	EmitLoadDiagnostics(diags)
+	return cfg
+}
+
+// LoadDeferringDiagnostics loads the config and hands back its diagnostics
+// unemitted, for a caller that must resolve the log level before they are
+// written. The load diagnostics describe reading the very file that carries
+// server.logLevel, so emitting them during the load drops every debug one at any
+// setting. A fatal config error still terminates here: it is reported at error
+// level, which no level suppresses, and there is nothing to resolve afterwards.
+//
+// This carries no precedence logic — the caller decides the level and then calls
+// EmitLoadDiagnostics.
+func LoadDeferringDiagnostics() (*RuntimeConfig, []LoadDiagnostic) {
+	cfg, diags, err := LoadConfig()
+	if err != nil {
+		EmitLoadDiagnostics(diags)
+		slog.Error(err.Error())
+		os.Exit(1)
+	}
+	return cfg, diags
+}
+
+// EmitLoadDiagnostics writes collected load diagnostics through slog at the level
+// each one declares.
+func EmitLoadDiagnostics(diags []LoadDiagnostic) {
+	for _, d := range diags {
+		switch d.Level {
+		case slog.LevelDebug:
+			slog.Debug(d.Message, d.Attrs...)
+		case slog.LevelInfo:
+			slog.Info(d.Message, d.Attrs...)
+		default:
+			slog.Warn(d.Message, d.Attrs...)
+		}
+	}
+}
+
+// LoadConfig builds the RuntimeConfig (env > file > defaults) with no logging and
+// no os.Exit. It returns the config, ordered diagnostics for the caller to log,
+// and a fatal error (e.g. missing port) for the caller to act on.
+// defaultAutoSolverConfig is the single owner of the autoSolver section's defaults.
+// LoadConfig assigns it directly and DefaultFileConfig pointer-wraps its fields —
+// the plain/pointer split stays, because pointer-wrapping is how "absent from file"
+// remains distinguishable from "explicitly false", but the VALUES are written once.
+// Everything the core also owns is read from autosolver.DefaultConfig() with the unit
+// conversion in this one place; only the three trigger flags, which the core has no
+// counterpart for, are literals here.
+func defaultAutoSolverConfig() AutoSolverConfig {
+	core := autosolver.DefaultConfig()
+	return AutoSolverConfig{
+		Enabled:           core.Enabled,
+		AutoTrigger:       true,
+		TriggerOnNavigate: true,
+		TriggerOnAction:   true,
+		MaxAttempts:       core.MaxAttempts,
+		SolverTimeoutSec:  int(core.SolverTimeout / time.Second),
+		RetryBaseDelayMs:  int(core.RetryBaseDelay / time.Millisecond),
+		RetryMaxDelayMs:   int(core.RetryMaxDelay / time.Millisecond),
+		Solvers:           core.Solvers,
+		LLMFallback:       core.LLMFallback,
+	}
+}
+
+func LoadConfig() (*RuntimeConfig, []LoadDiagnostic, error) {
 	cfg := &RuntimeConfig{
-		// Server defaults
 		Bind:              "127.0.0.1",
 		Port:              defaultPort,
 		InstancePortStart: 9868,
@@ -47,61 +187,62 @@ func Load() *RuntimeConfig {
 		StateDir:          userConfigDir(),
 		CookieSecure:      nil,
 
-		// Security defaults
 		AllowEvaluate:             false,
 		AllowMacro:                false,
 		AllowScreencast:           false,
 		AllowDownload:             false,
 		AllowCookies:              false,
 		AllowNetworkIntercept:     false,
+		AllowMemory:               false,
+		AllowFileScheme:           false,
 		RetainNetworkBodies:       false,
 		RetainNetworkBodyMaxBytes: 256 * 1024,
-		AllowedDomains:            append([]string(nil), defaultLocalAllowedDomains...),
+		AllowedDomains:            nil,
 		DownloadAllowedDomains:    nil,
 		DownloadMaxBytes:          DefaultDownloadMaxBytes,
+		MemorySnapshotMaxBytes:    DefaultMemorySnapshotMaxBytes,
 		AllowUpload:               false,
 		AllowClipboard:            false,
 		AllowStateExport:          false,
 		StateEncryptionKey:        "",
-		EnableActionGuards:        true,
 		UploadMaxRequestBytes:     DefaultUploadMaxRequestBytes,
 		UploadMaxFiles:            DefaultUploadMaxFiles,
 		UploadMaxFileBytes:        DefaultUploadMaxFileBytes,
 		UploadMaxTotalBytes:       DefaultUploadMaxTotalBytes,
 		MaxRedirects:              -1, // Unlimited by default; set to N to limit redirect hops
 
-		// Browser / instance defaults
-		Headless:           true,
-		NoRestore:          false,
-		ProfileDir:         "",
-		ProfilesBaseDir:    "",
-		DefaultProfile:     "default",
-		ChromeVersion:      "144.0.7559.133",
-		Timezone:           "",
-		BlockImages:        false,
-		BlockMedia:         false,
-		BlockAds:           false,
-		MaxTabs:            20,
-		MaxParallelTabs:    0,
-		ChromeBinary:       "", // Set via config.json only
-		ChromeExtraFlags:   "",
-		ExtensionPaths:     []string{defaultExtensionsDir(userConfigDir())},
-		UserAgent:          "",
-		NoAnimations:       false,
-		Humanize:           false,
-		StealthLevel:       "light",
-		TabEvictionPolicy:  "close_lru",
-		TabLifecyclePolicy: "keep",
-		TabCloseDelay:      5 * time.Minute,
-		TabRestore:         false,
+		Headless:               true,
+		NoRestore:              false,
+		ProfileDir:             "",
+		ProfilesBaseDir:        "",
+		DefaultProfile:         "default",
+		ProfileQuarantineKeep:  DefaultProfileQuarantineKeep,
+		Timezone:               "",
+		BlockImages:            false,
+		BlockMedia:             false,
+		BlockAds:               false,
+		MaxTabs:                20,
+		MaxParallelTabs:        0,
+		DefaultBrowser:         DefaultBrowserForSystem(),
+		BrowserBinary:          "", // Set via config.json only
+		BrowserExtraFlags:      "",
+		Cloak:                  CloakBrowserRuntimeConfig{DisableDefaultStealthArgs: true},
+		ExtensionPaths:         []string{defaultExtensionsDir(userConfigDir())},
+		UserAgent:              "",
+		NoAnimations:           false,
+		CaptureAllowActivation: true,
+		Humanize:               false,
+		StealthLevel:           "light",
+		TabEvictionPolicy:      "close_lru",
+		TabLifecyclePolicy:     "keep",
+		TabCloseDelay:          5 * time.Minute,
+		TabRestore:             false,
 
-		// Timeout defaults
 		ActionTimeout:   30 * time.Second,
 		NavigateTimeout: 60 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
 		WaitNavDelay:    1 * time.Second,
 
-		// Orchestrator defaults
 		Strategy:           "always-on",
 		AllocationPolicy:   "fcfs",
 		RestartMaxRestarts: 20,
@@ -109,27 +250,10 @@ func Load() *RuntimeConfig {
 		RestartMaxBackoff:  60 * time.Second,
 		RestartStableAfter: 5 * time.Minute,
 
-		// Attach defaults
 		AttachEnabled:      false,
 		AttachAllowHosts:   []string{"127.0.0.1", "localhost", "::1"},
-		AttachAllowSchemes: []string{"ws", "wss"},
+		AttachAllowSchemes: []string{"ws", "wss", "http", "https"},
 
-		// IDPI defaults
-		IDPI: IDPIConfig{
-			Enabled:        true,
-			StrictMode:     true,
-			ScanContent:    true,
-			WrapContent:    true,
-			ScanTimeoutSec: 5,
-		},
-
-		// TransactionPolicy defaults (disabled by default)
-		TransactionPolicy: TransactionPolicyConfig{},
-
-		// Engine default (set via config.json only)
-		Engine: "chrome",
-
-		// Observability defaults
 		Observability: ObservabilityConfig{
 			Activity: ActivityConfig{
 				Enabled:        true,
@@ -139,10 +263,9 @@ func Load() *RuntimeConfig {
 			},
 		},
 
-		// Session defaults
 		Sessions: SessionsRuntimeConfig{
 			Agent: AgentSessionRuntimeConfig{
-				Enabled:     true,
+				Enabled:     DefaultAgentSessionsEnabled,
 				Mode:        "preferred",
 				IdleTimeout: 30 * time.Minute,
 				MaxLifetime: 24 * time.Hour,
@@ -157,87 +280,99 @@ func Load() *RuntimeConfig {
 			},
 		},
 
-		// AutoSolver defaults (disabled by default)
-		AutoSolver: AutoSolverConfig{
-			Enabled:           false,
-			AutoTrigger:       true,
-			TriggerOnNavigate: true,
-			TriggerOnAction:   true,
-			MaxAttempts:       8,
-			SolverTimeoutSec:  30,
-			RetryBaseDelayMs:  500,
-			RetryMaxDelayMs:   10000,
-			Solvers:           []string{"cloudflare", "semantic", "capsolver", "twocaptcha"},
-			LLMFallback:       false,
-		},
-	}
-	finalizeProfileConfig(cfg)
-
-	// Load config file (supports both legacy flat and new nested format)
-	defaultConfigPath := filepath.Join(userConfigDir(), "config.json")
-	configPath := envOr("PINCHTAB_CONFIG", defaultConfigPath)
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("failed to read config file", "path", configPath, "error", err)
-		}
-		return cfg
+		AutoSolver: defaultAutoSolverConfig(),
 	}
 
-	slog.Debug("loading config file", "path", configPath)
+	// Deferred, not called here, because the profile paths are DERIVED from
+	// server.stateDir and the file that carries stateDir has not been read yet.
+	// Finalizing eagerly filled ProfilesBaseDir from the default state dir, and the
+	// second call after applyFileConfig then found it non-empty and left it alone — so
+	// server.stateDir could never relocate profiles. A defer is the one shape that
+	// cannot miss one of this function's several early returns.
+	defer finalizeProfileConfig(cfg)
+	defer finalizeSchedulerConfig(cfg)
 
-	var fc *FileConfig
-
-	if isLegacyConfig(data) {
-		var lc legacyFileConfig
-		if err := json.Unmarshal(data, &lc); err != nil {
-			slog.Warn("failed to parse legacy config", "path", configPath, "error", err)
-			return cfg
+	var diags []LoadDiagnostic
+	res := readAndParseConfigFile()
+	if !res.Found {
+		if res.ReadErr != nil && !os.IsNotExist(res.ReadErr) {
+			diags = append(diags, LoadDiagnostic{slog.LevelWarn, "failed to read config file", []any{"path", res.Path, "error", res.ReadErr}})
 		}
-		fc = convertLegacyConfig(&lc)
-		slog.Info("loaded legacy flat config, consider migrating to nested format", "path", configPath)
-	} else {
-		fc = &FileConfig{}
-		if err := json.Unmarshal(data, fc); err != nil {
-			slog.Warn("failed to parse config", "path", configPath, "error", err)
-			return cfg
-		}
-		// Warn about unrecognized fields (non-fatal, config still loads).
-		dec := json.NewDecoder(bytes.NewReader(data))
-		dec.DisallowUnknownFields()
-		if ufErr := dec.Decode(&FileConfig{}); ufErr != nil {
-			slog.Warn("config has unrecognized fields that will be ignored", "path", configPath, "error", ufErr)
-		}
+		return cfg, diags, nil
 	}
 
-	// Validate file config and log warnings
-	if errs := ValidateFileConfig(fc); len(errs) > 0 {
-		for _, e := range errs {
-			slog.Warn("config validation error", "path", configPath, "error", e)
+	diags = append(diags, LoadDiagnostic{slog.LevelDebug, "loading config file", []any{"path", res.Path}})
+
+	if res.ParseErr != nil {
+		if res.Legacy {
+			diags = append(diags, LoadDiagnostic{slog.LevelWarn, "failed to parse legacy config", []any{"path", res.Path, "error", res.ParseErr}})
+		} else {
+			diags = append(diags, LoadDiagnostic{slog.LevelWarn, "failed to parse config", []any{"path", res.Path, "error", res.ParseErr}})
 		}
-		// An enabled-but-invalid transaction policy must never load: a
-		// half-configured deny policy silently permits the traffic it was
-		// meant to block. Fail startup instead.
-		if fc.Security.TransactionPolicy.Enabled {
-			for _, e := range errs {
-				if strings.HasPrefix(e.Error(), "security.transactionPolicy") {
-					panic(fmt.Sprintf("invalid enabled security.transactionPolicy in %s: %v", configPath, errs))
-				}
-			}
-		}
+		return cfg, diags, nil
+	}
+	if res.Legacy {
+		diags = append(diags, LoadDiagnostic{slog.LevelInfo, "loaded legacy flat config, consider migrating to nested format", []any{"path", res.Path}})
+	}
+	if res.UnknownFields != nil {
+		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config has unrecognized fields that will be ignored", []any{"path", res.Path, "error", res.UnknownFields}})
+	}
+	for _, e := range res.ValidationErrs {
+		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config validation error", []any{"path", res.Path, "error", e}})
+	}
+	if err := fatalValidationError(res.ValidationErrs); err != nil {
+		return cfg, diags, err
+	}
+	// Reported at load like the rest, but from the non-gating list: the file says
+	// something inert, which is worth knowing and is nobody's blocker.
+	for _, advisory := range res.Advisories {
+		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config setting has no effect", []any{"path", res.Path, "advisory", advisory}})
 	}
 
-	// Apply file config (only if env var NOT set)
-	applyFileConfig(cfg, fc)
-	finalizeProfileConfig(cfg)
+	diags = append(diags, applyFileConfig(cfg, res.FC)...)
 
 	if cfg.Port == "" {
-		slog.Error("server port is not configured — set server.port in config.json")
-		os.Exit(1)
+		return cfg, diags, fmt.Errorf("server port is not configured — set server.port in config.json")
 	}
 
-	return cfg
+	return cfg, diags, nil
+}
+
+// fatalValidationError returns the first validation error that must stop the load.
+// The class is declared by the error itself (ValidationError.FatalAtLoad), never
+// inferred here from a field name or a message, so adding a member is a decision
+// taken where the rule is written.
+func fatalValidationError(errs []error) error {
+	for _, e := range errs {
+		var ve ValidationError
+		if errors.As(e, &ve) && ve.FatalAtLoad {
+			return fmt.Errorf("config cannot be loaded: %w", e)
+		}
+	}
+	return nil
+}
+
+// ConfigFileStatus reports on-disk config state without invoking Load (used by `pinchtab doctor`).
+type ConfigFileStatus struct {
+	Path        string
+	DefaultPath string
+	EnvOverride bool
+	Found       bool
+	ParseErr    error
+	UnknownKeys []string
+}
+
+// InspectConfigFile reports config-file load status with no side effects.
+func InspectConfigFile() ConfigFileStatus {
+	res := readAndParseConfigFile()
+	return ConfigFileStatus{
+		Path:        res.Path,
+		DefaultPath: res.DefaultPath,
+		EnvOverride: res.EnvOverride,
+		Found:       res.Found,
+		ParseErr:    res.ParseErr,
+		UnknownKeys: res.UnknownKeys,
+	}
 }
 
 func envOr(key, fallback string) string {
@@ -259,233 +394,325 @@ func finalizeProfileConfig(cfg *RuntimeConfig) {
 	}
 }
 
-func applyFileConfig(cfg *RuntimeConfig, fc *FileConfig) {
-	// Server
-	if fc.Server.Port != "" {
-		cfg.Port = fc.Server.Port
+func applyFileConfig(cfg *RuntimeConfig, fc *FileConfig) []LoadDiagnostic {
+	applyServerConfig(cfg, fc.Server)
+	applySecurityConfig(cfg, fc.Security)
+	applyObservabilityConfig(cfg, fc.Observability)
+	applySessionsConfig(cfg, fc.Sessions)
+	diags := applyBrowserConfig(cfg, &fc.Browser, fc.Browsers)
+	applyInstanceDefaultsConfig(cfg, &fc.InstanceDefaults)
+	applyProfilesConfig(cfg, fc.Profiles)
+	applyMultiInstanceConfig(cfg, fc.MultiInstance)
+	applyTimeoutsConfig(cfg, fc.Timeouts)
+	applySchedulerConfig(cfg, fc.Scheduler)
+	applyAutoSolverConfig(cfg, fc.AutoSolver)
+	return diags
+}
+
+func applyServerConfig(cfg *RuntimeConfig, s ServerConfig) {
+	if s.Port != "" {
+		cfg.Port = s.Port
 	}
-	if fc.Server.Bind != "" {
-		cfg.Bind = fc.Server.Bind
+	if s.Bind != "" {
+		cfg.Bind = s.Bind
 	}
 	if os.Getenv("PINCHTAB_TOKEN") == "" {
-		cfg.Token = fc.Server.Token
+		cfg.Token = s.Token
 	}
-	if fc.Server.StateDir != "" {
-		cfg.StateDir = fc.Server.StateDir
+	if s.StateDir != "" {
+		cfg.StateDir = s.StateDir
 	}
-	if fc.Server.Engine != "" {
-		cfg.Engine = fc.Server.Engine
+	if s.LogLevel != "" {
+		cfg.LogLevel = s.LogLevel
 	}
-	if fc.Server.NetworkBufferSize != nil && *fc.Server.NetworkBufferSize > 0 {
-		cfg.NetworkBufferSize = ClampNetworkBufferSize(*fc.Server.NetworkBufferSize)
+	if s.NetworkBufferSize != nil && *s.NetworkBufferSize > 0 {
+		cfg.NetworkBufferSize = ClampNetworkBufferSize(*s.NetworkBufferSize)
 	}
-	if fc.Server.RetainNetworkBodies != nil {
-		cfg.RetainNetworkBodies = *fc.Server.RetainNetworkBodies
+	if s.RetainNetworkBodies != nil {
+		cfg.RetainNetworkBodies = *s.RetainNetworkBodies
 	}
-	if fc.Server.RetainNetworkBodyMaxBytes != nil && *fc.Server.RetainNetworkBodyMaxBytes >= 0 {
-		cfg.RetainNetworkBodyMaxBytes = *fc.Server.RetainNetworkBodyMaxBytes
+	if s.RetainNetworkBodyMaxBytes != nil && *s.RetainNetworkBodyMaxBytes >= 0 {
+		cfg.RetainNetworkBodyMaxBytes = *s.RetainNetworkBodyMaxBytes
 	}
-	if fc.Server.TrustProxyHeaders != nil {
-		cfg.TrustProxyHeaders = *fc.Server.TrustProxyHeaders
+	if s.TrustProxyHeaders != nil {
+		cfg.TrustProxyHeaders = *s.TrustProxyHeaders
 	}
-	cfg.CookieSecure = fc.Server.CookieSecure
-	// Security
-	if fc.Security.AllowEvaluate != nil {
-		cfg.AllowEvaluate = *fc.Security.AllowEvaluate
+	cfg.CookieSecure = s.CookieSecure
+}
+
+func applySecurityConfig(cfg *RuntimeConfig, s SecurityConfig) {
+	if s.AllowEvaluate != nil {
+		cfg.AllowEvaluate = *s.AllowEvaluate
 	}
-	if fc.Security.AllowMacro != nil {
-		cfg.AllowMacro = *fc.Security.AllowMacro
+	if s.AllowMacro != nil {
+		cfg.AllowMacro = *s.AllowMacro
 	}
-	if fc.Security.AllowScreencast != nil {
-		cfg.AllowScreencast = *fc.Security.AllowScreencast
+	if s.AllowScreencast != nil {
+		cfg.AllowScreencast = *s.AllowScreencast
 	}
-	if fc.Security.AllowDownload != nil {
-		cfg.AllowDownload = *fc.Security.AllowDownload
+	if s.AllowDownload != nil {
+		cfg.AllowDownload = *s.AllowDownload
 	}
-	if fc.Security.AllowCookies != nil {
-		cfg.AllowCookies = *fc.Security.AllowCookies
+	if s.AllowCookies != nil {
+		cfg.AllowCookies = *s.AllowCookies
 	}
-	if fc.Security.AllowNetworkIntercept != nil {
-		cfg.AllowNetworkIntercept = *fc.Security.AllowNetworkIntercept
+	if s.AllowNetworkIntercept != nil {
+		cfg.AllowNetworkIntercept = *s.AllowNetworkIntercept
 	}
-	cfg.DownloadAllowedDomains = append([]string(nil), fc.Security.DownloadAllowedDomains...)
-	if fc.Security.DownloadMaxBytes != nil {
-		cfg.DownloadMaxBytes = clampPositiveLimit(*fc.Security.DownloadMaxBytes, DefaultDownloadMaxBytes, MaxDownloadMaxBytes)
+	if s.AllowMemory != nil {
+		cfg.AllowMemory = *s.AllowMemory
 	}
-	if fc.Security.AllowUpload != nil {
-		cfg.AllowUpload = *fc.Security.AllowUpload
+	if s.AllowFileScheme != nil {
+		cfg.AllowFileScheme = *s.AllowFileScheme
 	}
-	if fc.Security.AllowClipboard != nil {
-		cfg.AllowClipboard = *fc.Security.AllowClipboard
+	cfg.DownloadAllowedDomains = append([]string(nil), s.DownloadAllowedDomains...)
+	if s.DownloadMaxBytes != nil {
+		cfg.DownloadMaxBytes = clampPositiveLimit(*s.DownloadMaxBytes, DefaultDownloadMaxBytes, MaxDownloadMaxBytes)
 	}
-	if fc.Security.AllowStateExport != nil {
-		cfg.AllowStateExport = *fc.Security.AllowStateExport
+	if s.MemorySnapshotMaxBytes != nil {
+		cfg.MemorySnapshotMaxBytes = clampPositiveLimit(*s.MemorySnapshotMaxBytes, DefaultMemorySnapshotMaxBytes, MaxMemorySnapshotMaxBytes)
 	}
-	if fc.Security.StateEncryptionKey != nil {
-		cfg.StateEncryptionKey = *fc.Security.StateEncryptionKey
+	if s.AllowUpload != nil {
+		cfg.AllowUpload = *s.AllowUpload
 	}
-	if fc.Security.EnableActionGuards != nil {
-		cfg.EnableActionGuards = *fc.Security.EnableActionGuards
+	if s.AllowClipboard != nil {
+		cfg.AllowClipboard = *s.AllowClipboard
 	}
-	if fc.Security.UploadMaxRequestBytes != nil {
-		cfg.UploadMaxRequestBytes = clampPositiveLimit(*fc.Security.UploadMaxRequestBytes, DefaultUploadMaxRequestBytes, MaxUploadMaxRequestBytes)
+	if s.AllowStateExport != nil {
+		cfg.AllowStateExport = *s.AllowStateExport
 	}
-	if fc.Security.UploadMaxFiles != nil {
-		cfg.UploadMaxFiles = clampPositiveLimit(*fc.Security.UploadMaxFiles, DefaultUploadMaxFiles, MaxUploadMaxFiles)
+	if s.StateEncryptionKey != nil {
+		cfg.StateEncryptionKey = *s.StateEncryptionKey
 	}
-	if fc.Security.UploadMaxFileBytes != nil {
-		cfg.UploadMaxFileBytes = clampPositiveLimit(*fc.Security.UploadMaxFileBytes, DefaultUploadMaxFileBytes, MaxUploadMaxFileBytes)
+	if s.UploadMaxRequestBytes != nil {
+		cfg.UploadMaxRequestBytes = clampPositiveLimit(*s.UploadMaxRequestBytes, DefaultUploadMaxRequestBytes, MaxUploadMaxRequestBytes)
 	}
-	if fc.Security.UploadMaxTotalBytes != nil {
-		cfg.UploadMaxTotalBytes = clampPositiveLimit(*fc.Security.UploadMaxTotalBytes, DefaultUploadMaxTotalBytes, MaxUploadMaxTotalBytes)
+	if s.UploadMaxFiles != nil {
+		cfg.UploadMaxFiles = clampPositiveLimit(*s.UploadMaxFiles, DefaultUploadMaxFiles, MaxUploadMaxFiles)
 	}
-	if fc.Security.MaxRedirects != nil {
-		cfg.MaxRedirects = *fc.Security.MaxRedirects
+	if s.UploadMaxFileBytes != nil {
+		cfg.UploadMaxFileBytes = clampPositiveLimit(*s.UploadMaxFileBytes, DefaultUploadMaxFileBytes, MaxUploadMaxFileBytes)
 	}
-	if fc.Security.Attach.Enabled != nil {
-		cfg.AttachEnabled = *fc.Security.Attach.Enabled
+	if s.UploadMaxTotalBytes != nil {
+		cfg.UploadMaxTotalBytes = clampPositiveLimit(*s.UploadMaxTotalBytes, DefaultUploadMaxTotalBytes, MaxUploadMaxTotalBytes)
 	}
-	cfg.AttachAllowHosts = append([]string(nil), fc.Security.Attach.AllowHosts...)
-	cfg.AttachAllowSchemes = append([]string(nil), fc.Security.Attach.AllowSchemes...)
-	cfg.TrustedProxyCIDRs = append([]string(nil), fc.Security.TrustedProxyCIDRs...)
-	cfg.TrustedResolveCIDRs = append([]string(nil), fc.Security.TrustedResolveCIDRs...)
-	if fc.Security.TrustLoopbackProxy != nil {
-		cfg.TrustLoopbackProxy = *fc.Security.TrustLoopbackProxy
+	if s.MaxRedirects != nil {
+		cfg.MaxRedirects = *s.MaxRedirects
 	}
-	// IDPI – copy the whole struct; individual fields have safe zero-value defaults.
-	cfg.IDPI = fc.Security.IDPI
+	cfg.TrustedProxyCIDRs = append([]string(nil), s.TrustedProxyCIDRs...)
+	cfg.TrustedResolveCIDRs = append([]string(nil), s.TrustedResolveCIDRs...)
+	if s.TrustLoopbackProxy != nil {
+		cfg.TrustLoopbackProxy = *s.TrustLoopbackProxy
+	}
+	if s.IDPI != nil {
+		cfg.IDPI = *s.IDPI
+	}
 	// TransactionPolicy – copy the whole struct; disabled by default.
-	cfg.TransactionPolicy = fc.Security.TransactionPolicy
-	cfg.AllowedDomains = effectiveSecurityAllowedDomains(fc.Security)
-	if fc.Observability.Activity.Enabled != nil {
-		cfg.Observability.Activity.Enabled = *fc.Observability.Activity.Enabled
+	cfg.TransactionPolicy = s.TransactionPolicy
+	cfg.AllowedDomains = effectiveSecurityAllowedDomains(s)
+	if s.Attach.Enabled != nil {
+		cfg.AttachEnabled = *s.Attach.Enabled
 	}
-	if fc.Observability.Activity.SessionIdleSec != nil {
-		cfg.Observability.Activity.SessionIdleSec = *fc.Observability.Activity.SessionIdleSec
+	if s.Attach.ForwardProxyAuth != nil {
+		cfg.AttachForwardProxyAuth = *s.Attach.ForwardProxyAuth
 	}
-	if fc.Observability.Activity.RetentionDays != nil {
-		cfg.Observability.Activity.RetentionDays = *fc.Observability.Activity.RetentionDays
+	if len(s.Attach.AllowHosts) > 0 {
+		cfg.AttachAllowHosts = append([]string(nil), s.Attach.AllowHosts...)
 	}
-	if fc.Observability.Activity.Events.Dashboard != nil {
-		cfg.Observability.Activity.Events.Dashboard = *fc.Observability.Activity.Events.Dashboard
+	if len(s.Attach.AllowSchemes) > 0 {
+		cfg.AttachAllowSchemes = append([]string(nil), s.Attach.AllowSchemes...)
 	}
-	if fc.Observability.Activity.Events.Server != nil {
-		cfg.Observability.Activity.Events.Server = *fc.Observability.Activity.Events.Server
+}
+
+func applyObservabilityConfig(cfg *RuntimeConfig, o ObservabilityFileConfig) {
+	if o.Activity.Enabled != nil {
+		cfg.Observability.Activity.Enabled = *o.Activity.Enabled
 	}
-	if fc.Observability.Activity.Events.Bridge != nil {
-		cfg.Observability.Activity.Events.Bridge = *fc.Observability.Activity.Events.Bridge
+	if o.Activity.SessionIdleSec != nil {
+		cfg.Observability.Activity.SessionIdleSec = *o.Activity.SessionIdleSec
 	}
-	if fc.Observability.Activity.Events.Orchestrator != nil {
-		cfg.Observability.Activity.Events.Orchestrator = *fc.Observability.Activity.Events.Orchestrator
+	if o.Activity.RetentionDays != nil {
+		cfg.Observability.Activity.RetentionDays = *o.Activity.RetentionDays
 	}
-	if fc.Observability.Activity.Events.Scheduler != nil {
-		cfg.Observability.Activity.Events.Scheduler = *fc.Observability.Activity.Events.Scheduler
+	if o.Activity.Events.Dashboard != nil {
+		cfg.Observability.Activity.Events.Dashboard = *o.Activity.Events.Dashboard
 	}
-	if fc.Observability.Activity.Events.MCP != nil {
-		cfg.Observability.Activity.Events.MCP = *fc.Observability.Activity.Events.MCP
+	if o.Activity.Events.Server != nil {
+		cfg.Observability.Activity.Events.Server = *o.Activity.Events.Server
 	}
-	if fc.Observability.Activity.Events.Other != nil {
-		cfg.Observability.Activity.Events.Other = *fc.Observability.Activity.Events.Other
+	if o.Activity.Events.Bridge != nil {
+		cfg.Observability.Activity.Events.Bridge = *o.Activity.Events.Bridge
 	}
-	if fc.Sessions.Dashboard.Persist != nil {
-		cfg.Sessions.Dashboard.Persist = *fc.Sessions.Dashboard.Persist
+	if o.Activity.Events.Orchestrator != nil {
+		cfg.Observability.Activity.Events.Orchestrator = *o.Activity.Events.Orchestrator
 	}
-	if fc.Sessions.Dashboard.IdleTimeoutSec != nil && *fc.Sessions.Dashboard.IdleTimeoutSec > 0 {
-		cfg.Sessions.Dashboard.IdleTimeout = time.Duration(*fc.Sessions.Dashboard.IdleTimeoutSec) * time.Second
+	if o.Activity.Events.Scheduler != nil {
+		cfg.Observability.Activity.Events.Scheduler = *o.Activity.Events.Scheduler
 	}
-	if fc.Sessions.Dashboard.MaxLifetimeSec != nil && *fc.Sessions.Dashboard.MaxLifetimeSec > 0 {
-		cfg.Sessions.Dashboard.MaxLifetime = time.Duration(*fc.Sessions.Dashboard.MaxLifetimeSec) * time.Second
+	if o.Activity.Events.MCP != nil {
+		cfg.Observability.Activity.Events.MCP = *o.Activity.Events.MCP
 	}
-	if fc.Sessions.Dashboard.ElevationWindowSec != nil && *fc.Sessions.Dashboard.ElevationWindowSec > 0 {
-		cfg.Sessions.Dashboard.ElevationWindow = time.Duration(*fc.Sessions.Dashboard.ElevationWindowSec) * time.Second
+	if o.Activity.Events.Other != nil {
+		cfg.Observability.Activity.Events.Other = *o.Activity.Events.Other
 	}
-	if fc.Sessions.Dashboard.PersistElevationAcrossRestart != nil {
-		cfg.Sessions.Dashboard.PersistElevationAcrossRestart = *fc.Sessions.Dashboard.PersistElevationAcrossRestart
+}
+
+func applySessionsConfig(cfg *RuntimeConfig, s SessionsFileConfig) {
+	if s.Dashboard.Persist != nil {
+		cfg.Sessions.Dashboard.Persist = *s.Dashboard.Persist
 	}
-	if fc.Sessions.Dashboard.RequireElevation != nil {
-		cfg.Sessions.Dashboard.RequireElevation = *fc.Sessions.Dashboard.RequireElevation
+	if s.Dashboard.IdleTimeoutSec != nil && *s.Dashboard.IdleTimeoutSec > 0 {
+		cfg.Sessions.Dashboard.IdleTimeout = time.Duration(*s.Dashboard.IdleTimeoutSec) * time.Second
+	}
+	if s.Dashboard.MaxLifetimeSec != nil && *s.Dashboard.MaxLifetimeSec > 0 {
+		cfg.Sessions.Dashboard.MaxLifetime = time.Duration(*s.Dashboard.MaxLifetimeSec) * time.Second
+	}
+	if s.Dashboard.ElevationWindowSec != nil && *s.Dashboard.ElevationWindowSec > 0 {
+		cfg.Sessions.Dashboard.ElevationWindow = time.Duration(*s.Dashboard.ElevationWindowSec) * time.Second
+	}
+	if s.Dashboard.PersistElevationAcrossRestart != nil {
+		cfg.Sessions.Dashboard.PersistElevationAcrossRestart = *s.Dashboard.PersistElevationAcrossRestart
+	}
+	if s.Dashboard.RequireElevation != nil {
+		cfg.Sessions.Dashboard.RequireElevation = *s.Dashboard.RequireElevation
+	}
+	if s.Agent.Enabled != nil {
+		cfg.Sessions.Agent.Enabled = *s.Agent.Enabled
+	}
+	if s.Agent.Mode != "" {
+		cfg.Sessions.Agent.Mode = s.Agent.Mode
+	}
+	if s.Agent.IdleTimeoutSec != nil && *s.Agent.IdleTimeoutSec > 0 {
+		cfg.Sessions.Agent.IdleTimeout = time.Duration(*s.Agent.IdleTimeoutSec) * time.Second
+	}
+	if s.Agent.MaxLifetimeSec != nil && *s.Agent.MaxLifetimeSec > 0 {
+		cfg.Sessions.Agent.MaxLifetime = time.Duration(*s.Agent.MaxLifetimeSec) * time.Second
+	}
+}
+
+// applyBrowserConfig returns its notices rather than logging them: a debug notice
+// emitted during the load is written before any command has resolved the level,
+// so logging here made a silently rewritten config unreadable at every setting.
+func applyBrowserConfig(cfg *RuntimeConfig, browser *BrowserConfig, browsersCfg BrowsersConfig) []LoadDiagnostic {
+	var diags []LoadDiagnostic
+	synthesized, conflict := migrateLegacyBrowserConfig(browser, browsersCfg.Default)
+	if conflict {
+		diags = append(diags, LoadDiagnostic{slog.LevelWarn, "config has both browser.targets and legacy browser.binary/extraFlags/cloak/proxy set; targets are used as authored (no legacy synthesis), but the legacy fields still seed the base runtime config that target resolution overlays per-field", nil})
+	} else if synthesized {
+		diags = append(diags, LoadDiagnostic{slog.LevelDebug, "migrated legacy browser config into browser.targets.default", nil})
+	}
+	cfg.Targets = cloneBrowserTargetsConfig(browser.Targets)
+	cfg.DefaultTarget = browser.DefaultTarget
+	cfg.FallbackOrder = append([]string(nil), browser.FallbackOrder...)
+	cfg.TargetsSynthesized = synthesized && len(browser.Targets) > 0
+
+	if browsersCfg.Default != "" {
+		cfg.DefaultBrowser = strings.ToLower(strings.TrimSpace(browsersCfg.Default))
+		if _, ok := browsers.Get(strings.ToLower(strings.TrimSpace(browsersCfg.Default))); !ok {
+			diags = append(diags, LoadDiagnostic{slog.LevelWarn, "browsers.default is not a known browser; launches will fall back to chrome",
+				[]any{"configured", browsersCfg.Default, "known", browsers.IDs()}})
+		}
+	} else if name := ResolveDefaultTarget(cfg); name != "" && !cfg.TargetsSynthesized && cfg.Targets[name].Provider != "" {
+		cfg.DefaultBrowser = NormalizeBrowser(cfg.Targets[name].Provider)
+	} else {
+		cfg.DefaultBrowser = DefaultBrowserForSystem()
 	}
 
-	// Agent sessions
-	if fc.Sessions.Agent.Enabled != nil {
-		cfg.Sessions.Agent.Enabled = *fc.Sessions.Agent.Enabled
-	}
-	if fc.Sessions.Agent.Mode != "" {
-		cfg.Sessions.Agent.Mode = fc.Sessions.Agent.Mode
-	}
-	if fc.Sessions.Agent.IdleTimeoutSec != nil && *fc.Sessions.Agent.IdleTimeoutSec > 0 {
-		cfg.Sessions.Agent.IdleTimeout = time.Duration(*fc.Sessions.Agent.IdleTimeoutSec) * time.Second
-	}
-	if fc.Sessions.Agent.MaxLifetimeSec != nil && *fc.Sessions.Agent.MaxLifetimeSec > 0 {
-		cfg.Sessions.Agent.MaxLifetime = time.Duration(*fc.Sessions.Agent.MaxLifetimeSec) * time.Second
+	if b, ok := browsers.Get(strings.ToLower(cfg.DefaultBrowser)); ok && b.Capabilities().Has(browsers.CapNativeStealth) && browser.Cloak.DisableDefaultStealthArgs == nil {
+		cfg.Cloak.DisableDefaultStealthArgs = true
 	}
 
-	// Browser
-	if fc.Browser.ChromeVersion != "" {
-		cfg.ChromeVersion = fc.Browser.ChromeVersion
+	if browser.BrowserVersion != "" {
+		cfg.BrowserVersion = browser.BrowserVersion
 	}
-	if fc.Browser.ChromeBinary != "" {
-		cfg.ChromeBinary = fc.Browser.ChromeBinary
+	if browser.BrowserBinary != "" {
+		cfg.BrowserBinary = browser.BrowserBinary
 	}
-	if fc.Browser.ChromeDebugPort != nil && *fc.Browser.ChromeDebugPort > 0 {
-		cfg.ChromeDebugPort = *fc.Browser.ChromeDebugPort
+	if browser.BrowserDebugPort != nil && *browser.BrowserDebugPort > 0 {
+		cfg.BrowserDebugPort = *browser.BrowserDebugPort
 	}
-	if fc.Browser.ChromeExtraFlags != "" {
-		cfg.ChromeExtraFlags = SanitizeChromeExtraFlags(fc.Browser.ChromeExtraFlags)
+	if browser.BrowserExtraFlags != "" {
+		cfg.BrowserExtraFlags = SanitizeBrowserExtraFlags(browser.BrowserExtraFlags)
 	}
-	if fc.Browser.ExtensionPaths != nil {
-		cfg.ExtensionPaths = append([]string(nil), fc.Browser.ExtensionPaths...)
+	applyCloakBrowserConfigToRuntime(cfg, browser.Cloak)
+	cfg.Proxy = BrowserProxyConfig{
+		Server:     browser.Proxy.Server,
+		BypassList: append([]string(nil), browser.Proxy.BypassList...),
+		Username:   browser.Proxy.Username,
+		Password:   browser.Proxy.Password,
+	}
+	if browser.Proxy.Geo != nil {
+		geoCopy := *browser.Proxy.Geo
+		cfg.Proxy.Geo = &geoCopy
+	}
+	if browser.ExtensionPaths != nil {
+		cfg.ExtensionPaths = append([]string(nil), browser.ExtensionPaths...)
 	}
 
-	// Instance defaults — resolve headless bool into mode string.
-	if fc.InstanceDefaults.Headless != nil && fc.InstanceDefaults.Mode == "" {
-		if *fc.InstanceDefaults.Headless {
-			fc.InstanceDefaults.Mode = "headless"
+	if len(browsersCfg.Available) > 0 {
+		cfg.BrowsersAvailable = make([]string, len(browsersCfg.Available))
+		copy(cfg.BrowsersAvailable, browsersCfg.Available)
+	} else if cfg.DefaultBrowser != "" {
+		cfg.BrowsersAvailable = []string{cfg.DefaultBrowser}
+	} else {
+		cfg.BrowsersAvailable = []string{"chrome"}
+	}
+
+	return diags
+}
+
+func applyInstanceDefaultsConfig(cfg *RuntimeConfig, d *InstanceDefaultsConfig) {
+	if d.Headless != nil && d.Mode == "" {
+		if *d.Headless {
+			d.Mode = "headless"
 		} else {
-			fc.InstanceDefaults.Mode = "headed"
+			d.Mode = "headed"
 		}
 	}
-	if fc.InstanceDefaults.Mode != "" {
-		cfg.Headless = modeToHeadless(fc.InstanceDefaults.Mode, cfg.Headless)
+	if d.Mode != "" {
+		cfg.Headless = modeToHeadless(d.Mode, cfg.Headless)
 		cfg.HeadlessSet = true
 	}
-	if fc.InstanceDefaults.NoRestore != nil {
-		cfg.NoRestore = *fc.InstanceDefaults.NoRestore
+	if d.NoRestore != nil {
+		cfg.NoRestore = *d.NoRestore
 	}
-	if fc.InstanceDefaults.Timezone != "" {
-		cfg.Timezone = fc.InstanceDefaults.Timezone
+	if d.Timezone != "" {
+		cfg.Timezone = d.Timezone
 	}
-	if fc.InstanceDefaults.BlockImages != nil {
-		cfg.BlockImages = *fc.InstanceDefaults.BlockImages
+	if d.BlockImages != nil {
+		cfg.BlockImages = *d.BlockImages
 	}
-	if fc.InstanceDefaults.BlockMedia != nil {
-		cfg.BlockMedia = *fc.InstanceDefaults.BlockMedia
+	if d.BlockMedia != nil {
+		cfg.BlockMedia = *d.BlockMedia
 	}
-	if fc.InstanceDefaults.BlockAds != nil {
-		cfg.BlockAds = *fc.InstanceDefaults.BlockAds
+	if d.BlockAds != nil {
+		cfg.BlockAds = *d.BlockAds
 	}
-	if fc.InstanceDefaults.MaxTabs != nil {
-		cfg.MaxTabs = *fc.InstanceDefaults.MaxTabs
+	if d.MaxTabs != nil {
+		cfg.MaxTabs = *d.MaxTabs
 	}
-	if fc.InstanceDefaults.MaxParallelTabs != nil {
-		cfg.MaxParallelTabs = *fc.InstanceDefaults.MaxParallelTabs
+	if d.MaxParallelTabs != nil {
+		cfg.MaxParallelTabs = *d.MaxParallelTabs
 	}
-	if fc.InstanceDefaults.UserAgent != "" {
-		cfg.UserAgent = fc.InstanceDefaults.UserAgent
+	if d.UserAgent != "" {
+		cfg.UserAgent = d.UserAgent
 	}
-	if fc.InstanceDefaults.NoAnimations != nil {
-		cfg.NoAnimations = *fc.InstanceDefaults.NoAnimations
+	if d.NoAnimations != nil {
+		cfg.NoAnimations = *d.NoAnimations
 	}
-	if fc.InstanceDefaults.Humanize != nil {
-		cfg.Humanize = *fc.InstanceDefaults.Humanize
+	if d.CaptureAllowActivation != nil {
+		cfg.CaptureAllowActivation = *d.CaptureAllowActivation
 	}
-	if fc.InstanceDefaults.StealthLevel != "" {
-		cfg.StealthLevel = fc.InstanceDefaults.StealthLevel
+	if d.Humanize != nil {
+		cfg.Humanize = *d.Humanize
 	}
-	if fc.InstanceDefaults.TabEvictionPolicy != "" {
-		cfg.TabEvictionPolicy = fc.InstanceDefaults.TabEvictionPolicy
+	if d.StealthLevel != "" {
+		cfg.StealthLevel = d.StealthLevel
 	}
-	if tp := fc.InstanceDefaults.TabPolicy; tp != nil {
+	if d.TabEvictionPolicy != "" {
+		cfg.TabEvictionPolicy = d.TabEvictionPolicy
+	}
+	if tp := d.TabPolicy; tp != nil {
 		if tp.Eviction != "" {
 			cfg.TabEvictionPolicy = tp.Eviction
 		}
@@ -499,151 +726,149 @@ func applyFileConfig(cfg *RuntimeConfig, fc *FileConfig) {
 			cfg.TabRestore = *tp.Restore
 		}
 	}
-	// Clamp to a sane minimum to avoid races between handler return and timer fire.
-	if cfg.TabLifecyclePolicy == "close_idle" && cfg.TabCloseDelay < time.Second {
+	if IdleTabLifecycle(cfg.TabLifecyclePolicy) && cfg.TabCloseDelay < time.Second {
 		cfg.TabCloseDelay = time.Second
 	}
-	if fc.InstanceDefaults.DialogAutoAccept != nil {
-		cfg.DialogAutoAccept = *fc.InstanceDefaults.DialogAutoAccept
+	if d.DialogAutoAccept != nil {
+		cfg.DialogAutoAccept = *d.DialogAutoAccept
 	}
+}
 
-	// Profiles
-	if fc.Profiles.BaseDir != "" {
-		cfg.ProfilesBaseDir = fc.Profiles.BaseDir
+func applyProfilesConfig(cfg *RuntimeConfig, p ProfilesConfig) {
+	if p.BaseDir != "" {
+		cfg.ProfilesBaseDir = p.BaseDir
 	}
-	if fc.Profiles.DefaultProfile != "" {
-		cfg.DefaultProfile = fc.Profiles.DefaultProfile
+	if p.DefaultProfile != "" {
+		cfg.DefaultProfile = p.DefaultProfile
+	}
+	if p.QuarantineKeep != nil && *p.QuarantineKeep >= 0 {
+		cfg.ProfileQuarantineKeep = *p.QuarantineKeep
 	}
 	cfg.ProfileDir = ""
+}
 
-	// Multi-instance
-	if fc.MultiInstance.Strategy != "" {
-		cfg.Strategy = fc.MultiInstance.Strategy
+func applyMultiInstanceConfig(cfg *RuntimeConfig, m MultiInstanceConfig) {
+	if m.Strategy != "" {
+		cfg.Strategy = m.Strategy
 	}
-	if fc.MultiInstance.AllocationPolicy != "" {
-		cfg.AllocationPolicy = fc.MultiInstance.AllocationPolicy
+	if m.AllocationPolicy != "" {
+		cfg.AllocationPolicy = m.AllocationPolicy
 	}
-	if fc.MultiInstance.InstancePortStart != nil {
-		cfg.InstancePortStart = *fc.MultiInstance.InstancePortStart
+	if m.InstancePortStart != nil {
+		cfg.InstancePortStart = *m.InstancePortStart
 	}
-	if fc.MultiInstance.InstancePortEnd != nil {
-		cfg.InstancePortEnd = *fc.MultiInstance.InstancePortEnd
+	if m.InstancePortEnd != nil {
+		cfg.InstancePortEnd = *m.InstancePortEnd
 	}
-	// Restart
-	if fc.MultiInstance.Restart.MaxRestarts != nil {
-		cfg.RestartMaxRestarts = *fc.MultiInstance.Restart.MaxRestarts
+	if m.Restart.MaxRestarts != nil {
+		cfg.RestartMaxRestarts = *m.Restart.MaxRestarts
 	}
-	if fc.MultiInstance.Restart.InitBackoffSec != nil {
-		cfg.RestartInitBackoff = time.Duration(*fc.MultiInstance.Restart.InitBackoffSec) * time.Second
+	if m.Restart.InitBackoffSec != nil {
+		cfg.RestartInitBackoff = time.Duration(*m.Restart.InitBackoffSec) * time.Second
 	}
-	if fc.MultiInstance.Restart.MaxBackoffSec != nil {
-		cfg.RestartMaxBackoff = time.Duration(*fc.MultiInstance.Restart.MaxBackoffSec) * time.Second
+	if m.Restart.MaxBackoffSec != nil {
+		cfg.RestartMaxBackoff = time.Duration(*m.Restart.MaxBackoffSec) * time.Second
 	}
-	if fc.MultiInstance.Restart.StableAfterSec != nil {
-		cfg.RestartStableAfter = time.Duration(*fc.MultiInstance.Restart.StableAfterSec) * time.Second
+	if m.Restart.StableAfterSec != nil {
+		cfg.RestartStableAfter = time.Duration(*m.Restart.StableAfterSec) * time.Second
 	}
+}
 
-	// Attach
-	if fc.Security.Attach.Enabled != nil {
-		cfg.AttachEnabled = *fc.Security.Attach.Enabled
+func applyTimeoutsConfig(cfg *RuntimeConfig, t TimeoutsConfig) {
+	if t.ActionSec > 0 {
+		cfg.ActionTimeout = time.Duration(t.ActionSec) * time.Second
 	}
-	if len(fc.Security.Attach.AllowHosts) > 0 {
-		cfg.AttachAllowHosts = append([]string(nil), fc.Security.Attach.AllowHosts...)
+	if t.NavigateSec > 0 {
+		cfg.NavigateTimeout = time.Duration(t.NavigateSec) * time.Second
 	}
-	if len(fc.Security.Attach.AllowSchemes) > 0 {
-		cfg.AttachAllowSchemes = append([]string(nil), fc.Security.Attach.AllowSchemes...)
+	if t.ShutdownSec > 0 {
+		cfg.ShutdownTimeout = time.Duration(t.ShutdownSec) * time.Second
 	}
+	if t.WaitNavMs > 0 {
+		cfg.WaitNavDelay = time.Duration(t.WaitNavMs) * time.Millisecond
+	}
+}
 
-	// Timeouts
-	if fc.Timeouts.ActionSec > 0 {
-		cfg.ActionTimeout = time.Duration(fc.Timeouts.ActionSec) * time.Second
+func applySchedulerConfig(cfg *RuntimeConfig, s SchedulerFileConfig) {
+	if s.Enabled != nil {
+		cfg.Scheduler.Enabled = *s.Enabled
 	}
-	if fc.Timeouts.NavigateSec > 0 {
-		cfg.NavigateTimeout = time.Duration(fc.Timeouts.NavigateSec) * time.Second
+	if s.Strategy != "" {
+		cfg.Scheduler.Strategy = s.Strategy
 	}
-	if fc.Timeouts.ShutdownSec > 0 {
-		cfg.ShutdownTimeout = time.Duration(fc.Timeouts.ShutdownSec) * time.Second
+	if s.MaxQueueSize != nil {
+		cfg.Scheduler.MaxQueueSize = *s.MaxQueueSize
 	}
-	if fc.Timeouts.WaitNavMs > 0 {
-		cfg.WaitNavDelay = time.Duration(fc.Timeouts.WaitNavMs) * time.Millisecond
+	if s.MaxPerAgent != nil {
+		cfg.Scheduler.MaxPerAgent = *s.MaxPerAgent
 	}
+	if s.MaxInflight != nil {
+		cfg.Scheduler.MaxInflight = *s.MaxInflight
+	}
+	if s.MaxPerAgentFlight != nil {
+		cfg.Scheduler.MaxPerAgentFlight = *s.MaxPerAgentFlight
+	}
+	if s.ResultTTLSec != nil {
+		cfg.Scheduler.ResultTTLSec = *s.ResultTTLSec
+	}
+	if s.WorkerCount != nil {
+		cfg.Scheduler.WorkerCount = *s.WorkerCount
+	}
+	if s.MaxBatchSize != nil {
+		cfg.Scheduler.MaxBatchSize = *s.MaxBatchSize
+	}
+}
 
-	// Scheduler
-	if fc.Scheduler.Enabled != nil {
-		cfg.Scheduler.Enabled = *fc.Scheduler.Enabled
+func applyAutoSolverConfig(cfg *RuntimeConfig, a AutoSolverFileConfig) {
+	if a.Enabled != nil {
+		cfg.AutoSolver.Enabled = *a.Enabled
 	}
-	if fc.Scheduler.Strategy != "" {
-		cfg.Scheduler.Strategy = fc.Scheduler.Strategy
+	if a.AutoTrigger != nil {
+		cfg.AutoSolver.AutoTrigger = *a.AutoTrigger
 	}
-	if fc.Scheduler.MaxQueueSize != nil {
-		cfg.Scheduler.MaxQueueSize = *fc.Scheduler.MaxQueueSize
+	if a.TriggerOnNavigate != nil {
+		cfg.AutoSolver.TriggerOnNavigate = *a.TriggerOnNavigate
 	}
-	if fc.Scheduler.MaxPerAgent != nil {
-		cfg.Scheduler.MaxPerAgent = *fc.Scheduler.MaxPerAgent
+	if a.TriggerOnAction != nil {
+		cfg.AutoSolver.TriggerOnAction = *a.TriggerOnAction
 	}
-	if fc.Scheduler.MaxInflight != nil {
-		cfg.Scheduler.MaxInflight = *fc.Scheduler.MaxInflight
+	if a.MaxAttempts != nil && *a.MaxAttempts > 0 {
+		cfg.AutoSolver.MaxAttempts = *a.MaxAttempts
 	}
-	if fc.Scheduler.MaxPerAgentFlight != nil {
-		cfg.Scheduler.MaxPerAgentFlight = *fc.Scheduler.MaxPerAgentFlight
+	if a.SolverTimeoutSec != nil && *a.SolverTimeoutSec > 0 {
+		cfg.AutoSolver.SolverTimeoutSec = *a.SolverTimeoutSec
 	}
-	if fc.Scheduler.ResultTTLSec != nil {
-		cfg.Scheduler.ResultTTLSec = *fc.Scheduler.ResultTTLSec
+	if a.RetryBaseDelayMs != nil && *a.RetryBaseDelayMs >= 0 {
+		cfg.AutoSolver.RetryBaseDelayMs = *a.RetryBaseDelayMs
 	}
-	if fc.Scheduler.WorkerCount != nil {
-		cfg.Scheduler.WorkerCount = *fc.Scheduler.WorkerCount
+	if a.RetryMaxDelayMs != nil && *a.RetryMaxDelayMs >= 0 {
+		cfg.AutoSolver.RetryMaxDelayMs = *a.RetryMaxDelayMs
 	}
-
-	// AutoSolver
-	if fc.AutoSolver.Enabled != nil {
-		cfg.AutoSolver.Enabled = *fc.AutoSolver.Enabled
+	if len(a.Solvers) > 0 {
+		cfg.AutoSolver.Solvers = append([]string(nil), a.Solvers...)
 	}
-	if fc.AutoSolver.AutoTrigger != nil {
-		cfg.AutoSolver.AutoTrigger = *fc.AutoSolver.AutoTrigger
+	if a.LLMProvider != "" {
+		cfg.AutoSolver.LLMProvider = a.LLMProvider
 	}
-	if fc.AutoSolver.TriggerOnNavigate != nil {
-		cfg.AutoSolver.TriggerOnNavigate = *fc.AutoSolver.TriggerOnNavigate
+	if a.LLMFallback != nil {
+		cfg.AutoSolver.LLMFallback = *a.LLMFallback
 	}
-	if fc.AutoSolver.TriggerOnAction != nil {
-		cfg.AutoSolver.TriggerOnAction = *fc.AutoSolver.TriggerOnAction
-	}
-	if fc.AutoSolver.MaxAttempts != nil && *fc.AutoSolver.MaxAttempts > 0 {
-		cfg.AutoSolver.MaxAttempts = *fc.AutoSolver.MaxAttempts
-	}
-	if fc.AutoSolver.SolverTimeoutSec != nil && *fc.AutoSolver.SolverTimeoutSec > 0 {
-		cfg.AutoSolver.SolverTimeoutSec = *fc.AutoSolver.SolverTimeoutSec
-	}
-	if fc.AutoSolver.RetryBaseDelayMs != nil && *fc.AutoSolver.RetryBaseDelayMs >= 0 {
-		cfg.AutoSolver.RetryBaseDelayMs = *fc.AutoSolver.RetryBaseDelayMs
-	}
-	if fc.AutoSolver.RetryMaxDelayMs != nil && *fc.AutoSolver.RetryMaxDelayMs >= 0 {
-		cfg.AutoSolver.RetryMaxDelayMs = *fc.AutoSolver.RetryMaxDelayMs
-	}
-	if len(fc.AutoSolver.Solvers) > 0 {
-		cfg.AutoSolver.Solvers = append([]string(nil), fc.AutoSolver.Solvers...)
-	}
-	if fc.AutoSolver.LLMProvider != "" {
-		cfg.AutoSolver.LLMProvider = fc.AutoSolver.LLMProvider
-	}
-	if fc.AutoSolver.LLMFallback != nil {
-		cfg.AutoSolver.LLMFallback = *fc.AutoSolver.LLMFallback
-	}
-	cfg.AutoSolver.CapsolverKey = fc.AutoSolver.External.CapsolverKey
-	cfg.AutoSolver.TwoCaptchaKey = fc.AutoSolver.External.TwoCaptchaKey
+	cfg.AutoSolver.CapsolverKey = a.External.CapsolverKey
+	cfg.AutoSolver.TwoCaptchaKey = a.External.TwoCaptchaKey
 	cfg.AutoSolver.Credentials = AutoSolverCredentials{
 		Login: AutoSolverLoginCreds{
-			User:     fc.AutoSolver.Credentials.Login.User,
-			Password: fc.AutoSolver.Credentials.Login.Password,
+			User:     a.Credentials.Login.User,
+			Password: a.Credentials.Login.Password,
 		},
 		Signup: AutoSolverSignupCreds{
-			Name:     fc.AutoSolver.Credentials.Signup.Name,
-			Email:    fc.AutoSolver.Credentials.Signup.Email,
-			Password: fc.AutoSolver.Credentials.Signup.Password,
+			Name:     a.Credentials.Signup.Name,
+			Email:    a.Credentials.Signup.Email,
+			Password: a.Credentials.Signup.Password,
 		},
 		Form: AutoSolverFormCreds{
-			Field1: fc.AutoSolver.Credentials.Form.Field1,
-			Field2: fc.AutoSolver.Credentials.Form.Field2,
-			Email:  fc.AutoSolver.Credentials.Form.Email,
+			Field1: a.Credentials.Form.Field1,
+			Field2: a.Credentials.Form.Field2,
+			Email:  a.Credentials.Form.Email,
 		},
 	}
 }
@@ -658,7 +883,37 @@ func ApplyFileConfigToRuntime(cfg *RuntimeConfig, fc *FileConfig) {
 	// The transaction policy is startup-only: a live reload must not be able
 	// to enable or disable supplier transaction guards under a running bridge.
 	policy := cfg.TransactionPolicy
-	applyFileConfig(cfg, fc)
+	EmitLoadDiagnostics(applyFileConfig(cfg, fc))
 	cfg.TransactionPolicy = policy
 	finalizeProfileConfig(cfg)
+}
+
+func applyCloakBrowserConfigToRuntime(cfg *RuntimeConfig, cloak CloakBrowserConfig) {
+	if cfg == nil {
+		return
+	}
+	if cloak.FingerprintSeed != "" {
+		cfg.Cloak.FingerprintSeed = cloak.FingerprintSeed
+	}
+	if cloak.Platform != "" {
+		cfg.Cloak.Platform = cloak.Platform
+	}
+	if cloak.Locale != "" {
+		cfg.Cloak.Locale = cloak.Locale
+	}
+	if cloak.Timezone != "" {
+		cfg.Cloak.Timezone = cloak.Timezone
+	}
+	if cloak.WebRTCIP != "" {
+		cfg.Cloak.WebRTCIP = cloak.WebRTCIP
+	}
+	if cloak.FontsDir != "" {
+		cfg.Cloak.FontsDir = filepath.Clean(cloak.FontsDir)
+	}
+	if cloak.StorageQuotaMB != nil {
+		cfg.Cloak.StorageQuotaMB = *cloak.StorageQuotaMB
+	}
+	if cloak.DisableDefaultStealthArgs != nil {
+		cfg.Cloak.DisableDefaultStealthArgs = *cloak.DisableDefaultStealthArgs
+	}
 }

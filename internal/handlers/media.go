@@ -2,13 +2,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/chromedp/cdproto/emulation"
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/activity"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 )
@@ -22,9 +19,8 @@ type mediaRequest struct {
 // HandleSetMedia emulates a CSS media feature via CDP.
 // POST /emulation/media
 func (h *Handlers) HandleSetMedia(w http.ResponseWriter, r *http.Request) {
-	var req mediaRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
+	req, ok := decodeJSONBody[mediaRequest](w, r)
+	if !ok {
 		return
 	}
 
@@ -34,20 +30,12 @@ func (h *Handlers) HandleSetMedia(w http.ResponseWriter, r *http.Request) {
 // HandleTabSetMedia emulates a CSS media feature for a specific tab.
 // POST /tabs/{id}/emulation/media
 func (h *Handlers) HandleTabSetMedia(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("missing tab ID"))
+	req, ok := decodeJSONBody[mediaRequest](w, r)
+	if !ok {
 		return
 	}
-
-	var req mediaRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
-		return
-	}
-
-	if req.TabID != "" && req.TabID != tabID {
-		httpx.Error(w, 400, fmt.Errorf("tabId in body %q does not match URL path %q", req.TabID, tabID))
+	tabID, ok := h.requirePathTabIDMatch(w, r, req.TabID)
+	if !ok {
 		return
 	}
 	req.TabID = tabID
@@ -65,28 +53,15 @@ func (h *Handlers) setMedia(w http.ResponseWriter, r *http.Request, req mediaReq
 		return
 	}
 
-	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	ctx, resolvedTabID, ok := h.guardedTabContext(w, r, req.TabID, guardDialogBlocked|guardDomainPolicy|guardHandoffPause)
+	if !ok {
 		return
 	}
 
 	tCtx, tCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer tCancel()
 
-	if err := chromedp.Run(tCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			if err := emulation.SetEmulatedMedia().
-				WithFeatures([]*emulation.MediaFeature{{Name: req.Feature, Value: req.Value}}).
-				Do(ctx); err != nil {
-				return fmt.Errorf("setEmulatedMedia: %w", err)
-			}
-			return nil
-		}),
-	); err != nil {
+	if err := h.Bridge.SetEmulatedMedia(tCtx, req.Feature, req.Value); err != nil {
 		httpx.Error(w, 500, fmt.Errorf("CDP set emulated media: %w", err))
 		return
 	}

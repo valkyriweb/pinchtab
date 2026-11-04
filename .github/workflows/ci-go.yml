@@ -3,22 +3,30 @@ name: CI / Go
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'skills/**'
-      - 'plugin/**'
+    paths:
+      - '**'
+      - '!**.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!skills/**'
+      - '!plugins/**'
+      - '!.grok-plugin/**'
+      - 'skills/pinchtab/SKILL.md'
+      - 'skills/pinchtab-mcp/SKILL.md'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'skills/**'
-      - 'plugin/**'
+    paths:
+      - '**'
+      - '!**.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!skills/**'
+      - '!plugins/**'
+      - '!.grok-plugin/**'
+      - 'skills/pinchtab/SKILL.md'
+      - 'skills/pinchtab-mcp/SKILL.md'
   workflow_dispatch:
 
 

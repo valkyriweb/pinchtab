@@ -10,24 +10,24 @@ pt_post /navigate -d "{\"url\":\"${FIXTURES_URL}/buttons.html\"}"
 TAB_ID=$(get_tab_id)
 show_tab "created" "$TAB_ID"
 
-pt_post /action -d '{"action":"click","selector":"[invalid:::selector]"}'
-assert_http_error 400 "invalid|selector|syntax" "invalid selector rejected"
+pt_post /action -d '{"kind":"click","selector":"[invalid:::selector]"}'
+assert_http_error 404 "matched no element" "invalid selector rejected"
 
 end_test
 
 # ─────────────────────────────────────────────────────────────────
 start_test "error handling: element not found"
 
-pt_post /action -d '{"action":"click","selector":"#this-element-does-not-exist"}'
-assert_contains_any "$RESULT" "not found|no element|404|400" "missing element error"
+pt_post /action -d '{"kind":"click","selector":"#this-element-does-not-exist"}'
+assert_contains_any "$RESULT" "not found|no element" "missing element error"
 
 end_test
 
 # ─────────────────────────────────────────────────────────────────
 start_test "error handling: action on missing field"
 
-pt_post /action -d '{"action":"fill","selector":"#nonexistent-input","text":"test"}'
-assert_contains_any "$RESULT" "not found|missing|404|400" "action on missing field rejected"
+pt_post /action -d '{"kind":"fill","selector":"#nonexistent-input","text":"test"}'
+assert_contains_any "$RESULT" "not found|no element" "action on missing field rejected"
 
 end_test
 
@@ -435,16 +435,13 @@ assert_not_ok "rejects non-existent tab"
 end_test
 
 # ─────────────────────────────────────────────────────────────────
-start_test "POST /network/clear: clear network data"
+# /network/clear is gated behind security.allowNetworkIntercept, which this
+# server leaves off by default — see network-route-extended.sh for the
+# happy-path assertion against the full-permissive server.
+start_test "POST /network/clear: 403 when capability off (default server)"
 
 pt_post /network/clear "{\"tabId\":\"${TAB_ID}\"}"
-assert_ok "clear network data"
-
-# Verify entries are cleared
-pt_get "/network?tabId=${TAB_ID}"
-assert_ok "get network after clear"
-ENTRIES_COUNT=$(echo "$RESULT" | jq '.entries | length')
-echo -e "  ${GREEN}✓${NC} entries after clear: $ENTRIES_COUNT"
-((ASSERTIONS_PASSED++)) || true
+assert_not_ok "rejects when allowNetworkIntercept=false"
+assert_json_contains "$RESULT" '.code' 'network_intercept_disabled' "error code identifies the disabled capability"
 
 end_test

@@ -33,11 +33,9 @@ func (o *Orchestrator) handleInstanceTabOpen(w http.ResponseWriter, r *http.Requ
 	var req struct {
 		URL string `json:"url,omitempty"`
 	}
-	if r.ContentLength > 0 {
-		if err := httpx.DecodeJSONBody(w, r, 0, &req); err != nil {
-			httpx.Error(w, httpx.StatusForJSONDecodeError(err), fmt.Errorf("invalid JSON"))
-			return
-		}
+	if err := httpx.DecodeOptionalJSONBody(w, r, 0, &req); err != nil {
+		httpx.Error(w, httpx.StatusForJSONDecodeError(err), err)
+		return
 	}
 
 	payload, err := json.Marshal(map[string]any{
@@ -66,7 +64,7 @@ func (o *Orchestrator) handleInstanceTabOpen(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if shouldRetryInstanceTabOpen(resp.StatusCode, body) {
-		ensureURL, ensureErr := o.instancePathURL(inst, "/ensure-chrome", "")
+		ensureURL, ensureErr := o.instancePathURL(inst, "/ensure-browser", "")
 		if ensureErr == nil {
 			if err := o.ensureInstanceChrome(inst, ensureURL); err == nil {
 				if retryResp, retryBody, retryErr := o.doInstanceRequest(r.Context(), proxyReq.Method, proxyReq.Header, payload, targetURL, inst); retryErr == nil {
@@ -83,7 +81,7 @@ func (o *Orchestrator) handleInstanceTabOpen(w http.ResponseWriter, r *http.Requ
 
 func (o *Orchestrator) ensureInstanceChrome(inst *InstanceInternal, targetURL *url.URL) error {
 	if inst == nil || targetURL == nil {
-		return fmt.Errorf("instance ensure-chrome target missing")
+		return fmt.Errorf("instance ensure-browser target missing")
 	}
 	req, err := http.NewRequest(http.MethodPost, targetURL.String(), nil)
 	if err != nil {
@@ -98,7 +96,7 @@ func (o *Orchestrator) ensureInstanceChrome(inst *InstanceInternal, targetURL *u
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ensure-chrome HTTP %d: %s", resp.StatusCode, compactBody(body))
+		return fmt.Errorf("ensure-browser HTTP %d: %s", resp.StatusCode, compactBody(body))
 	}
 	return nil
 }
@@ -126,11 +124,7 @@ func (o *Orchestrator) doInstanceRequest(ctx context.Context, method string, hea
 }
 
 func copyProxyResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
-	for key, values := range resp.Header {
-		for _, v := range values {
-			w.Header().Add(key, v)
-		}
-	}
+	httpx.CopyProxiedResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
 }

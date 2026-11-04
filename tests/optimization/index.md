@@ -8,7 +8,7 @@ Read this index first, then read the relevant group files.
 
 - `setup-pinchtab.md` defines lane-specific setup, wrapper usage, and recording.
 - This directory defines the shared task groups.
-- Each group lives in its own file: `group-00.md` through `group-44.md`.
+- Each group lives in its own file: `group-00.md` through `group-46.md`.
 - When running a subset, read only the selected group files.
 - When running the full suite, proceed in numeric order.
 
@@ -59,3 +59,5 @@ Read this index first, then read the relevant group files.
 - `group-42.md` — Toast Notifications
 - `group-43.md` — Staff Directory (Content Discovery)
 - `group-44.md` — Multi-Step Wizard (DOM Mutation)
+- `group-45.md` — Element Attributes & State Inspection
+- `group-46.md` — Tab Lifecycle

@@ -8,19 +8,34 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/chromedp/cdproto/network"
 	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/config"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 	"github.com/pinchtab/pinchtab/internal/idpi"
 	"github.com/pinchtab/pinchtab/internal/netguard"
+	"github.com/pinchtab/pinchtab/internal/remedy"
 )
 
-var errDownloadTooLarge = errors.New("download response too large")
+// Aliased to the bridge sentinel so errors from either layer classify identically.
+var errDownloadTooLarge = bridge.ErrDownloadTooLarge
+
+const codeDownloadHostBlocked = "download_host_blocked"
+
+var errDownloadHostBlocked = errors.New("internal or blocked host")
+
+// The restart is named in the hint, not this executable remedy: the download
+// guard answers on a bridge as well as a server, and `pinchtab server restart`
+// would stop a bridge, so only the mode-neutral config write is executable here.
+var downloadHostGrant = remedy.Declare(
+	`pinchtab config set security.downloadAllowedDomains "$(pinchtab config get security.downloadAllowedDomains),<host>"`)
+
+type downloadHostBlockedError struct{ host string }
+
+func (e downloadHostBlockedError) Error() string { return errDownloadHostBlocked.Error() }
+func (e downloadHostBlockedError) Unwrap() error { return errDownloadHostBlocked }
 
 type downloadURLGuard struct {
 	allowedDomains []string
@@ -30,10 +45,7 @@ func newDownloadURLGuard(allowedDomains []string) *downloadURLGuard {
 	return &downloadURLGuard{allowedDomains: append([]string(nil), allowedDomains...)}
 }
 
-func (g *downloadURLGuard) isHostAllowed(host string) bool {
-	if len(g.allowedDomains) == 0 {
-		return false
-	}
+func (g *downloadURLGuard) allowsHost(host string) bool {
 	host = netguard.NormalizeHost(host)
 	if host == "" {
 		return false
@@ -41,9 +53,6 @@ func (g *downloadURLGuard) isHostAllowed(host string) bool {
 	return g.isDomainAllowed("https://" + host)
 }
 
-// isDomainAllowed reports whether rawURL's domain is on the configured
-// allowlist. Allowlisted domains bypass private-IP checks because they
-// are explicitly trusted by the operator (e.g. internal docker hosts).
 func (g *downloadURLGuard) isDomainAllowed(rawURL string) bool {
 	if len(g.allowedDomains) == 0 {
 		return false
@@ -66,8 +75,14 @@ func (g *downloadURLGuard) Validate(rawURL string) error {
 	}
 
 	host := netguard.NormalizeHost(parsed.Hostname())
-	if host == "" || netguard.IsLocalHost(host) {
-		return fmt.Errorf("internal or blocked host")
+	if host == "" {
+		return downloadHostBlockedError{}
+	}
+	if g.allowsHost(host) {
+		return nil
+	}
+	if netguard.IsLocalHost(host) {
+		return downloadHostBlockedError{host: host}
 	}
 
 	if len(g.allowedDomains) > 0 {
@@ -149,9 +164,6 @@ type downloadRequestGuard struct {
 	validator    *downloadURLGuard
 	maxRedirects int
 	redirects    atomic.Int32
-
-	mu         sync.Mutex
-	blockedErr error
 }
 
 func newDownloadRequestGuard(validator *downloadURLGuard, maxRedirects int) *downloadRequestGuard {
@@ -179,25 +191,11 @@ func (g *downloadRequestGuard) Validate(rawURL string, redirected bool) error {
 	return nil
 }
 
-func (g *downloadRequestGuard) NoteBlocked(err error) {
-	g.mu.Lock()
-	if g.blockedErr == nil {
-		g.blockedErr = err
-	}
-	g.mu.Unlock()
-}
-
-func (g *downloadRequestGuard) BlockedError() error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.blockedErr
-}
-
 func downloadTooLargeError(size int64, maxBytes int) error {
 	return fmt.Errorf("%w: received %d bytes, max %d", errDownloadTooLarge, size, maxBytes)
 }
 
-func parseContentLengthHeader(headers network.Headers) (int64, bool) {
+func parseContentLengthHeader(headers map[string]interface{}) (int64, bool) {
 	for key, raw := range headers {
 		if !strings.EqualFold(strings.TrimSpace(key), "Content-Length") {
 			continue
@@ -215,11 +213,32 @@ func parseContentLengthHeader(headers network.Headers) (int64, bool) {
 	return 0, false
 }
 
+// parseContentLengthHeaderGeneric is a type-compatible alias for bridge callbacks.
+func parseContentLengthHeaderGeneric(headers map[string]interface{}) (int64, bool) {
+	return parseContentLengthHeader(headers)
+}
+
+func downloadHostBlockedDetails(host string) map[string]any {
+	if host == "" {
+		return nil
+	}
+	details := remedy.Details(
+		"Name the host in security.downloadAllowedDomains to let the download endpoint reach it, then restart PinchTab to apply the change; a loopback entry exposes services on the server's own machine.",
+		downloadHostGrant.Fill(host))
+	details["host"] = host
+	details["setting"] = "security.downloadAllowedDomains"
+	return details
+}
+
 func writeDownloadGuardError(w http.ResponseWriter, err error, maxBytes int) bool {
 	if err == nil {
 		return false
 	}
+	var blocked downloadHostBlockedError
 	switch {
+	case errors.As(err, &blocked):
+		httpx.ErrorCode(w, http.StatusBadRequest, codeDownloadHostBlocked, err.Error(), false,
+			downloadHostBlockedDetails(blocked.host))
 	case errors.Is(err, bridge.ErrTooManyRedirects):
 		httpx.Error(w, 422, fmt.Errorf("download: %w", err))
 	case errors.Is(err, errDownloadTooLarge):

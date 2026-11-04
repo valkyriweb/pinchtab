@@ -6,20 +6,49 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/pinchtab/pinchtab/internal/config"
+	"github.com/pinchtab/pinchtab/internal/httpx"
 	"github.com/pinchtab/pinchtab/internal/orchestrator"
 	"github.com/pinchtab/pinchtab/internal/proxy"
+	"github.com/pinchtab/pinchtab/internal/routes"
 )
 
 type mockRunner struct {
 	portAvail bool
+	cmds      []*mockCmd
+}
+
+type mockCmd struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newMockCmd() *mockCmd {
+	return &mockCmd{done: make(chan struct{})}
+}
+
+func (m *mockCmd) Wait() error {
+	<-m.done
+	return nil
+}
+
+func (m *mockCmd) PID() int { return 1234 }
+
+func (m *mockCmd) Cancel() {
+	m.once.Do(func() {
+		close(m.done)
+	})
 }
 
 func (m *mockRunner) Run(context.Context, string, []string, []string, io.Writer, io.Writer) (orchestrator.Cmd, error) {
-	return nil, nil
+	cmd := newMockCmd()
+	m.cmds = append(m.cmds, cmd)
+	return cmd, nil
 }
 
 func (m *mockRunner) InspectPort(string) orchestrator.PortInspection {
@@ -95,6 +124,60 @@ func TestStrategy_ProxyToFirst_NoOrch_Returns503(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestStrategy_EnsureRunning_BrowserTargetAutoLaunchesRequestedTarget(t *testing.T) {
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+
+	runner := &mockRunner{portAvail: true}
+	orch := orchestrator.NewOrchestratorWithRunner(t.TempDir(), runner)
+	orch.ApplyRuntimeConfig(&config.RuntimeConfig{
+		DefaultTarget: "chrome",
+		Targets: config.BrowserTargetsConfig{
+			"chrome": {Provider: config.BrowserChrome},
+			"cloak":  {Provider: config.BrowserCloak},
+		},
+	})
+	// Shutdown, not a Stop loop: it also waits for the startup monitors, which
+	// otherwise outlive the test and keep reading http.DefaultTransport while
+	// the cleanup registered above restores it.
+	t.Cleanup(orch.Shutdown)
+
+	req := httptest.NewRequest(http.MethodPost, "/navigate?browser=cloak", nil)
+
+	s := &Strategy{orch: orch}
+	target, status, err := s.ensureRunning(req)
+	if err != nil {
+		t.Fatalf("ensureRunning status=%d err=%v", status, err)
+	}
+	if target == "" {
+		t.Fatal("target URL is empty")
+	}
+	instances := orch.List()
+	if len(instances) != 1 {
+		t.Fatalf("instances = %d, want 1: %+v", len(instances), instances)
+	}
+	if instances[0].Browser != config.BrowserCloak {
+		t.Fatalf("Browser = %q, want cloak", instances[0].Browser)
+	}
+	if instances[0].ProfileName != "default-cloak" {
+		t.Fatalf("ProfileName = %q, want default-cloak", instances[0].ProfileName)
+	}
+}
+
 func TestStrategy_HandleTabs_NoInstances(t *testing.T) {
 	// handleTabs with nil orch would panic — test the empty-tabs path
 	// by checking the JSON response format of proxyHTTP fallback.
@@ -110,35 +193,85 @@ func TestStrategy_HandleTabs_NoInstances(t *testing.T) {
 	}
 }
 
-func TestStrategy_RegisterRoutes_LocksSensitiveShorthandRoutes(t *testing.T) {
+func lockedMux(t *testing.T) *http.ServeMux {
+	t.Helper()
 	orch := orchestrator.NewOrchestratorWithRunner(t.TempDir(), &mockRunner{portAvail: true})
 	orch.ApplyRuntimeConfig(&config.RuntimeConfig{})
 
 	s := &Strategy{orch: orch}
 	mux := http.NewServeMux()
 	s.RegisterRoutes(mux)
+	return mux
+}
 
-	tests := []struct {
-		method  string
-		path    string
-		body    string
-		setting string
-	}{
-		{method: "POST", path: "/evaluate", body: `{"expression":"1+1"}`, setting: "security.allowEvaluate"},
-		{method: "GET", path: "/cookies", setting: "security.allowCookies"},
-		{method: "DELETE", path: "/cookies", setting: "security.allowCookies"},
+func refuse(t *testing.T, mux *http.ServeMux, ep routes.Endpoint) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(ep.Method, ep.Path, strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("%s: got %d, want 403: %s", ep.Route(), rec.Code, rec.Body.String())
 	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("%s: refusal is not JSON: %v: %s", ep.Route(), err, rec.Body.String())
+	}
+	return body
+}
 
-	for _, tt := range tests {
-		req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
+func TestStrategy_RegisterRoutes_RefusalsComeFromTheCapabilityOwner(t *testing.T) {
+	gated := routes.CapabilityEndpoints()
+	if len(gated) == 0 {
+		t.Fatal("no capability-gated endpoints; this guard would pass vacuously")
+	}
+	mux := lockedMux(t)
 
-		if rec.Code != 403 {
-			t.Fatalf("%s %s expected 403, got %d: %s", tt.method, tt.path, rec.Code, rec.Body.String())
+	seen := 0
+	for cap, eps := range gated {
+		meta, ok := routes.Meta(cap)
+		if !ok {
+			t.Errorf("capability %q gates routes but routes.Meta does not describe it", cap)
+			continue
 		}
-		if !strings.Contains(rec.Body.String(), tt.setting) {
-			t.Fatalf("%s %s expected lock response to mention %s, got %s", tt.method, tt.path, tt.setting, rec.Body.String())
+		want := map[string]any{
+			"code":    meta.DisabledCode,
+			"error":   httpx.DisabledEndpointMessage(meta.Label, meta.Setting),
+			"details": httpx.DisabledEndpointDetails(meta.Setting),
+		}
+		if len(eps) == 0 {
+			t.Errorf("capability %q yields no endpoints, so it is uncovered here", cap)
+		}
+		for _, ep := range eps {
+			got := refuse(t, mux, ep)
+			delete(got, "retryable")
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("%s refusal = %#v, want %#v", ep.Route(), got, want)
+			}
+			seen++
+		}
+	}
+	if seen < len(gated) {
+		t.Fatalf("checked %d endpoints across %d capabilities; every capability must contribute at least one", seen, len(gated))
+	}
+}
+
+func TestStrategy_RegisterRoutes_RefusedSettingIsASettableConfigKey(t *testing.T) {
+	gated := routes.CapabilityEndpoints()
+	if len(gated) == 0 {
+		t.Fatal("no capability-gated endpoints; this guard would pass vacuously")
+	}
+	mux := lockedMux(t)
+
+	for cap, eps := range gated {
+		details, _ := refuse(t, mux, eps[0])["details"].(map[string]any)
+		setting, _ := details["setting"].(string)
+		if setting == "" {
+			t.Errorf("capability %q refuses without naming a setting, so its remedy cannot be followed", cap)
+			continue
+		}
+		if err := config.SetConfigValue(&config.FileConfig{}, setting, "true"); err != nil {
+			t.Errorf("capability %q refuses citing %q, which the config editor rejects: %v", cap, setting, err)
 		}
 	}
 }

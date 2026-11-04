@@ -17,10 +17,18 @@ Today, the main production shape is:
 
 PinchTab also supports an advanced attach path:
 
-- the server can register an externally managed Chrome instance through `POST /instances/attach`
+- the server can front an externally managed Chrome instance through `POST /instances/attach` (it launches a child `pinchtab bridge --cdp-attach` against the CDP URL), or register an already running bridge through `POST /instances/attach-bridge`
 - attach is policy-gated by `security.attach.enabled`, `security.attach.allowHosts`, and `security.attach.allowSchemes`
 
 The current managed implementation is bridge-backed. Any direct-CDP-only managed model is architectural discussion elsewhere, not the default runtime path in this codebase.
+
+Related architecture specs:
+
+- [Browser Abstraction](./browser-abstraction.md): the multi-browser target model
+  for selecting Chrome, CloakBrowser, and future providers per request (see the
+  Target Architecture section).
+- [Geo Provider](./geo-provider.md): proxy egress geo resolution, including the
+  proposed contract for a future HTTP-backed provider.
 
 ## System Overview
 
@@ -54,18 +62,19 @@ For the normal multi-instance server path, the flow is:
 ```mermaid
 flowchart LR
     R["HTTP Request"] --> M["Auth + Middleware"]
-    M --> P["Policy Checks"]
-    P --> X["Routing / Instance Resolution"]
+    M --> X["Routing / Instance Resolution"]
     X --> B["Bridge Handler"]
-    B --> C["Chrome via CDP"]
+    B --> P["Handler Policy Checks"]
+    P --> C["Chrome via CDP"]
     C --> O["JSON / Text / PDF / Image Response"]
 ```
 
 Important details:
 
 - auth and common middleware run at the HTTP layer
-- policy checks include attach policy and, when enabled, IDPI protections
+- attach policy is enforced on the attach routes in the server
 - tab-scoped routes are resolved to the owning instance before execution
+- browser-facing checks (open-dialog guard, domain policy, and IDPI when enabled) run in the bridge handlers, before any CDP work
 - the bridge runtime performs the actual CDP work
 
 In bridge-only mode, the orchestrator and multi-instance routing layers are skipped, but the same browser handler model still applies.
@@ -99,7 +108,7 @@ When `security.idpi` is enabled, the current implementation can:
 Architecturally, this keeps policy separate from routing and execution:
 
 ```text
-request -> middleware/policy -> routing -> execution -> response
+request -> middleware -> routing -> handler policy -> execution -> response
 ```
 
 ## Design Principles
@@ -116,7 +125,9 @@ The most important packages for the current architecture are:
 
 - `cmd/pinchtab`: process startup modes and CLI entrypoints
 - `internal/orchestrator`: instance lifecycle, attach, and tab-to-instance proxying
+- `internal/instance`: tab-to-instance locator cache and instance allocation used by the orchestrator
 - `internal/bridge`: browser runtime, tab state, and CDP execution
+- `internal/browsers`: browser provider registry (`chrome`, `cloak`, `ghost-chrome`)
 - `internal/handlers`: single-instance HTTP handlers
 - `internal/profiles`: persistent profile management
 - `internal/strategy`: server-side routing behavior for shorthand requests

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,10 @@ const (
 	pinchtabDaemonUnitName = "pinchtab.service"
 	pinchtabLaunchdLabel   = "com.pinchtab.pinchtab"
 )
+
+var ErrUnsupportedOS = errors.New("pinchtab daemon is supported on macOS and Linux only")
+
+var runtimeGOOS = runtime.GOOS
 
 type Manager interface {
 	Preflight() error
@@ -56,12 +61,25 @@ func CurrentManager() (Manager, error) {
 }
 
 func IsInstalled() bool {
+	installed, err := InstallationStatus()
+	return err == nil && installed
+}
+
+// InstallationStatus distinguishes an absent service from an unreadable service
+// location so lifecycle callers can fail closed instead of starting a second owner.
+func InstallationStatus() (bool, error) {
 	manager, err := CurrentManager()
 	if err != nil {
-		return false
+		return false, err
 	}
 	_, err = os.Stat(manager.ServicePath())
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func IsRunning() bool {
@@ -98,7 +116,7 @@ func currentEnvironment() (environment, error) {
 	return environment{
 		execPath:      execPath,
 		homeDir:       homeDir,
-		osName:        runtime.GOOS,
+		osName:        runtimeGOOS,
 		userID:        currentUser.Uid,
 		xdgConfigHome: os.Getenv("XDG_CONFIG_HOME"),
 	}, nil
@@ -111,7 +129,7 @@ func newManager(env environment, runner commandRunner) (Manager, error) {
 	case "darwin":
 		return &launchdManager{env: env, runner: runner}, nil
 	default:
-		return nil, fmt.Errorf("pinchtab daemon is supported on macOS and Linux; current OS is %s", env.osName)
+		return nil, fmt.Errorf("%w; current OS is %s", ErrUnsupportedOS, env.osName)
 	}
 }
 
@@ -144,6 +162,17 @@ func pinchtabStateHome(env environment) string {
 
 func daemonLogDir(env environment) string {
 	return filepath.Join(pinchtabStateHome(env), "logs")
+}
+
+// StderrLogPath is where a service-managed server's diagnostics land. Exported so a
+// surface that tells an operator where to look reads the same path the installer
+// writes into the unit, rather than spelling it a second time.
+func StderrLogPath() (string, error) {
+	env, err := currentEnvironment()
+	if err != nil {
+		return "", err
+	}
+	return daemonStderrLogPath(env), nil
 }
 
 func daemonStdoutLogPath(env environment) string {

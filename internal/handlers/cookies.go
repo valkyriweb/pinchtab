@@ -1,30 +1,23 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/activity"
+	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
+	"github.com/pinchtab/pinchtab/internal/routes"
 )
 
 func (h *Handlers) ensureCookiesEnabled(w http.ResponseWriter) bool {
 	if h.cookiesEnabled() {
 		return true
 	}
-	httpx.ErrorCode(w, http.StatusForbidden, "cookies_disabled", httpx.DisabledEndpointMessage("cookies", "security.allowCookies"), false, map[string]any{
-		"setting": "security.allowCookies",
-	})
+	h.writeCapabilityDisabled(w, routes.CapCookies)
 	return false
 }
 
@@ -37,12 +30,8 @@ func (h *Handlers) HandleGetCookies(w http.ResponseWriter, r *http.Request) {
 	url := r.URL.Query().Get("url")
 	name := r.URL.Query().Get("name")
 
-	ctx, resolvedTabID, err := h.tabContext(r, tabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	ctx, _, ok := h.guardedTabContext(w, r, tabID, guardDomainPolicy)
+	if !ok {
 		return
 	}
 
@@ -53,24 +42,18 @@ func (h *Handlers) HandleGetCookies(w http.ResponseWriter, r *http.Request) {
 	tCtx, tCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer tCancel()
 
-	var cookies []*network.Cookie
-	if err := chromedp.Run(tCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			if url == "" {
-				_ = chromedp.Location(&url).Do(ctx)
-			}
+	if url == "" {
+		url, _ = h.Bridge.CurrentURL(tCtx)
+	}
 
-			var err error
-			cookies, err = network.GetCookies().WithURLs([]string{url}).Do(ctx)
-			return err
-		}),
-	); err != nil {
+	cookies, err := h.Bridge.GetCookies(tCtx, []string{url})
+	if err != nil {
 		httpx.Error(w, 500, fmt.Errorf("get cookies: %w", err))
 		return
 	}
 
 	if name != "" {
-		filtered := make([]*network.Cookie, 0)
+		filtered := make([]bridge.CookieData, 0)
 		for _, c := range cookies {
 			if c.Name == name {
 				filtered = append(filtered, c)
@@ -90,7 +73,7 @@ func (h *Handlers) HandleGetCookies(w http.ResponseWriter, r *http.Request) {
 			"path":     c.Path,
 			"secure":   c.Secure,
 			"httpOnly": c.HTTPOnly,
-			"sameSite": c.SameSite.String(),
+			"sameSite": c.SameSite,
 		}
 		if c.Expires > 0 {
 			result[i]["expires"] = c.Expires
@@ -108,21 +91,7 @@ func (h *Handlers) HandleGetCookies(w http.ResponseWriter, r *http.Request) {
 //
 // @Endpoint GET /tabs/{id}/cookies
 func (h *Handlers) HandleTabGetCookies(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
-		return
-	}
-
-	q := r.URL.Query()
-	q.Set("tabId", tabID)
-
-	req := r.Clone(r.Context())
-	u := *r.URL
-	u.RawQuery = q.Encode()
-	req.URL = &u
-
-	h.HandleGetCookies(w, req)
+	h.withPathTabID(w, r, h.HandleGetCookies)
 }
 
 type cookieRequest struct {
@@ -150,7 +119,7 @@ func (h *Handlers) HandleClearCookies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.ensureChrome(); err != nil {
+	if err := h.ensureBrowser(h.Config); err != nil {
 		httpx.Error(w, http.StatusServiceUnavailable, err)
 		return
 	}
@@ -169,13 +138,16 @@ func (h *Handlers) HandleClearCookies(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "cleared"})
 }
 
-// HandleTabClearCookies clears all browser cookies (tab-scoped variant for API consistency).
+// HandleTabClearCookies clears EVERY cookie in the browser, for every origin. The
+// tab id addresses the route and is verified to exist; it does not scope the wipe,
+// and no cookie belonging only to this tab's origin can be cleared on its own. The
+// tab-scoped spelling exists for API consistency with the GET and POST variants,
+// which are genuinely per-tab.
 //
 // @Endpoint DELETE /tabs/{id}/cookies
 func (h *Handlers) HandleTabClearCookies(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
+	tabID, ok := requirePathTabID(w, r)
+	if !ok {
 		return
 	}
 
@@ -203,22 +175,39 @@ func (h *Handlers) HandleSetCookies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.URL == "" {
-		httpx.Error(w, 400, fmt.Errorf("url is required"))
-		return
-	}
-
 	if len(req.Cookies) == 0 {
 		httpx.Error(w, 400, fmt.Errorf("cookies array is empty"))
 		return
 	}
 
-	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
+	// A cookie with no name cannot be set at all, and skipping it silently is how
+	// this endpoint used to report a no-op: an empty value is now honoured, since
+	// blanking a cookie without deleting it is a legitimate operation and CDP
+	// accepts it, so the only unsettable cookie is a nameless one. Refusing here
+	// keeps every counted cookie one the browser was actually asked to store.
+	for i, cookie := range req.Cookies {
+		if cookie.Name == "" {
+			httpx.Error(w, 400, fmt.Errorf("cookies[%d] has no name; a cookie without a name cannot be set", i))
+			return
+		}
+	}
+
+	ctx, _, ok := h.guardedTabContext(w, r, req.TabID, guardDomainPolicy|guardHandoffPause)
+	if !ok {
 		return
 	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+
+	tCtx, tCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer tCancel()
+
+	// The tab's current URL is the default target, the same way HandleGetCookies
+	// reads it: a caller driving one tab already said which page it means, and
+	// making it restate the URL is what kept session injection off the CLI.
+	if req.URL == "" {
+		req.URL, _ = h.Bridge.CurrentURL(tCtx)
+	}
+	if req.URL == "" {
+		httpx.Error(w, 400, fmt.Errorf("url is required: the tab has no current URL to default to"))
 		return
 	}
 
@@ -226,93 +215,53 @@ func (h *Handlers) HandleSetCookies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tCtx, tCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer tCancel()
-
 	successCount := 0
-	for _, cookie := range req.Cookies {
-		if cookie.Name == "" || cookie.Value == "" {
+	// The reason each cookie was refused, not just how many were: a domain mismatch, an
+	// invalid SameSite and Secure-on-http are the same count and different remedies, and a
+	// caller that only learns the count cannot tell a malformed request from a retryable
+	// one. Reported per index so a multi-cookie request says WHICH.
+	failures := []map[string]any{}
+	for i, cookie := range req.Cookies {
+		err := h.Bridge.SetCookie(tCtx, bridge.SetCookieParams{
+			Name:     cookie.Name,
+			Value:    cookie.Value,
+			URL:      req.URL,
+			Domain:   cookie.Domain,
+			Path:     cookie.Path,
+			Secure:   cookie.Secure,
+			HTTPOnly: cookie.HTTPOnly,
+			SameSite: cookie.SameSite,
+			Expires:  cookie.Expires,
+		})
+		if err == nil {
+			successCount++
 			continue
 		}
-
-		params := network.SetCookie(cookie.Name, cookie.Value).
-			WithURL(req.URL).
-			WithHTTPOnly(cookie.HTTPOnly).
-			WithSecure(cookie.Secure)
-
-		if cookie.Domain != "" {
-			params = params.WithDomain(cookie.Domain)
-		}
-		if cookie.Path != "" {
-			params = params.WithPath(cookie.Path)
-		}
-		if cookie.Expires > 0 {
-			expires := cdp.TimeSinceEpoch(time.Unix(int64(cookie.Expires), 0))
-			params = params.WithExpires(&expires)
-		}
-
-		if cookie.SameSite != "" {
-			var sameSite network.CookieSameSite
-			switch strings.ToLower(cookie.SameSite) {
-			case "strict":
-				sameSite = network.CookieSameSiteStrict
-			case "lax":
-				sameSite = network.CookieSameSiteLax
-			case "none":
-				sameSite = network.CookieSameSiteNone
-			}
-			if sameSite != "" {
-				params = params.WithSameSite(sameSite)
-			}
-		}
-
-		if err := chromedp.Run(tCtx, params); err == nil {
-			successCount++
-		}
+		failures = append(failures, map[string]any{
+			"index": i,
+			"name":  cookie.Name,
+			"error": err.Error(),
+		})
 	}
 
 	h.recordActivity(r, activity.Update{Action: "cookies.write"})
 
-	httpx.JSON(w, 200, map[string]any{
+	result := map[string]any{
 		"set":    successCount,
 		"failed": len(req.Cookies) - successCount,
 		"total":  len(req.Cookies),
-	})
+	}
+	if len(failures) > 0 {
+		result["failures"] = failures
+	}
+	httpx.JSON(w, 200, result)
 }
 
 // HandleTabSetCookies sets cookies for a tab identified by path ID.
 //
 // @Endpoint POST /tabs/{id}/cookies
 func (h *Handlers) HandleTabSetCookies(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
-		return
-	}
-
-	reqBody := cookieRequest{}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize))
-	if err := dec.Decode(&reqBody); err != nil && !errors.Is(err, io.EOF) {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
-		return
-	}
-
-	if reqBody.TabID != "" && reqBody.TabID != tabID {
-		httpx.Error(w, 400, fmt.Errorf("tabId in body does not match path id"))
-		return
-	}
-	reqBody.TabID = tabID
-
-	payload, err := json.Marshal(reqBody)
-	if err != nil {
-		httpx.Error(w, 500, fmt.Errorf("encode: %w", err))
-		return
-	}
-
-	req := r.Clone(r.Context())
-	req.Body = io.NopCloser(bytes.NewReader(payload))
-	req.ContentLength = int64(len(payload))
-	req.Header = r.Header.Clone()
-	req.Header.Set("Content-Type", "application/json")
-	h.HandleSetCookies(w, req)
+	// Path id is canonical; reject a conflicting body tabId and forward to the
+	// root handler, which re-decodes the cookieRequest.
+	h.withPathTabIDBody(w, r, h.HandleSetCookies)
 }

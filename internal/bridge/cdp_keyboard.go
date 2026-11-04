@@ -6,18 +6,26 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// namedKeyDefs maps friendly key names (as accepted by the CLI "press" command)
-// to their CDP Input.dispatchKeyEvent parameters. Keys not in this table fall
-// through to chromedp.KeyEvent so that single printable characters still work.
+// namedKeyDefs maps friendly key names to CDP Input.dispatchKeyEvent parameters.
+// Keys absent from this table fall through to chromedp.KeyEvent.
+// insertText non-empty → use "keyDown" (fires keypress + default action); empty → "rawKeyDown".
 var namedKeyDefs = map[string]struct {
 	code       string
 	virtualKey int64
-	insertText string // non-empty for keys that produce a character (Enter→\r, Tab→\t)
+	insertText string
 }{
-	"Enter":      {"Enter", 13, "\r"},
-	"Return":     {"Enter", 13, "\r"},
-	"Tab":        {"Tab", 9, "\t"},
-	"Escape":     {"Escape", 27, ""},
+	"Enter":  {"Enter", 13, "\r"},
+	"Return": {"Enter", 13, "\r"},
+	"Tab":    {"Tab", 9, "\t"},
+	"Escape": {"Escape", 27, ""},
+	// Modifier keys must dispatch keyDown/keyUp events, never text. Without these
+	// entries they fall through to chromedp.KeyEvent and the literal name ("Shift")
+	// is typed into the focused field (issue #588). insertText is empty so the
+	// browser receives a real modifier key event with no character.
+	"Shift":      {"ShiftLeft", 16, ""},
+	"Control":    {"ControlLeft", 17, ""},
+	"Alt":        {"AltLeft", 18, ""},
+	"Meta":       {"MetaLeft", 91, ""},
 	"Backspace":  {"Backspace", 8, ""},
 	"Delete":     {"Delete", 46, ""},
 	"ArrowLeft":  {"ArrowLeft", 37, ""},
@@ -43,50 +51,142 @@ var namedKeyDefs = map[string]struct {
 	"F12":        {"F12", 123, ""},
 }
 
-// DispatchNamedKey sends proper CDP keyDown / keyUp events for well-known key
-// names (e.g. "Enter", "Tab", "Escape", "ArrowLeft") so that JavaScript event
-// handlers receive a KeyboardEvent with the correct key property.
-//
-// Unlike chromedp.KeyEvent, which treats multi-character strings as text
-// sequences and would type "Enter" as five separate characters, this function
-// consults namedKeyDefs and emits a single logical keystroke. Unrecognised keys
-// fall back to chromedp.KeyEvent so that single printable characters still work.
-func DispatchNamedKey(ctx context.Context, key string) error {
+// printableShortcutKey returns the CDP code and Windows virtual-key code for a
+// single printable ASCII key. It is used to dispatch keyboard shortcuts such as
+// Ctrl+C / Cmd+A where the key is not in namedKeyDefs but must still carry a real
+// code/virtualKey so the page recognises the chord. ok is false for anything we
+// cannot map (the caller then falls back to typing the key).
+func printableShortcutKey(key string) (code string, vk int64, ok bool) {
+	if len(key) != 1 {
+		return "", 0, false
+	}
+	c := key[0]
+	switch {
+	case c >= 'a' && c <= 'z':
+		u := c - ('a' - 'A')
+		return "Key" + string(rune(u)), int64(u), true
+	case c >= 'A' && c <= 'Z':
+		return "Key" + string(rune(c)), int64(c), true
+	case c >= '0' && c <= '9':
+		return "Digit" + string(rune(c)), int64(c), true
+	}
+	return "", 0, false
+}
+
+// editingCommand maps a Ctrl/Cmd shortcut to the editing command CDP applies via
+// the keyDown "commands" field. On macOS the built-in editor only performs these
+// actions (select-all, copy, …) when the command name is supplied; Linux/Windows
+// derive them from the key event directly, where the empty default is harmless.
+func editingCommand(key string, modifiers int) string {
+	const ctrl, meta, shift = 2, 4, 8
+	if modifiers&(ctrl|meta) == 0 {
+		return ""
+	}
+	switch key {
+	case "a", "A":
+		return "selectAll"
+	case "c", "C":
+		return "copy"
+	case "v", "V":
+		return "paste"
+	case "x", "X":
+		return "cut"
+	case "z", "Z":
+		if modifiers&shift != 0 {
+			return "redo"
+		}
+		return "undo"
+	case "y", "Y":
+		return "redo"
+	}
+	return ""
+}
+
+func w3cKeyName(key string) string {
+	if key == "Return" {
+		return "Enter"
+	}
+	return key
+}
+
+func dispatchNamedKeyEvent(ctx context.Context, key, eventType string) error {
+	params := map[string]any{"type": eventType, "key": w3cKeyName(key)}
+	if def, ok := namedKeyDefs[key]; ok {
+		params["code"] = def.code
+		params["windowsVirtualKeyCode"] = def.virtualKey
+		params["nativeVirtualKeyCode"] = def.virtualKey
+	}
+	return chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return chromedp.FromContext(ctx).Target.Execute(ctx, "Input.dispatchKeyEvent", params, nil)
+	}))
+}
+
+// DispatchNamedKey dispatches key with the given CDP modifier bitmask
+// (Alt=1, Ctrl=2, Meta=4, Shift=8). Unrecognised keys with no modifiers fall
+// back to chromedp.KeyEvent (types the key); with modifiers they are dispatched
+// as a shortcut so chords like Ctrl+C / Cmd+A reach the page.
+func DispatchNamedKey(ctx context.Context, key string, modifiers int) error {
 	def, ok := namedKeyDefs[key]
 	if !ok {
+		if modifiers != 0 {
+			if code, vk, mapped := printableShortcutKey(key); mapped {
+				return dispatchKeyChord(ctx, key, code, vk, "", modifiers, editingCommand(key, modifiers))
+			}
+		}
 		return chromedp.Run(ctx, chromedp.KeyEvent(key))
 	}
 
-	// Normalise "Return" → "Enter" for the W3C key value.
-	w3cKey := key
-	if key == "Return" {
-		w3cKey = "Enter"
+	w3cKey := w3cKeyName(key)
+
+	// A named key with modifiers is a shortcut (Shift+ArrowRight selects,
+	// Ctrl+Backspace deletes a word): suppress its default text so it isn't
+	// also inserted as a character.
+	text := def.insertText
+	if modifiers != 0 {
+		text = ""
+	}
+	return dispatchKeyChord(ctx, w3cKey, def.code, def.virtualKey, text, modifiers, "")
+}
+
+// dispatchKeyChord sends a keyDown+keyUp pair via CDP, applying the modifier
+// bitmask. When text is non-empty the keyDown uses type "keyDown" and carries the
+// text (fires keypress + default actions like form submit); otherwise it uses
+// "rawKeyDown" for non-character / shortcut keys.
+func dispatchKeyChord(ctx context.Context, key, code string, vk int64, text string, modifiers int, command string) error {
+	params := func(evType string, isKeyDown bool) map[string]any {
+		p := map[string]any{
+			"type":                  evType,
+			"key":                   key,
+			"code":                  code,
+			"windowsVirtualKeyCode": vk,
+			"nativeVirtualKeyCode":  vk,
+		}
+		if modifiers != 0 {
+			p["modifiers"] = modifiers
+		}
+		if isKeyDown && text != "" {
+			p["text"] = text
+			p["unmodifiedText"] = text
+		}
+		// The editing command rides on the keyDown so macOS performs the action.
+		if isKeyDown && command != "" {
+			p["commands"] = []string{command}
+		}
+		return p
 	}
 
-	dispatchEvent := func(evType string) chromedp.ActionFunc {
-		return chromedp.ActionFunc(func(ctx context.Context) error {
-			return chromedp.FromContext(ctx).Target.Execute(ctx, "Input.dispatchKeyEvent", map[string]any{
-				"type":                  evType,
-				"key":                   w3cKey,
-				"code":                  def.code,
-				"windowsVirtualKeyCode": def.virtualKey,
-				"nativeVirtualKeyCode":  def.virtualKey,
-			}, nil)
-		})
+	downType := "rawKeyDown"
+	if text != "" {
+		downType = "keyDown"
 	}
-
-	actions := chromedp.Tasks{dispatchEvent("rawKeyDown")}
-	if def.insertText != "" {
-		insertText := def.insertText
-		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
-			return chromedp.FromContext(ctx).Target.Execute(ctx, "Input.insertText", map[string]any{
-				"text": insertText,
-			}, nil)
-		}))
-	}
-	actions = append(actions, dispatchEvent("keyUp"))
-
-	return chromedp.Run(ctx, actions...)
+	return chromedp.Run(ctx,
+		chromedp.ActionFunc(func(c context.Context) error {
+			return chromedp.FromContext(c).Target.Execute(c, "Input.dispatchKeyEvent", params(downType, true), nil)
+		}),
+		chromedp.ActionFunc(func(c context.Context) error {
+			return chromedp.FromContext(c).Target.Execute(c, "Input.dispatchKeyEvent", params("keyUp", false), nil)
+		}),
+	)
 }
 
 func TypeByNodeID(ctx context.Context, nodeID int64, text string) error {

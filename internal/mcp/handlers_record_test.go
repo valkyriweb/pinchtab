@@ -23,7 +23,7 @@ func TestSafeRecordPath_RejectsRelativePath(t *testing.T) {
 }
 
 func TestSafeRecordPath_RejectsBadExtension(t *testing.T) {
-	_, err := safeRecordPath("/tmp/output.txt")
+	_, err := safeRecordPath(filepath.Join(t.TempDir(), "output.txt"))
 	if err == nil || !strings.Contains(err.Error(), "unsupported extension") {
 		t.Fatalf("expected extension error, got %v", err)
 	}
@@ -81,44 +81,13 @@ func TestSafeRecordPath_RejectsNonDirectoryParent(t *testing.T) {
 	}
 }
 
-func TestStreamToFile_WritesAndCaps(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "out.gif")
-
-	data := strings.NewReader("hello recording data")
-	n, err := streamToFile(path, data)
-	if err != nil {
-		t.Fatalf("streamToFile() error = %v", err)
-	}
-	if n != 20 {
-		t.Fatalf("wrote %d bytes, want 20", n)
-	}
-
-	got, _ := os.ReadFile(path)
-	if string(got) != "hello recording data" {
-		t.Fatalf("file content = %q", got)
-	}
-}
-
-func TestStreamToFile_RefusesOverwrite(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "out.gif")
-	if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := streamToFile(path, strings.NewReader("new data"))
-	if err == nil {
-		t.Fatal("expected error for existing file")
-	}
-}
-
 func TestRecordStartRejectsRelativePath(t *testing.T) {
 	srv := mockPinchTab()
 	defer srv.Close()
 
-	r := callTool(t, "pinchtab_record_start", map[string]any{
-		"file": "relative/out.gif",
+	r := callTool(t, "pinchtab_record", map[string]any{
+		"action": "start",
+		"file":   "relative/out.gif",
 	}, srv)
 
 	text := resultText(t, r)
@@ -137,13 +106,40 @@ func TestRecordStartRejectsExistingFile(t *testing.T) {
 	srv := mockPinchTab()
 	defer srv.Close()
 
-	r := callTool(t, "pinchtab_record_start", map[string]any{
-		"file": existing,
+	r := callTool(t, "pinchtab_record", map[string]any{
+		"action": "start",
+		"file":   existing,
 	}, srv)
 
 	text := resultText(t, r)
 	if !strings.Contains(text, "already exists") {
 		t.Fatalf("expected exists error, got %q", text)
+	}
+}
+
+func TestRecordStatusReachesTheStatusEndpoint(t *testing.T) {
+	srv := mockPinchTab()
+	defer srv.Close()
+
+	r := callTool(t, "pinchtab_record", map[string]any{"action": "status"}, srv)
+	if r.IsError {
+		t.Fatalf("action=status was rejected: %s", resultText(t, r))
+	}
+	if got, _ := resultJSON(t, r)["path"].(string); got != "/record/status" {
+		t.Errorf("action=status reached %q, want /record/status", got)
+	}
+}
+
+func TestRecordRefusesAnUnknownAction(t *testing.T) {
+	srv := mockPinchTab()
+	defer srv.Close()
+
+	r := callTool(t, "pinchtab_record", map[string]any{"action": "pause"}, srv)
+	if !r.IsError {
+		t.Fatal("action=\"pause\" was accepted")
+	}
+	if text := resultText(t, r); !strings.Contains(text, "start") || !strings.Contains(text, "status") {
+		t.Errorf("refusal %q does not list the accepted actions, so the caller cannot correct it", text)
 	}
 }
 
@@ -163,11 +159,11 @@ func TestRecordStopBadPathStillStopsRecording(t *testing.T) {
 
 	c := NewClient(srv.URL, "")
 	handlers := handlerMap(c)
-	h := handlers["pinchtab_record_stop"]
+	h := handlers["pinchtab_record"]
 
 	req := mcp.CallToolRequest{}
-	req.Params.Name = "pinchtab_record_stop"
-	req.Params.Arguments = map[string]any{"file": "relative/bad.gif"}
+	req.Params.Name = "pinchtab_record"
+	req.Params.Arguments = map[string]any{"action": "stop", "file": "relative/bad.gif"}
 
 	result, err := h(context.Background(), req)
 	if err != nil {
@@ -219,14 +215,14 @@ func TestRecordStopUsesLongTimeout(t *testing.T) {
 
 	c := NewClient(srv.URL, "")
 	handlers := handlerMap(c)
-	h := handlers["pinchtab_record_stop"]
+	h := handlers["pinchtab_record"]
 
 	dir := t.TempDir()
 	outFile := filepath.Join(dir, "test.gif")
 
 	req := mcp.CallToolRequest{}
-	req.Params.Name = "pinchtab_record_stop"
-	req.Params.Arguments = map[string]any{"file": outFile}
+	req.Params.Name = "pinchtab_record"
+	req.Params.Arguments = map[string]any{"action": "stop", "file": outFile}
 
 	_, err := h(context.Background(), req)
 	if err != nil {

@@ -1,12 +1,11 @@
 package selector
 
 import (
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 )
-
-// ---------------------------------------------------------------------------
-// Parse – explicit prefixes
-// ---------------------------------------------------------------------------
 
 func TestParse_ExplicitPrefixes(t *testing.T) {
 	tests := []struct {
@@ -14,31 +13,26 @@ func TestParse_ExplicitPrefixes(t *testing.T) {
 		kind  Kind
 		value string
 	}{
-		// CSS
 		{"css:#login", KindCSS, "#login"},
 		{"css:.btn.primary", KindCSS, ".btn.primary"},
 		{"css:div > span", KindCSS, "div > span"},
 		{"css:input[type=text]", KindCSS, "input[type=text]"},
 		{"css:*", KindCSS, "*"},
 
-		// XPath
 		{"xpath://div[@id='main']", KindXPath, "//div[@id='main']"},
 		{"xpath:(//button)[1]", KindXPath, "(//button)[1]"},
 		{"xpath://a[contains(@href,'login')]", KindXPath, "//a[contains(@href,'login')]"},
 
-		// Text
 		{"text:Submit", KindText, "Submit"},
 		{"text:Log in", KindText, "Log in"},
 		{"text:", KindText, ""},
 		{"text:with:colon", KindText, "with:colon"},
 
-		// Semantic / find
 		{"find:login button", KindSemantic, "login button"},
 		{"semantic:login button", KindSemantic, "login button"},
 		{"find:the search input field", KindSemantic, "the search input field"},
 		{"find:", KindSemantic, ""},
 
-		// Locator prefixes
 		{"role:button Save", KindRole, "button Save"},
 		{"label:Email", KindLabel, "Email"},
 		{"placeholder:Search", KindPlaceholder, "Search"},
@@ -49,7 +43,6 @@ func TestParse_ExplicitPrefixes(t *testing.T) {
 		{"last:text:Submit", KindLast, "text:Submit"},
 		{"nth:2:role:button Save", KindNth, "2:role:button Save"},
 
-		// Ref (explicit prefix)
 		{"ref:e5", KindRef, "e5"},
 		{"ref:e0", KindRef, "e0"},
 		{"ref:e99999", KindRef, "e99999"},
@@ -67,47 +60,36 @@ func TestParse_ExplicitPrefixes(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Parse – auto-detection (no prefix)
-// ---------------------------------------------------------------------------
-
 func TestParse_AutoDetect(t *testing.T) {
 	tests := []struct {
 		input string
 		kind  Kind
 		value string
 	}{
-		// Refs
 		{"e0", KindRef, "e0"},
 		{"e5", KindRef, "e5"},
 		{"e42", KindRef, "e42"},
 		{"e123", KindRef, "e123"},
 		{"e99999", KindRef, "e99999"},
 
-		// CSS auto-detect: # prefix
 		{"#login", KindCSS, "#login"},
 		{"#my-id", KindCSS, "#my-id"},
 
-		// CSS auto-detect: . prefix
 		{".btn", KindCSS, ".btn"},
 		{".btn.primary", KindCSS, ".btn.primary"},
 
-		// CSS auto-detect: [ prefix
 		{"[type=file]", KindCSS, "[type=file]"},
 		{"[data-testid='foo']", KindCSS, "[data-testid='foo']"},
 
-		// CSS auto-detect: compound selectors
 		{"button.submit", KindCSS, "button.submit"},
 		{"div > span", KindCSS, "div > span"},
 		{"input[name='email']", KindCSS, "input[name='email']"},
 		{"ul li:first-child", KindCSS, "ul li:first-child"},
 		{"a:hover", KindCSS, "a:hover"},
 
-		// XPath auto-detect: //
 		{"//div[@class='main']", KindXPath, "//div[@class='main']"},
 		{"//a", KindXPath, "//a"},
 
-		// XPath auto-detect: (//
 		{"(//button)[1]", KindXPath, "(//button)[1]"},
 		{"(//div[@class='x'])[last()]", KindXPath, "(//div[@class='x'])[last()]"},
 
@@ -132,10 +114,6 @@ func TestParse_AutoDetect(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Parse – empty / whitespace
-// ---------------------------------------------------------------------------
-
 func TestParse_Empty(t *testing.T) {
 	s := Parse("")
 	if !s.IsEmpty() {
@@ -156,7 +134,6 @@ func TestParse_WhitespaceOnly(t *testing.T) {
 }
 
 func TestParse_WhitespaceTrimming(t *testing.T) {
-	// Leading/trailing whitespace should be trimmed before parsing
 	tests := []struct {
 		input string
 		kind  Kind
@@ -180,10 +157,6 @@ func TestParse_WhitespaceTrimming(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Parse – edge cases
-// ---------------------------------------------------------------------------
 
 func TestParse_EdgeCases(t *testing.T) {
 	tests := []struct {
@@ -278,10 +251,6 @@ func TestParse_EdgeCases(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// IsRef
-// ---------------------------------------------------------------------------
-
 func TestIsRef(t *testing.T) {
 	refs := []string{"e0", "e5", "e42", "e123", "e9999", "e1234567890"}
 	for _, r := range refs {
@@ -301,10 +270,6 @@ func TestIsRef(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Selector.String() – canonical representation
-// ---------------------------------------------------------------------------
 
 func TestSelector_String(t *testing.T) {
 	tests := []struct {
@@ -340,10 +305,6 @@ func TestSelector_String(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Selector.IsEmpty()
-// ---------------------------------------------------------------------------
-
 func TestSelector_IsEmpty(t *testing.T) {
 	if !(Selector{}).IsEmpty() {
 		t.Error("zero-value Selector should be empty")
@@ -355,10 +316,6 @@ func TestSelector_IsEmpty(t *testing.T) {
 		t.Error("Selector with value should not be empty")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Selector.Validate()
-// ---------------------------------------------------------------------------
 
 func TestSelector_Validate(t *testing.T) {
 	valid := []Selector{
@@ -383,15 +340,12 @@ func TestSelector_Validate(t *testing.T) {
 		}
 	}
 
-	// Empty selector
 	if err := (Selector{}).Validate(); err == nil {
 		t.Error("Validate(empty) should fail")
 	}
-	// Empty value with kind set
 	if err := (Selector{Kind: KindCSS}).Validate(); err == nil {
 		t.Error("Validate(kind=css, value='') should fail")
 	}
-	// Unknown kind
 	if err := (Selector{Kind: "bogus", Value: "x"}).Validate(); err == nil {
 		t.Error("Validate(bogus kind) should fail")
 	}
@@ -417,7 +371,7 @@ func TestSelector_SemanticQuery(t *testing.T) {
 		{"testid:submit", "testid:submit", true},
 		{"first:text:Submit", "", false},
 		{"last:role:button Save", "last:role:button Save", true},
-		{"nth:2:label:Email", "nth:2:label:Email", true},
+		{"nth:2:label:Email", "nth:3:label:Email", true},
 		{"first:button", "", false},
 		{"last:css:button", "", false},
 		{"nth:2:button", "", false},
@@ -435,12 +389,47 @@ func TestSelector_SemanticQuery(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// From* constructors
-// ---------------------------------------------------------------------------
+func TestPositionalWrapperOverSemanticFormReachesTheMatcherWithItsIndex(t *testing.T) {
+	semanticPrefixes := []string{}
+	for _, pk := range prefixKinds {
+		if rawSelectorCanUseSemantic(pk.Prefix + "Save") {
+			semanticPrefixes = append(semanticPrefixes, pk.Prefix)
+		}
+	}
+	if len(semanticPrefixes) == 0 {
+		t.Fatal("no prefix routes to the semantic matcher, so this guard checked nothing")
+	}
+
+	for _, prefix := range semanticPrefixes {
+		bare := prefix + "Save"
+		for _, tc := range []struct{ wrapped, want string }{
+			{"first:" + bare, "first:" + bare},
+			{"last:" + bare, "last:" + bare},
+			{"nth:0:" + bare, "nth:1:" + bare},
+			{"nth:2:" + bare, "nth:3:" + bare},
+		} {
+			query, ok := Parse(tc.wrapped).SemanticQuery()
+			if !ok {
+				t.Errorf("%s no longer routes to the semantic matcher, so the wrapper it carries is never applied", tc.wrapped)
+				continue
+			}
+			if query != tc.want {
+				t.Errorf("SemanticQuery(%q) = %q, want %q: the wrapper must reach the matcher with its index, translated into the one-based nth the matcher publishes", tc.wrapped, query, tc.want)
+			}
+		}
+	}
+
+	for _, prefix := range []string{"css:", "xpath:", "text:"} {
+		bare := prefix + "Save"
+		for _, wrapped := range []string{bare, "first:" + bare, "last:" + bare, "nth:2:" + bare} {
+			if _, ok := Parse(wrapped).SemanticQuery(); ok {
+				t.Errorf("%s routes to the semantic matcher, so it no longer indexes in document order browser-side as docs/commands.md promises for this kind", wrapped)
+			}
+		}
+	}
+}
 
 func TestFromConstructors(t *testing.T) {
-	// Non-empty values
 	if s := FromRef("e5"); s.Kind != KindRef || s.Value != "e5" {
 		t.Errorf("FromRef(\"e5\"): %+v", s)
 	}
@@ -457,7 +446,6 @@ func TestFromConstructors(t *testing.T) {
 		t.Errorf("FromSemantic(\"btn\"): %+v", s)
 	}
 
-	// Empty values → empty selector
 	empties := []struct {
 		name string
 		fn   func(string) Selector
@@ -474,10 +462,6 @@ func TestFromConstructors(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Parse roundtrip: Parse → String → Parse should be stable
-// ---------------------------------------------------------------------------
 
 func TestParse_Roundtrip(t *testing.T) {
 	inputs := []string{
@@ -512,12 +496,7 @@ func TestParse_Roundtrip(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Parse – prefix priority (explicit prefix wins over auto-detect)
-// ---------------------------------------------------------------------------
-
 func TestParse_PrefixPriority(t *testing.T) {
-	// "css://div" should be CSS, not XPath (explicit prefix wins)
 	s := Parse("css://div")
 	if s.Kind != KindCSS {
 		t.Errorf("Parse(\"css://div\").Kind = %q, want css", s.Kind)
@@ -526,7 +505,6 @@ func TestParse_PrefixPriority(t *testing.T) {
 		t.Errorf("Parse(\"css://div\").Value = %q, want \"//div\"", s.Value)
 	}
 
-	// "ref:embed" should be ref, not CSS
 	s = Parse("ref:embed")
 	if s.Kind != KindRef {
 		t.Errorf("Parse(\"ref:embed\").Kind = %q, want ref", s.Kind)
@@ -535,7 +513,6 @@ func TestParse_PrefixPriority(t *testing.T) {
 		t.Errorf("Parse(\"ref:embed\").Value = %q, want \"embed\"", s.Value)
 	}
 
-	// "text:#login" should be text, not CSS
 	s = Parse("text:#login")
 	if s.Kind != KindText {
 		t.Errorf("Parse(\"text:#login\").Kind = %q, want text", s.Kind)
@@ -544,9 +521,194 @@ func TestParse_PrefixPriority(t *testing.T) {
 		t.Errorf("Parse(\"text:#login\").Value = %q, want \"#login\"", s.Value)
 	}
 
-	// "xpath:e5" should be xpath, not ref
 	s = Parse("xpath:e5")
 	if s.Kind != KindXPath {
 		t.Errorf("Parse(\"xpath:e5\").Kind = %q, want xpath", s.Kind)
+	}
+}
+
+// The nth grammar is owned here; the bridge resolver and SemanticQuery both
+// depend on this split agreeing.
+func TestParseNth(t *testing.T) {
+	index, raw, err := ParseNth("2:role:button Save")
+	if err != nil {
+		t.Fatalf("ParseNth returned error: %v", err)
+	}
+	if index != 2 || raw != "role:button Save" {
+		t.Fatalf("got index=%d raw=%q, want 2 and a role selector", index, raw)
+	}
+
+	if _, _, err := ParseNth("0:button"); err != nil {
+		t.Errorf("zero index should be valid, got %v", err)
+	}
+	if _, _, err := ParseNth("-1:button"); err == nil {
+		t.Error("expected negative index to fail")
+	}
+	if _, _, err := ParseNth("button"); err == nil {
+		t.Error("expected missing nested selector to fail")
+	}
+	if _, _, err := ParseNth("2:   "); err == nil {
+		t.Error("expected blank nested selector to fail")
+	}
+}
+
+// TestPrefixTableDrivesBothParseAndHasKnownPrefix is the guard that keeps the
+// two readers of prefixKinds from drifting: every table entry must parse to its
+// own Kind and be recognised by the predicate, in lower, upper and mixed case.
+func TestPrefixTableDrivesBothParseAndHasKnownPrefix(t *testing.T) {
+	if len(prefixKinds) == 0 {
+		t.Fatal("prefixKinds is empty; the guard would pass vacuously")
+	}
+
+	for _, pk := range prefixKinds {
+		for _, spelling := range []string{
+			pk.Prefix,
+			strings.ToUpper(pk.Prefix),
+			strings.ToUpper(pk.Prefix[:1]) + pk.Prefix[1:],
+		} {
+			input := spelling + "value"
+			t.Run(input, func(t *testing.T) {
+				if !HasKnownPrefix(input) {
+					t.Errorf("HasKnownPrefix(%q) = false, want true", input)
+				}
+				got := Parse(input)
+				if got.Kind != pk.Kind {
+					t.Errorf("Parse(%q).Kind = %q, want %q", input, got.Kind, pk.Kind)
+				}
+				if got.Value != "value" {
+					t.Errorf("Parse(%q).Value = %q, want %q", input, got.Value, "value")
+				}
+			})
+		}
+	}
+}
+
+func TestPrefixTableCoversEveryKindWithAPrefix(t *testing.T) {
+	tabled := map[Kind]bool{}
+	for _, pk := range prefixKinds {
+		tabled[pk.Kind] = true
+	}
+	for _, kind := range declaredKinds(t) {
+		if !tabled[kind] {
+			t.Errorf("kind %q is declared but has no prefix in prefixKinds, so Parse can never produce it and HasKnownPrefix cannot see it. Give it a prefix, or if it is deliberately unprefixed say so here", kind)
+		}
+	}
+	if got := Parse("semantic:login button"); got.Kind != KindSemantic {
+		t.Errorf(`Parse("semantic:...").Kind = %q, want %q`, got.Kind, KindSemantic)
+	}
+	if got := Parse("find:login button"); got.Kind != KindSemantic {
+		t.Errorf(`Parse("find:...").Kind = %q, want %q`, got.Kind, KindSemantic)
+	}
+}
+
+// Read from the declarations rather than listed here: the change this guard exists
+// to catch is a kind added to the grammar, and a hand-written list is one the same
+// commit would have to remember to update — which is the omission being guarded
+// against. KindNone is the absence of a kind and takes no prefix.
+func declaredKinds(t *testing.T) []Kind {
+	t.Helper()
+
+	raw, err := os.ReadFile("selector.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	declaration := regexp.MustCompile(`(?m)^\s*(?:const\s+)?Kind\w+\s+Kind = "([^"]*)"`)
+	var kinds []Kind
+	for _, m := range declaration.FindAllStringSubmatch(string(raw), -1) {
+		if m[1] == "" {
+			continue
+		}
+		kinds = append(kinds, Kind(m[1]))
+	}
+	if len(kinds) < 2 {
+		t.Fatalf("found %d declared kinds in selector.go; the scan matched almost nothing and the coverage check would pass vacuously", len(kinds))
+	}
+	return kinds
+}
+
+func TestHasKnownPrefixExcludesTheAutoDetectedForms(t *testing.T) {
+	for _, in := range []string{"//div", "(//div)", "e5", "#id", ".class", "submit", "unknownprefix:value", ""} {
+		if HasKnownPrefix(in) {
+			t.Errorf("HasKnownPrefix(%q) = true, want false", in)
+		}
+	}
+
+	if got := Parse("//div"); got.Kind != KindXPath || got.Value != "//div" {
+		t.Errorf(`Parse("//div") = %+v, want xpath //div`, got)
+	}
+	if got := Parse("(//div)"); got.Kind != KindXPath || got.Value != "(//div)" {
+		t.Errorf(`Parse("(//div)") = %+v, want xpath (//div)`, got)
+	}
+	if got := Parse("e5"); got.Kind != KindRef || got.Value != "e5" {
+		t.Errorf(`Parse("e5") = %+v, want ref e5`, got)
+	}
+
+	if !HasKnownPrefix("  text:hello") {
+		t.Error(`HasKnownPrefix("  text:hello") = false; leading space must be trimmed as Parse trims it`)
+	}
+}
+
+func TestParseMixedCasePrefixesMatchTheirLowercaseForm(t *testing.T) {
+	pairs := [][2]string{
+		{"CSS:#id", "css:#id"},
+		{"Text:hello", "text:hello"},
+		{"XPath://div", "xpath://div"},
+		{"Find:login button", "find:login button"},
+		{"Role:button Save", "role:button Save"},
+		{"TestID:submit", "testid:submit"},
+		{"NTH:2:div", "nth:2:div"},
+		{"Ref:e5", "ref:e5"},
+	}
+	for _, pair := range pairs {
+		mixed, lower := Parse(pair[0]), Parse(pair[1])
+		if mixed != lower {
+			t.Errorf("Parse(%q) = %+v, want it identical to Parse(%q) = %+v", pair[0], mixed, pair[1], lower)
+		}
+	}
+
+	if got := Parse("CSS:#id"); got.Kind != KindCSS || got.Value != "#id" {
+		t.Errorf(`Parse("CSS:#id") = %+v, want css #id`, got)
+	}
+}
+
+// TestTheSemanticNthOffsetIsAnAdapterNotAnOffByOne states why the +1 exists, so it is
+// not "simplified" away by someone who sees the arithmetic and assumes a bug. The two
+// bases are both documented: this project publishes nth as zero-based for every
+// selector kind, and the semantic matcher's README publishes nth as one-based, where
+// nth:0 is not the first match. Deleting the offset makes the documented nth:0 select
+// nothing on the whole semantic family.
+func TestTheSemanticNthOffsetIsAnAdapterNotAnOffByOne(t *testing.T) {
+	if semanticNthOffset != 1 {
+		t.Fatalf("semanticNthOffset = %d, want 1: PinchTab's public nth is zero-based and the matcher's is one-based", semanticNthOffset)
+	}
+
+	query, ok := Parse("nth:0:role:button Save").SemanticQuery()
+	if !ok {
+		t.Fatal("nth over a semantic form must reach the matcher")
+	}
+	if query != "nth:1:role:button Save" {
+		t.Errorf("the public first match nth:0 arrives as %q; the matcher treats nth:0 as out of range, so it must arrive as nth:1", query)
+	}
+}
+
+func TestSemanticNthBaseReportsTheCallersOwnIndex(t *testing.T) {
+	for _, tc := range []struct {
+		input     string
+		wantIndex int
+		wantBase  string
+		wantOK    bool
+	}{
+		{"nth:0:role:button Save", 0, "role:button Save", true},
+		{"nth:2:label:Email", 2, "label:Email", true},
+		{"first:role:button", 0, "", false},
+		{"last:role:button", 0, "", false},
+		{"nth:2:css:button", 0, "", false},
+		{"role:button", 0, "", false},
+	} {
+		index, base, ok := Parse(tc.input).SemanticNthBase()
+		if ok != tc.wantOK || index != tc.wantIndex || base != tc.wantBase {
+			t.Errorf("SemanticNthBase(%q) = (%d, %q, %v), want (%d, %q, %v)", tc.input, index, base, ok, tc.wantIndex, tc.wantBase, tc.wantOK)
+		}
 	}
 }

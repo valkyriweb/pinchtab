@@ -8,35 +8,38 @@ import (
 	"path/filepath"
 )
 
-func copyDir(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+func copyDir(src *importSource, dst *os.Root) error {
+	return fs.WalkDir(src.root.FS(), filepath.ToSlash(src.relative), func(sourcePath string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinks are not allowed in imported profiles: %s", path)
+			return fmt.Errorf("symlinks are not allowed in imported profiles: %s", sourcePath)
 		}
 
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel(filepath.FromSlash(src.relative), filepath.FromSlash(sourcePath))
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dst, rel)
+		target := filepath.FromSlash(rel)
+		if !filepath.IsLocal(target) {
+			return fmt.Errorf("import path escapes destination: %s", sourcePath)
+		}
 
 		if d.IsDir() {
 			info, err := d.Info()
 			if err != nil {
 				return err
 			}
-			return os.MkdirAll(target, info.Mode().Perm())
+			return dst.MkdirAll(target, info.Mode().Perm())
 		}
 
-		return copyFile(path, target)
+		return copyFile(src.root, filepath.FromSlash(sourcePath), dst, target)
 	})
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src) // #nosec G304 — src is validated by caller
+func copyFile(srcRoot *os.Root, src string, dstRoot *os.Root, dst string) error {
+	in, err := srcRoot.Open(src)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", src, err)
 	}
@@ -47,7 +50,7 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	out, err := dstRoot.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}

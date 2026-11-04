@@ -2,22 +2,21 @@ package observe
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/config"
 	"github.com/pinchtab/pinchtab/internal/sanitize"
 )
 
-// DefaultNetworkBufferSize is the default number of entries kept per tab.
-const DefaultNetworkBufferSize = 100
 const defaultRetainBodyMaxBytesPerTab = 4 << 20
 const defaultRetainBodyConcurrency = 4
 
@@ -34,305 +33,6 @@ const (
 	maxNetworkHeaderTotalBytes  = 32 * 1024
 )
 
-// NetworkEntry represents a single captured network request/response pair.
-type NetworkEntry struct {
-	RequestID       string            `json:"requestId"`
-	URL             string            `json:"url"`
-	Method          string            `json:"method"`
-	Status          int               `json:"status,omitempty"`
-	StatusText      string            `json:"statusText,omitempty"`
-	ResourceType    string            `json:"resourceType"`
-	RequestHeaders  map[string]string `json:"requestHeaders,omitempty"`
-	ResponseHeaders map[string]string `json:"responseHeaders,omitempty"`
-	PostData        string            `json:"postData,omitempty"`
-	MimeType        string            `json:"mimeType,omitempty"`
-	StartTime       time.Time         `json:"startTime"`
-	EndTime         time.Time         `json:"endTime,omitempty"`
-	Duration        float64           `json:"duration,omitempty"`
-	Size            int64             `json:"size,omitempty"`
-	Error           string            `json:"error,omitempty"`
-	Finished        bool              `json:"finished"`
-	Failed          bool              `json:"failed"`
-	ResponseBody    string            `json:"responseBody,omitempty"`
-	Base64Encoded   bool              `json:"base64Encoded,omitempty"`
-	BodyRetained    bool              `json:"bodyRetained,omitempty"`
-	BodyTruncated   bool              `json:"bodyTruncated,omitempty"`
-	BodyError       string            `json:"bodyError,omitempty"`
-}
-
-// NetworkBuffer is a thread-safe ring buffer of network entries for a single tab.
-type NetworkBuffer struct {
-	mu            sync.RWMutex
-	entries       []NetworkEntry
-	index         map[string]int
-	maxSize       int
-	retainedBytes int64
-
-	// Inflight tracking is independent of the ring buffer so eviction
-	// doesn't corrupt the count. inflightIDs holds request IDs currently
-	// in flight; lastChange records the most recent in-flight transition
-	// (request started or completed). Both are guarded by mu.
-	inflightIDs map[string]struct{}
-	lastChange  time.Time
-
-	subMu       sync.Mutex
-	subscribers map[int]chan NetworkEntry
-	nextSubID   int
-}
-
-// NewNetworkBuffer creates a ring buffer with the given capacity.
-func NewNetworkBuffer(size int) *NetworkBuffer {
-	size = config.ClampNetworkBufferSize(size)
-	if size <= 0 {
-		size = DefaultNetworkBufferSize
-	}
-	return &NetworkBuffer{
-		entries:     make([]NetworkEntry, 0, size),
-		index:       make(map[string]int),
-		maxSize:     size,
-		inflightIDs: make(map[string]struct{}),
-		lastChange:  time.Now(),
-		subscribers: make(map[int]chan NetworkEntry),
-	}
-}
-
-// MarkRequestStart records that a request is in flight. Idempotent per
-// request ID. Updates lastChange so wait callers can detect activity.
-func (nb *NetworkBuffer) MarkRequestStart(requestID string) {
-	if requestID == "" {
-		return
-	}
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	if _, ok := nb.inflightIDs[requestID]; ok {
-		return
-	}
-	nb.inflightIDs[requestID] = struct{}{}
-	nb.lastChange = time.Now()
-}
-
-// MarkRequestEnd records that an in-flight request finished or failed.
-// No-op if the request was never registered.
-func (nb *NetworkBuffer) MarkRequestEnd(requestID string) {
-	if requestID == "" {
-		return
-	}
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	if _, ok := nb.inflightIDs[requestID]; !ok {
-		return
-	}
-	delete(nb.inflightIDs, requestID)
-	nb.lastChange = time.Now()
-}
-
-// InflightStatus returns the current in-flight request count and the
-// timestamp of the most recent in-flight transition.
-func (nb *NetworkBuffer) InflightStatus() (count int, lastChange time.Time) {
-	nb.mu.RLock()
-	defer nb.mu.RUnlock()
-	return len(nb.inflightIDs), nb.lastChange
-}
-
-// Add inserts or updates a network entry.
-func (nb *NetworkBuffer) Add(entry NetworkEntry) {
-	entry = normalizeNetworkEntry(entry)
-	nb.mu.Lock()
-
-	isNew := false
-	if idx, ok := nb.index[entry.RequestID]; ok {
-		nb.entries[idx] = entry
-	} else {
-		isNew = true
-		if len(nb.entries) >= nb.maxSize {
-			oldest := nb.entries[0]
-			if oldest.BodyRetained {
-				nb.retainedBytes -= int64(len(oldest.ResponseBody))
-				if nb.retainedBytes < 0 {
-					nb.retainedBytes = 0
-				}
-			}
-			delete(nb.index, oldest.RequestID)
-			nb.entries = nb.entries[1:]
-			for i, e := range nb.entries {
-				nb.index[e.RequestID] = i
-			}
-		}
-		nb.index[entry.RequestID] = len(nb.entries)
-		nb.entries = append(nb.entries, entry)
-	}
-	nb.mu.Unlock()
-
-	if isNew {
-		nb.subMu.Lock()
-		for _, ch := range nb.subscribers {
-			select {
-			case ch <- entry:
-			default:
-			}
-		}
-		nb.subMu.Unlock()
-	}
-}
-
-// Subscribe returns a channel that receives new entries as they are added.
-func (nb *NetworkBuffer) Subscribe() (int, <-chan NetworkEntry) {
-	nb.subMu.Lock()
-	defer nb.subMu.Unlock()
-	id := nb.nextSubID
-	nb.nextSubID++
-	ch := make(chan NetworkEntry, 64)
-	nb.subscribers[id] = ch
-	return id, ch
-}
-
-// Unsubscribe removes a subscriber and closes its channel.
-func (nb *NetworkBuffer) Unsubscribe(id int) {
-	nb.subMu.Lock()
-	defer nb.subMu.Unlock()
-	if ch, ok := nb.subscribers[id]; ok {
-		close(ch)
-		delete(nb.subscribers, id)
-	}
-}
-
-// Get returns a specific entry by request ID.
-func (nb *NetworkBuffer) Get(requestID string) (NetworkEntry, bool) {
-	nb.mu.RLock()
-	defer nb.mu.RUnlock()
-	idx, ok := nb.index[requestID]
-	if !ok {
-		return NetworkEntry{}, false
-	}
-	return nb.entries[idx], true
-}
-
-// Update modifies an existing entry in place.
-func (nb *NetworkBuffer) Update(requestID string, fn func(*NetworkEntry)) {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	idx, ok := nb.index[requestID]
-	if !ok {
-		return
-	}
-	before := nb.entries[idx]
-	fn(&nb.entries[idx])
-	nb.entries[idx] = normalizeNetworkEntry(nb.entries[idx])
-	after := nb.entries[idx]
-	if before.BodyRetained {
-		nb.retainedBytes -= int64(len(before.ResponseBody))
-	}
-	if after.BodyRetained {
-		nb.retainedBytes += int64(len(after.ResponseBody))
-	}
-	if nb.retainedBytes < 0 {
-		nb.retainedBytes = 0
-	}
-}
-
-func (nb *NetworkBuffer) RetainedBytes() int64 {
-	nb.mu.RLock()
-	defer nb.mu.RUnlock()
-	return nb.retainedBytes
-}
-
-// List returns all entries, optionally filtered.
-func (nb *NetworkBuffer) List(filter NetworkFilter) []NetworkEntry {
-	nb.mu.RLock()
-	defer nb.mu.RUnlock()
-
-	result := make([]NetworkEntry, 0, len(nb.entries))
-	for _, e := range nb.entries {
-		if filter.Match(e) {
-			result = append(result, e)
-		}
-	}
-	return result
-}
-
-// Clear removes all entries. Inflight tracking is preserved because
-// active requests are not affected by a buffer clear.
-func (nb *NetworkBuffer) Clear() {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	nb.entries = nb.entries[:0]
-	nb.index = make(map[string]int)
-}
-
-// Len returns the number of entries.
-func (nb *NetworkBuffer) Len() int {
-	nb.mu.RLock()
-	defer nb.mu.RUnlock()
-	return len(nb.entries)
-}
-
-// MaxSizeForTest exposes the effective ring-buffer size for package-external tests.
-func (nb *NetworkBuffer) MaxSizeForTest() int {
-	nb.mu.RLock()
-	defer nb.mu.RUnlock()
-	return nb.maxSize
-}
-
-// NetworkFilter defines criteria for filtering network entries.
-type NetworkFilter struct {
-	URLPattern   string
-	Method       string
-	StatusRange  string
-	ResourceType string
-	Limit        int
-}
-
-// Match returns true if the entry matches the filter criteria.
-func (f NetworkFilter) Match(e NetworkEntry) bool {
-	if f.URLPattern != "" && !strings.Contains(strings.ToLower(e.URL), strings.ToLower(f.URLPattern)) {
-		return false
-	}
-	if f.Method != "" && !strings.EqualFold(e.Method, f.Method) {
-		return false
-	}
-	if f.ResourceType != "" && !networkResourceTypeMatches(e.ResourceType, f.ResourceType) {
-		return false
-	}
-	if f.StatusRange != "" && !MatchStatusRange(e.Status, f.StatusRange) {
-		return false
-	}
-	return true
-}
-
-func networkResourceTypeMatches(entryType, filterType string) bool {
-	if strings.EqualFold(entryType, filterType) {
-		return true
-	}
-	// Keep fetch() traffic discoverable for older clients/tests that still
-	// query type=XHR for script-initiated requests.
-	if strings.EqualFold(filterType, "xhr") && strings.EqualFold(entryType, "fetch") {
-		return true
-	}
-	if strings.EqualFold(filterType, "fetch") && strings.EqualFold(entryType, "xhr") {
-		return true
-	}
-	return false
-}
-
-// MatchStatusRange checks whether a status code matches an exact or wildcard range.
-func MatchStatusRange(status int, pattern string) bool {
-	if pattern == "" {
-		return true
-	}
-	if len(pattern) == 3 && pattern[1] != 'x' && pattern[2] != 'x' {
-		var code int
-		if _, err := fmt.Sscanf(pattern, "%d", &code); err == nil {
-			return status == code
-		}
-	}
-	if len(pattern) == 3 && (pattern[1] == 'x' || pattern[2] == 'x') {
-		prefix := int(pattern[0] - '0')
-		return status/100 == prefix
-	}
-	return true
-}
-
-// NetworkMonitor manages network capture for all tabs.
 type NetworkMonitor struct {
 	mu                  sync.RWMutex
 	buffers             map[string]*NetworkBuffer
@@ -344,7 +44,6 @@ type NetworkMonitor struct {
 	retainBodySemaphore chan struct{}
 }
 
-// NewNetworkMonitor creates a new monitor with the given per-tab buffer size.
 func NewNetworkMonitor(bufferSize int) *NetworkMonitor {
 	bufferSize = config.ClampNetworkBufferSize(bufferSize)
 	if bufferSize <= 0 {
@@ -361,7 +60,6 @@ func NewNetworkMonitor(bufferSize int) *NetworkMonitor {
 	}
 }
 
-// ConfigureBodyRetention enables optional bounded response-body retention.
 func (nm *NetworkMonitor) ConfigureBodyRetention(enabled bool, maxBytes int) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
@@ -390,72 +88,51 @@ func (nm *NetworkMonitor) getOrCreateBufferWithSize(tabID string, size int) *Net
 	return buf
 }
 
-// GetOrCreateBufferForTest exposes getOrCreateBuffer for tests outside this package.
 func (nm *NetworkMonitor) GetOrCreateBufferForTest(tabID string) *NetworkBuffer {
 	return nm.getOrCreateBuffer(tabID)
 }
 
-// GetOrCreateBufferWithSizeForTest exposes buffer sizing for package-external tests.
 func (nm *NetworkMonitor) GetOrCreateBufferWithSizeForTest(tabID string, size int) *NetworkBuffer {
 	return nm.getOrCreateBufferWithSize(tabID, size)
 }
 
-// GetBuffer returns the buffer for a tab (nil if none).
 func (nm *NetworkMonitor) GetBuffer(tabID string) *NetworkBuffer {
 	nm.mu.RLock()
 	defer nm.mu.RUnlock()
 	return nm.buffers[tabID]
 }
 
-// BufferSizeForTest exposes the monitor default size for package-external tests.
 func (nm *NetworkMonitor) BufferSizeForTest() int {
 	nm.mu.RLock()
 	defer nm.mu.RUnlock()
 	return nm.bufSize
 }
 
-// StartCapture enables network monitoring on a tab's CDP session.
 func (nm *NetworkMonitor) StartCapture(tabCtx context.Context, tabID string) error {
 	return nm.StartCaptureWithSize(tabCtx, tabID, 0)
 }
 
-// StartCaptureWithSize enables network monitoring with a specific buffer size.
 func (nm *NetworkMonitor) StartCaptureWithSize(tabCtx context.Context, tabID string, bufferSize int) error {
 	buf := nm.getOrCreateBufferWithSize(tabID, bufferSize)
+
+	listenerCtx, _, alreadyActive := nm.reserveCaptureListener(tabID, tabCtx)
+	if alreadyActive {
+		// Capture is already running for this tab (the buffer exists above). Do
+		// NOT stack another ListenTarget callback — that would double-record events.
+		return nil
+	}
 
 	if err := chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 		return network.Enable().Do(ctx)
 	})); err != nil {
+		nm.releaseCaptureListener(tabID)
 		return fmt.Errorf("network enable: %w", err)
 	}
 
-	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
+	chromedp.ListenTarget(listenerCtx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
-			headers := make(map[string]string)
-			if e.Request.Headers != nil {
-				for k, v := range e.Request.Headers {
-					if s, ok := v.(string); ok {
-						headers[k] = s
-					}
-				}
-			}
-			var postData string
-			if e.Request.HasPostData && len(e.Request.PostDataEntries) > 0 {
-				for _, entry := range e.Request.PostDataEntries {
-					postData += entry.Bytes
-				}
-			}
-			entry := NetworkEntry{
-				RequestID:      string(e.RequestID),
-				URL:            e.Request.URL,
-				Method:         e.Request.Method,
-				ResourceType:   e.Type.String(),
-				RequestHeaders: headers,
-				PostData:       postData,
-				StartTime:      time.Now(),
-			}
-			buf.Add(entry)
+			buf.Add(requestEntryFromEvent(e))
 			buf.MarkRequestStart(string(e.RequestID))
 
 		case *network.EventResponseReceived:
@@ -487,6 +164,12 @@ func (nm *NetworkMonitor) StartCaptureWithSize(tabCtx context.Context, tabID str
 				if e.EncodedDataLength > 0 {
 					entry.Size = int64(e.EncodedDataLength)
 				}
+				if nm.bodyRetentionEnabled() {
+					entry.BodyPending = true
+					entry.BodySkipped = false
+					entry.BodySkipReason = ""
+					entry.BodyError = ""
+				}
 			})
 			buf.MarkRequestEnd(string(e.RequestID))
 			go nm.maybeRetainBody(tabCtx, buf, string(e.RequestID))
@@ -505,22 +188,51 @@ func (nm *NetworkMonitor) StartCaptureWithSize(tabCtx context.Context, tabID str
 		}
 	})
 
+	// Self-heal the listeners map when the listener ends (StopCapture cancel or
+	// tab close via tabCtx), so a later capture for a reused tabID re-registers.
+	go func() {
+		<-listenerCtx.Done()
+		nm.mu.Lock()
+		delete(nm.listeners, tabID)
+		nm.mu.Unlock()
+	}()
+
 	slog.Debug("network capture started", "tabId", tabID)
 	return nil
 }
 
-// StopCapture removes the buffer and listener for a tab.
-func (nm *NetworkMonitor) StopCapture(tabID string) {
+// reserveCaptureListener reserves the per-tab listener slot. If capture is
+// already active for tabID it returns alreadyActive=true (with a nil cancel);
+// otherwise it stores a fresh cancel derived from tabCtx and returns it.
+func (nm *NetworkMonitor) reserveCaptureListener(tabID string, tabCtx context.Context) (context.Context, context.CancelFunc, bool) {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
-	if cancel, ok := nm.listeners[tabID]; ok {
-		cancel()
-		delete(nm.listeners, tabID)
+	if _, exists := nm.listeners[tabID]; exists {
+		return nil, nil, true
 	}
-	delete(nm.buffers, tabID)
+	listenerCtx, cancel := context.WithCancel(tabCtx)
+	nm.listeners[tabID] = cancel
+	return listenerCtx, cancel, false
 }
 
-// ClearTab clears the network buffer for a tab.
+// releaseCaptureListener cancels and removes the per-tab capture listener, if any.
+func (nm *NetworkMonitor) releaseCaptureListener(tabID string) {
+	nm.mu.Lock()
+	cancel, ok := nm.listeners[tabID]
+	delete(nm.listeners, tabID)
+	nm.mu.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
+func (nm *NetworkMonitor) StopCapture(tabID string) {
+	nm.releaseCaptureListener(tabID)
+	nm.mu.Lock()
+	delete(nm.buffers, tabID)
+	nm.mu.Unlock()
+}
+
 func (nm *NetworkMonitor) ClearTab(tabID string) {
 	nm.mu.RLock()
 	buf := nm.buffers[tabID]
@@ -530,7 +242,6 @@ func (nm *NetworkMonitor) ClearTab(tabID string) {
 	}
 }
 
-// ClearAll clears all network buffers.
 func (nm *NetworkMonitor) ClearAll() {
 	nm.mu.RLock()
 	defer nm.mu.RUnlock()
@@ -539,62 +250,118 @@ func (nm *NetworkMonitor) ClearAll() {
 	}
 }
 
+func (nm *NetworkMonitor) bodyRetentionEnabled() bool {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	return nm.retainBodies
+}
+
+// fetchResponseBody reads the body from the browser. Indirected so retention
+// policy can be exercised without a live CDP target.
+var fetchResponseBody = GetResponseBody
+
+func skipRetainedBody(buf *NetworkBuffer, requestID, reason string) {
+	buf.Update(requestID, func(entry *NetworkEntry) {
+		entry.BodyPending = false
+		entry.BodySkipped = true
+		entry.BodySkipReason = reason
+		entry.BodyError = ""
+	})
+}
+
+// Operator-facing names of the two budgets a retained body is cut against, used
+// to build the skip reason so a dropped body says which one dropped it.
+const (
+	retentionLimitScope  = "retention limit"
+	retentionBudgetScope = "retention budget"
+	postDataLimitScope   = "request body limit"
+)
+
+// clampRetainedBody applies a byte budget to a retained payload — a response body,
+// or the request body in PostData. One rule: a retained payload is a byte-exact
+// prefix of what crossed the wire, or there is no retained payload. Text is cut on a rune boundary with the suffix-free helper — the display
+// variant appends "..." inside the budget, and a machine-read body must not carry
+// characters the payload never contained when the truncated flag already says it
+// was cut. A base64 body cannot be cut at all (the encoding's length and padding make
+// a fragment undecodable in whole, not only at the tail), and a budget smaller
+// than the body's first character leaves no whole rune to keep; both are dropped
+// with a reason rather than returned corrupt or returned empty-but-retained.
+func clampRetainedBody(body string, base64Encoded bool, limit int, scope string) (clamped string, truncated bool, dropReason string) {
+	if limit <= 0 || len(body) <= limit {
+		return body, false, ""
+	}
+	if base64Encoded {
+		return "", false, "base64 body exceeds " + scope
+	}
+	prefix := sanitize.TruncateUTF8BytesExact(body, limit)
+	if prefix == "" {
+		return "", false, scope + " is smaller than the body's first character"
+	}
+	return prefix, true, ""
+}
+
 func (nm *NetworkMonitor) maybeRetainBody(tabCtx context.Context, buf *NetworkBuffer, requestID string) {
+	// Every return path below resolves BodyPending via buf.Update; signal once on
+	// exit so retained-body readers wake instead of polling.
+	defer buf.SignalBodyChange()
+
 	nm.mu.RLock()
 	enabled := nm.retainBodies
 	maxBytes := nm.retainBodyMaxBytes
 	nm.mu.RUnlock()
 	if !enabled {
+		skipRetainedBody(buf, requestID, "retention disabled")
 		return
 	}
 	if buf.RetainedBytes() >= nm.retainBodyMaxPerTab {
-		buf.Update(requestID, func(entry *NetworkEntry) {
-			entry.BodyError = "retention budget exceeded"
-		})
+		skipRetainedBody(buf, requestID, "retention budget exceeded")
 		return
 	}
 	select {
 	case nm.retainBodySemaphore <- struct{}{}:
 		defer func() { <-nm.retainBodySemaphore }()
 	default:
-		buf.Update(requestID, func(entry *NetworkEntry) {
-			entry.BodyError = "retention concurrency limit reached"
-		})
+		skipRetainedBody(buf, requestID, "retention concurrency limit reached")
 		return
 	}
-	body, base64Encoded, err := GetResponseBodyDirect(tabCtx, requestID)
+	body, base64Encoded, err := fetchResponseBody(tabCtx, requestID)
 	if err != nil {
 		buf.Update(requestID, func(entry *NetworkEntry) {
+			entry.BodyPending = false
+			entry.BodySkipped = false
+			entry.BodySkipReason = ""
 			entry.BodyError = err.Error()
 		})
 		return
 	}
-	truncated := false
-	if maxBytes > 0 && len(body) > maxBytes {
-		body = body[:maxBytes]
-		truncated = true
+	body, truncated, dropReason := clampRetainedBody(body, base64Encoded, maxBytes, retentionLimitScope)
+	if dropReason != "" {
+		skipRetainedBody(buf, requestID, dropReason)
+		return
 	}
 	remainingBudget := int(nm.retainBodyMaxPerTab - buf.RetainedBytes())
 	if remainingBudget <= 0 {
-		buf.Update(requestID, func(entry *NetworkEntry) {
-			entry.BodyError = "retention budget exceeded"
-		})
+		skipRetainedBody(buf, requestID, "retention budget exceeded")
 		return
 	}
-	if len(body) > remainingBudget {
-		body = body[:remainingBudget]
-		truncated = true
+	body, cutForBudget, dropReason := clampRetainedBody(body, base64Encoded, remainingBudget, retentionBudgetScope)
+	if dropReason != "" {
+		skipRetainedBody(buf, requestID, dropReason)
+		return
 	}
+	truncated = truncated || cutForBudget
 	buf.Update(requestID, func(entry *NetworkEntry) {
 		entry.ResponseBody = body
 		entry.Base64Encoded = base64Encoded
 		entry.BodyRetained = true
+		entry.BodyPending = false
+		entry.BodySkipped = false
+		entry.BodySkipReason = ""
 		entry.BodyTruncated = truncated
 		entry.BodyError = ""
 	})
 }
 
-// GetResponseBody fetches the response body for a specific request via CDP.
 func (nm *NetworkMonitor) IsTabIdle(tabID string) (bool, bool) {
 	nm.mu.RLock()
 	buf, ok := nm.buffers[tabID]
@@ -606,13 +373,28 @@ func (nm *NetworkMonitor) IsTabIdle(tabID string) (bool, bool) {
 	return count == 0, true
 }
 
-func (nm *NetworkMonitor) GetResponseBody(tabCtx context.Context, requestID string) (string, bool, error) {
+// GetResponseBody is the only response-body fetcher. It reads Network.getResponseBody
+// as raw JSON so the body and the base64Encoded flag describing it come from the same
+// call and travel together.
+//
+// It deliberately does NOT use cdproto's typed constructor plus Do: that helper
+// base64-decodes the payload inside the dependency and returns []byte, so by the time
+// it returns the flag is gone and the string holds raw bytes. A second fetcher built
+// that way reported base64Encoded=false for every response, which meant a binary body
+// was retained as a string of U+FFFD once JSON-encoded — and made clampRetainedBody's
+// drop-and-mark branch unreachable in production, since nothing ever set the flag it
+// tests.
+func GetResponseBody(ctx context.Context, requestID string) (string, bool, error) {
 	var body string
 	var base64Encoded bool
 
-	err := chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		executor := chromedp.FromContext(ctx).Target
+		if executor == nil {
+			return fmt.Errorf("no CDP executor available")
+		}
 		var result json.RawMessage
-		if err := chromedp.FromContext(ctx).Target.Execute(ctx, "Network.getResponseBody", map[string]any{
+		if err := executor.Execute(ctx, "Network.getResponseBody", map[string]any{
 			"requestId": requestID,
 		}, &result); err != nil {
 			return err
@@ -632,37 +414,83 @@ func (nm *NetworkMonitor) GetResponseBody(tabCtx context.Context, requestID stri
 	return body, base64Encoded, err
 }
 
-// GetResponseBodyDirect fetches the response body using a raw CDP executor context.
-func GetResponseBodyDirect(ctx context.Context, requestID string) (string, bool, error) {
-	var body string
-	var base64Encoded bool
-
-	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		executor := chromedp.FromContext(ctx).Target
-		if executor == nil {
-			return fmt.Errorf("no CDP executor available")
+// decodePostData joins a request's body entries into the bytes the page sent. CDP declares
+// PostDataEntry.Bytes as a protocol binary field, so each entry arrives base64-encoded, and
+// joining the entries as strings is wrong twice over: the published value is an encoded blob
+// in a field named after the request body, and base64(a)+base64(b) is not base64(a+b) once an
+// entry's length is not a multiple of three, so any multi-entry body arrives corrupt.
+//
+// Anything that cannot be published as the text it claims to be publishes nothing, and says
+// why: an entry that is not base64, or a body that is not valid UTF-8 once decoded, such as a
+// file part in a multipart POST. The alternative is mojibake, or a blob in a field with no
+// encoding signal, or — worse — an empty string that reads as a request sent with no body.
+// The second return is that reason, empty when there is nothing to explain.
+func decodePostData(entries []*network.PostDataEntry) (string, string) {
+	var decoded []byte
+	for _, entry := range entries {
+		if entry == nil {
+			continue
 		}
-		params := network.GetResponseBody(network.RequestID(requestID))
-		resp, err := params.Do(cdp.WithExecutor(ctx, executor))
+		chunk, err := base64.StdEncoding.DecodeString(entry.Bytes)
 		if err != nil {
-			return err
+			return "", "request body entry is not base64"
 		}
-		body = string(resp)
-		base64Encoded = false
-		return nil
-	}))
+		decoded = append(decoded, chunk...)
+	}
+	if !utf8.Valid(decoded) {
+		return "", "request body is not valid UTF-8"
+	}
+	return string(decoded), ""
+}
 
-	return body, base64Encoded, err
+// requestEntryFromEvent builds the entry a started request is recorded as. It is the one
+// place a refused request body turns into a stated reason on the entry, so an absent
+// postData is never mistaken for a request sent without one.
+func requestEntryFromEvent(e *network.EventRequestWillBeSent) NetworkEntry {
+	headers := make(map[string]string)
+	if e.Request.Headers != nil {
+		for k, v := range e.Request.Headers {
+			if s, ok := v.(string); ok {
+				headers[k] = s
+			}
+		}
+	}
+	postData, postDataSkipReason := decodePostData(e.Request.PostDataEntries)
+	return NetworkEntry{
+		RequestID:          string(e.RequestID),
+		URL:                e.Request.URL,
+		Method:             e.Request.Method,
+		ResourceType:       e.Type.String(),
+		RequestHeaders:     headers,
+		PostData:           postData,
+		PostDataSkipped:    postDataSkipReason != "",
+		PostDataSkipReason: postDataSkipReason,
+		StartTime:          time.Now(),
+	}
 }
 
 func normalizeNetworkEntry(entry NetworkEntry) NetworkEntry {
-	entry.URL = sanitize.TruncateUTF8Bytes(entry.URL, maxNetworkURLBytes)
-	entry.Method = sanitize.TruncateUTF8Bytes(entry.Method, maxNetworkMethodBytes)
-	entry.ResourceType = sanitize.TruncateUTF8Bytes(entry.ResourceType, maxNetworkResourceTypeBytes)
-	entry.StatusText = sanitize.TruncateUTF8Bytes(entry.StatusText, maxNetworkStatusTextBytes)
-	entry.MimeType = sanitize.TruncateUTF8Bytes(entry.MimeType, maxNetworkMimeTypeBytes)
-	entry.Error = sanitize.TruncateUTF8Bytes(entry.Error, maxNetworkErrorBytes)
-	entry.PostData = sanitize.TruncateUTF8Bytes(entry.PostData, maxNetworkPostDataBytes)
+	entry.URL = sanitize.TruncateUTF8BytesWithEllipsis(entry.URL, maxNetworkURLBytes)
+	entry.Method = sanitize.TruncateUTF8BytesWithEllipsis(entry.Method, maxNetworkMethodBytes)
+	entry.ResourceType = sanitize.TruncateUTF8BytesWithEllipsis(entry.ResourceType, maxNetworkResourceTypeBytes)
+	entry.StatusText = sanitize.TruncateUTF8BytesWithEllipsis(entry.StatusText, maxNetworkStatusTextBytes)
+	entry.MimeType = sanitize.TruncateUTF8BytesWithEllipsis(entry.MimeType, maxNetworkMimeTypeBytes)
+	entry.Error = sanitize.TruncateUTF8BytesWithEllipsis(entry.Error, maxNetworkErrorBytes)
+	// The request body is clamped by the one owner of that rule, so it inherits the
+	// prefix-or-nothing policy the response body already states. The budget measures the
+	// decoded body, which is what PostData holds, so the constant describes the request
+	// content rather than its encoded length. Flags are only ever set here, never cleared:
+	// an entry is re-normalised on every update, and a second pass sees a value already
+	// within budget.
+	clampedPostData, postDataTruncated, postDataDropReason := clampRetainedBody(entry.PostData, false, maxNetworkPostDataBytes, postDataLimitScope)
+	entry.PostData = clampedPostData
+	if postDataTruncated {
+		entry.PostDataTruncated = true
+	}
+	if postDataDropReason != "" {
+		entry.PostDataSkipped = true
+		entry.PostDataSkipReason = postDataDropReason
+	}
 	entry.RequestHeaders = normalizeNetworkHeaders(entry.RequestHeaders)
 	entry.ResponseHeaders = normalizeNetworkHeaders(entry.ResponseHeaders)
 	return entry
@@ -680,7 +508,7 @@ func normalizeNetworkHeaders(headers map[string]string) map[string]string {
 			break
 		}
 
-		key = sanitize.TruncateUTF8Bytes(key, maxNetworkHeaderKeyBytes)
+		key = sanitize.TruncateUTF8BytesWithEllipsis(key, maxNetworkHeaderKeyBytes)
 		if key == "" {
 			continue
 		}
@@ -693,7 +521,7 @@ func normalizeNetworkHeaders(headers map[string]string) map[string]string {
 			break
 		}
 
-		value = sanitize.TruncateUTF8Bytes(value, valueLimit)
+		value = sanitize.TruncateUTF8BytesWithEllipsis(value, valueLimit)
 		entryBytes := len(key) + len(value)
 		if entryBytes <= 0 {
 			continue
@@ -707,4 +535,38 @@ func normalizeNetworkHeaders(headers map[string]string) map[string]string {
 		return nil
 	}
 	return normalized
+}
+
+// BrokenAsset is a subresource that failed to load: an HTTP error response
+// (status >= 400) or a request that failed outright (network error, abort).
+type BrokenAsset struct {
+	URL          string `json:"url"`
+	ResourceType string `json:"resourceType"`
+	StatusCode   int    `json:"statusCode"`
+	Error        string `json:"error,omitempty"`
+}
+
+// IsBrokenAsset reports whether entry represents a failed load: a response
+// with status >= 400, or a failed request. In-flight requests are not broken.
+func IsBrokenAsset(entry NetworkEntry) bool {
+	return entry.Status >= 400 || entry.Failed
+}
+
+// BrokenAssets classifies the broken loads in entries. Resource types are
+// the CDP categories lowercased (image, script, stylesheet, font, xhr,
+// fetch, document, ...).
+func BrokenAssets(entries []NetworkEntry) []BrokenAsset {
+	broken := []BrokenAsset{}
+	for _, entry := range entries {
+		if !IsBrokenAsset(entry) {
+			continue
+		}
+		broken = append(broken, BrokenAsset{
+			URL:          entry.URL,
+			ResourceType: strings.ToLower(entry.ResourceType),
+			StatusCode:   entry.Status,
+			Error:        entry.Error,
+		})
+	}
+	return broken
 }

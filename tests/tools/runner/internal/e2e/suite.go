@@ -26,245 +26,155 @@ func (e noMatchingScenariosError) Is(target error) bool {
 	return target == errNoMatchingScenarios
 }
 
-func apiSuite() suiteDef {
-	return suiteDef{
-		Name:        "api",
-		Title:       "E2E API tests (Docker)",
-		Compose:     singleCompose,
-		GroupDir:    "tests/e2e/scenarios/api",
-		Helper:      "api",
-		ScenarioDir: "scenarios/api",
-		Commands:    apiCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-api",
-		RunSuite:    "api",
-		Summary:     "tests/e2e/results/summary-api.txt",
-		Report:      "tests/e2e/results/report-api.md",
-		LogPrefix:   "logs-api",
-		Output:      "tests/e2e/results/output-api.log",
-		LogServices: []string{"runner-api", "pinchtab"},
-	}
+// suiteGroup captures the scenario-group metadata shared by every suite that
+// runs that group (api/cli/infra/plugin). Suites in the same group differ only
+// by mode (basic/extended/smoke), compose stack, ready targets and log services.
+type suiteGroup struct {
+	label       string // human label used in titles, e.g. "API"
+	dir         string // scenario group dir name, e.g. "api"
+	helper      string
+	commands    []string
+	runner      string
+	runSuiteKey string // RunSuite key; defaults to dir when empty
 }
 
-func apiExtendedSuite() suiteDef {
-	return suiteDef{
-		Name:        "api-extended",
-		Title:       "E2E API Extended tests (Docker)",
-		Compose:     multiCompose,
-		GroupDir:    "tests/e2e/scenarios/api",
-		Helper:      "api",
-		ScenarioDir: "scenarios/api",
-		Commands:    apiCommands(),
-		Ready:       extendedReady(),
-		Runner:      "runner-api",
-		RunSuite:    "api",
-		Extended:    true,
-		Summary:     "tests/e2e/results/summary-api-extended.txt",
-		Report:      "tests/e2e/results/report-api-extended.md",
-		LogPrefix:   "logs-api-extended",
-		Output:      "tests/e2e/results/output-api-extended.log",
-		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-medium", "pinchtab-full", "pinchtab-lite", "pinchtab-bridge"},
+func (g suiteGroup) runSuite() string {
+	if g.runSuiteKey != "" {
+		return g.runSuiteKey
 	}
+	return g.dir
 }
 
-func cliSuite() suiteDef {
-	return suiteDef{
-		Name:        "cli",
-		Title:       "E2E CLI tests (Docker)",
-		Compose:     singleCompose,
-		GroupDir:    "tests/e2e/scenarios/cli",
-		Helper:      "cli",
-		ScenarioDir: "scenarios/cli",
-		Commands:    cliCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-cli",
-		RunSuite:    "cli",
-		Summary:     "tests/e2e/results/summary-cli.txt",
-		Report:      "tests/e2e/results/report-cli.md",
-		LogPrefix:   "logs-cli",
-		Output:      "tests/e2e/results/output-cli.log",
-		LogServices: []string{"runner-cli", "pinchtab"},
-	}
+var (
+	groupAPI    = suiteGroup{label: "API", dir: "api", helper: "api", commands: apiCommands(), runner: "runner-api"}
+	groupCLI    = suiteGroup{label: "CLI", dir: "cli", helper: "cli", commands: cliCommands(), runner: "runner-cli"}
+	groupInfra  = suiteGroup{label: "Infra", dir: "infra", helper: "api", commands: apiCommands(), runner: "runner-api"}
+	groupPlugin = suiteGroup{label: "Plugin", dir: "plugin", helper: "api", commands: apiCommands(), runner: "runner-api"}
+)
+
+// suiteDescriptor is the single source of truth for one suite. Adding or
+// renaming a suite is one table entry; all artifact/log paths and the title are
+// derived from Name so they cannot drift by typo. Group is nil for host-only
+// suites such as docker-smoke.
+type suiteDescriptor struct {
+	Name         string
+	Group        *suiteGroup
+	TitleSuffix  string // overrides the derived "tests (Docker)" suffix when set
+	Compose      string
+	Extended     bool
+	Smoke        bool
+	Ready        []string
+	LogServices  []string
+	RestartAfter []string
 }
 
-func cliExtendedSuite() suiteDef {
-	return suiteDef{
-		Name:        "cli-extended",
-		Title:       "E2E CLI Extended tests (Docker)",
-		Compose:     singleCompose,
-		GroupDir:    "tests/e2e/scenarios/cli",
-		Helper:      "cli",
-		ScenarioDir: "scenarios/cli",
-		Commands:    cliCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-cli",
-		RunSuite:    "cli",
-		Extended:    true,
-		Summary:     "tests/e2e/results/summary-cli-extended.txt",
-		Report:      "tests/e2e/results/report-cli-extended.md",
-		LogPrefix:   "logs-cli-extended",
-		Output:      "tests/e2e/results/output-cli-extended.log",
-		LogServices: []string{"runner-cli", "pinchtab"},
-	}
+func resultsPath(prefix, name, ext string) string {
+	return "tests/e2e/results/" + prefix + "-" + name + "." + ext
 }
 
-func infraSuite() suiteDef {
-	return suiteDef{
-		Name:        "infra",
-		Title:       "E2E Infra tests (Docker)",
-		Compose:     singleCompose,
-		GroupDir:    "tests/e2e/scenarios/infra",
-		Helper:      "api",
-		ScenarioDir: "scenarios/infra",
-		Commands:    apiCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-api",
-		RunSuite:    "infra",
-		Summary:     "tests/e2e/results/summary-infra.txt",
-		Report:      "tests/e2e/results/report-infra.md",
-		LogPrefix:   "logs-infra",
-		Output:      "tests/e2e/results/output-infra.log",
-		LogServices: []string{"runner-api", "pinchtab"},
+func (d suiteDescriptor) build() suiteDef {
+	def := suiteDef{
+		Name:         d.Name,
+		Title:        d.title(),
+		Compose:      d.Compose,
+		Ready:        d.Ready,
+		Extended:     d.Extended,
+		Smoke:        d.Smoke,
+		Summary:      resultsPath("summary", d.Name, "txt"),
+		Report:       resultsPath("report", d.Name, "md"),
+		Timings:      resultsPath("timings", d.Name, "json"),
+		Output:       resultsPath("output", d.Name, "log"),
+		LogPrefix:    "logs-" + d.Name,
+		LogServices:  d.LogServices,
+		RestartAfter: d.RestartAfter,
 	}
+	if d.Group != nil {
+		g := d.Group
+		def.GroupDir = "tests/e2e/scenarios/" + g.dir
+		def.ScenarioDir = "scenarios/" + g.dir
+		def.Helper = g.helper
+		def.Commands = g.commands
+		def.Runner = g.runner
+		def.RunSuite = g.runSuite()
+	}
+	return def
 }
 
-func infraExtendedSuite() suiteDef {
-	return suiteDef{
-		Name:        "infra-extended",
-		Title:       "E2E Infra Extended tests (Docker)",
-		Compose:     multiCompose,
-		GroupDir:    "tests/e2e/scenarios/infra",
-		Helper:      "api",
-		ScenarioDir: "scenarios/infra",
-		Commands:    apiCommands(),
-		Ready:       extendedReady(),
-		Runner:      "runner-api",
-		RunSuite:    "infra",
-		Extended:    true,
-		Summary:     "tests/e2e/results/summary-infra-extended.txt",
-		Report:      "tests/e2e/results/report-infra-extended.md",
-		LogPrefix:   "logs-infra-extended",
-		Output:      "tests/e2e/results/output-infra-extended.log",
-		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-medium", "pinchtab-full", "pinchtab-lite", "pinchtab-bridge"},
+func (d suiteDescriptor) title() string {
+	suffix := d.TitleSuffix
+	if suffix == "" {
+		suffix = "tests (Docker)"
 	}
+	label := "Docker"
+	if d.Group != nil {
+		label = d.Group.label
+	}
+	mode := ""
+	switch {
+	case d.Smoke:
+		mode = " Smoke"
+	case d.Extended:
+		mode = " Extended"
+	}
+	return "E2E " + label + mode + " " + suffix
 }
 
-func pluginSuite() suiteDef {
-	return suiteDef{
-		Name:        "plugin",
-		Title:       "E2E Plugin tests (Docker)",
-		Compose:     singleCompose,
-		GroupDir:    "tests/e2e/scenarios/plugin",
-		Helper:      "api",
-		ScenarioDir: "scenarios/plugin",
-		Commands:    apiCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-api",
-		RunSuite:    "plugin",
-		Summary:     "tests/e2e/results/summary-plugin.txt",
-		Report:      "tests/e2e/results/report-plugin.md",
-		LogPrefix:   "logs-plugin",
-		Output:      "tests/e2e/results/output-plugin.log",
-		LogServices: []string{"runner-api", "pinchtab"},
-	}
+var suiteDescriptors = []suiteDescriptor{
+	{Name: "api", Group: &groupAPI, Compose: singleCompose, Ready: primaryReady(),
+		LogServices: []string{"runner-api", "pinchtab"}},
+	{Name: "api-extended", Group: &groupAPI, Compose: multiCompose, Extended: true, Ready: extendedReady(),
+		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-medium", "pinchtab-full", "pinchtab-ghostchrome", "pinchtab-bridge"}},
+	{Name: "cli", Group: &groupCLI, Compose: singleCompose, Ready: primaryReady(),
+		LogServices: []string{"runner-cli", "pinchtab"}},
+	{Name: "cli-extended", Group: &groupCLI, Compose: singleCompose, Extended: true, Ready: primaryReady(),
+		LogServices: []string{"runner-cli", "pinchtab"}, RestartAfter: []string{"pinchtab"}},
+	{Name: "infra", Group: &groupInfra, Compose: singleCompose, Ready: primaryReady(),
+		LogServices: []string{"runner-api", "pinchtab"}},
+	{Name: "infra-extended", Group: &groupInfra, Compose: multiCompose, Extended: true, Ready: extendedReady(),
+		LogServices:  []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-medium", "pinchtab-full", "pinchtab-ghostchrome", "pinchtab-bridge"},
+		RestartAfter: []string{"pinchtab"}},
+	{Name: "plugin", Group: &groupPlugin, Compose: singleCompose, Ready: primaryReady(),
+		LogServices: []string{"runner-api", "pinchtab"}},
+	{Name: "api-smoke", Group: &groupAPI, Compose: multiCompose, Smoke: true, Ready: extendedReady(),
+		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-autoclose", "pinchtab-medium", "pinchtab-full", "pinchtab-ghostchrome", "pinchtab-bridge"}},
+	{Name: "cli-smoke", Group: &groupCLI, Compose: multiCompose, Smoke: true, Ready: primaryReady(),
+		LogServices: []string{"runner-cli", "pinchtab"}, RestartAfter: []string{"pinchtab"}},
+	{Name: "infra-smoke", Group: &groupInfra, Compose: multiCompose, Smoke: true, Ready: extendedReady(),
+		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-medium", "pinchtab-full", "pinchtab-ghostchrome", "pinchtab-bridge"}},
+	{Name: "plugin-smoke", Group: &groupPlugin, Compose: multiCompose, Smoke: true, Ready: primaryReady(),
+		LogServices: []string{"runner-api", "pinchtab"}},
+	{Name: "docker-smoke", Group: nil, TitleSuffix: "tests (host)", Smoke: true},
 }
 
-func apiSmokeSuite() suiteDef {
-	return suiteDef{
-		Name:        "api-smoke",
-		Title:       "E2E API Smoke tests (Docker)",
-		Compose:     multiCompose,
-		GroupDir:    "tests/e2e/scenarios/api",
-		Helper:      "api",
-		ScenarioDir: "scenarios/api",
-		Commands:    apiCommands(),
-		Ready:       extendedReady(),
-		Runner:      "runner-api",
-		RunSuite:    "api",
-		Smoke:       true,
-		Summary:     "tests/e2e/results/summary-api-smoke.txt",
-		Report:      "tests/e2e/results/report-api-smoke.md",
-		LogPrefix:   "logs-api-smoke",
-		Output:      "tests/e2e/results/output-api-smoke.log",
-		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-autoclose", "pinchtab-medium", "pinchtab-full", "pinchtab-lite", "pinchtab-bridge"},
+func suiteDefByName(name string) (suiteDef, bool) {
+	for _, d := range suiteDescriptors {
+		if d.Name == name {
+			return d.build(), true
+		}
 	}
+	return suiteDef{}, false
 }
 
-func cliSmokeSuite() suiteDef {
-	return suiteDef{
-		Name:        "cli-smoke",
-		Title:       "E2E CLI Smoke tests (Docker)",
-		Compose:     multiCompose,
-		GroupDir:    "tests/e2e/scenarios/cli",
-		Helper:      "cli",
-		ScenarioDir: "scenarios/cli",
-		Commands:    cliCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-cli",
-		RunSuite:    "cli",
-		Smoke:       true,
-		Summary:     "tests/e2e/results/summary-cli-smoke.txt",
-		Report:      "tests/e2e/results/report-cli-smoke.md",
-		LogPrefix:   "logs-cli-smoke",
-		Output:      "tests/e2e/results/output-cli-smoke.log",
-		LogServices: []string{"runner-cli", "pinchtab"},
+func suiteByName(name string) suiteDef {
+	def, ok := suiteDefByName(name)
+	if !ok {
+		panic("e2e: unknown suite descriptor " + name)
 	}
+	return def
 }
 
-func infraSmokeSuite() suiteDef {
-	return suiteDef{
-		Name:        "infra-smoke",
-		Title:       "E2E Infra Smoke tests (Docker)",
-		Compose:     multiCompose,
-		GroupDir:    "tests/e2e/scenarios/infra",
-		Helper:      "api",
-		ScenarioDir: "scenarios/infra",
-		Commands:    apiCommands(),
-		Ready:       extendedReady(),
-		Runner:      "runner-api",
-		RunSuite:    "infra",
-		Smoke:       true,
-		Summary:     "tests/e2e/results/summary-infra-smoke.txt",
-		Report:      "tests/e2e/results/report-infra-smoke.md",
-		LogPrefix:   "logs-infra-smoke",
-		Output:      "tests/e2e/results/output-infra-smoke.log",
-		LogServices: []string{"runner-api", "pinchtab", "pinchtab-secure", "pinchtab-medium", "pinchtab-full", "pinchtab-lite", "pinchtab-bridge"},
-	}
-}
-
-func pluginSmokeSuite() suiteDef {
-	return suiteDef{
-		Name:        "plugin-smoke",
-		Title:       "E2E Plugin Smoke tests (Docker)",
-		Compose:     multiCompose,
-		GroupDir:    "tests/e2e/scenarios/plugin",
-		Helper:      "api",
-		ScenarioDir: "scenarios/plugin",
-		Commands:    apiCommands(),
-		Ready:       primaryReady(),
-		Runner:      "runner-api",
-		RunSuite:    "plugin",
-		Smoke:       true,
-		Summary:     "tests/e2e/results/summary-plugin-smoke.txt",
-		Report:      "tests/e2e/results/report-plugin-smoke.md",
-		LogPrefix:   "logs-plugin-smoke",
-		Output:      "tests/e2e/results/output-plugin-smoke.log",
-		LogServices: []string{"runner-api", "pinchtab"},
-	}
-}
-
-func dockerSmokeSuite() suiteDef {
-	return suiteDef{
-		Name:      "docker-smoke",
-		Title:     "E2E Docker Smoke tests (host)",
-		RunSuite:  "docker",
-		Smoke:     true,
-		Summary:   "tests/e2e/results/summary-docker-smoke.txt",
-		Report:    "tests/e2e/results/report-docker-smoke.md",
-		LogPrefix: "logs-docker-smoke",
-		Output:    "tests/e2e/results/output-docker-smoke.log",
-	}
-}
+func apiSuite() suiteDef           { return suiteByName("api") }
+func apiExtendedSuite() suiteDef   { return suiteByName("api-extended") }
+func cliSuite() suiteDef           { return suiteByName("cli") }
+func cliExtendedSuite() suiteDef   { return suiteByName("cli-extended") }
+func infraSuite() suiteDef         { return suiteByName("infra") }
+func infraExtendedSuite() suiteDef { return suiteByName("infra-extended") }
+func pluginSuite() suiteDef        { return suiteByName("plugin") }
+func apiSmokeSuite() suiteDef      { return suiteByName("api-smoke") }
+func cliSmokeSuite() suiteDef      { return suiteByName("cli-smoke") }
+func infraSmokeSuite() suiteDef    { return suiteByName("infra-smoke") }
+func pluginSmokeSuite() suiteDef   { return suiteByName("plugin-smoke") }
+func dockerSmokeSuite() suiteDef   { return suiteByName("docker-smoke") }
 
 func apiCommands() []string {
 	return []string{"curl", "jq", "grep", "sed", "awk", "seq", "mktemp"}
@@ -285,7 +195,7 @@ func extendedReady() []string {
 		"E2E_AUTOCLOSE_SERVER",
 		"E2E_MEDIUM_SERVER",
 		"E2E_FULL_SERVER",
-		"E2E_LITE_SERVER",
+		"E2E_SERVER_GHOSTCHROME",
 		"E2E_BRIDGE_URL|60|E2E_BRIDGE_TOKEN",
 	}
 }
@@ -384,6 +294,31 @@ func servicesForPlans(plans []suitePlan, fallback []string) []string {
 	return out
 }
 
+const pinchtabImageBuilder = "pinchtab"
+
+func servicesToBuild(plans []suitePlan, fallback []string) []string {
+	services := append([]string(nil), servicesForPlans(plans, fallback)...)
+	seen := map[string]bool{}
+	needsImageBuilder := false
+	for _, svc := range services {
+		seen[svc] = true
+		if strings.HasPrefix(svc, pinchtabImageBuilder+"-") {
+			needsImageBuilder = true
+		}
+	}
+	if needsImageBuilder && !seen[pinchtabImageBuilder] {
+		seen[pinchtabImageBuilder] = true
+		services = append([]string{pinchtabImageBuilder}, services...)
+	}
+	for _, plan := range plans {
+		if runner := plan.def.Runner; runner != "" && !seen[runner] {
+			seen[runner] = true
+			services = append(services, runner)
+		}
+	}
+	return services
+}
+
 func (r *Runner) showSuiteSkip(suite string) {
 	_, _ = fmt.Fprintf(r.stdout, "Skipping %s: filter %q has no matching scenarios\n", suite, r.args.Filter)
 }
@@ -393,7 +328,7 @@ func (r *Runner) prepareSuiteResults(def suiteDef) {
 		_, _ = fmt.Fprintf(r.stdout, "# prepare results for %s\n", def.Name)
 		return
 	}
-	for _, path := range []string{def.Summary, def.Report, def.Output} {
+	for _, path := range []string{def.Summary, def.Report, def.Timings, def.Output} {
 		_ = os.Remove(filepath.Join(r.repoRoot, path))
 	}
 	for _, path := range []string{
@@ -449,7 +384,7 @@ func execCommand(command []string, dir string) *exec.Cmd {
 }
 
 func (r *Runner) showFailureArtifacts(def suiteDef, duration time.Duration) {
-	paths := []string{def.Summary, def.Report, def.Output}
+	paths := []string{def.Summary, def.Report, def.Timings, def.Output}
 	for _, path := range paths {
 		if fileExists(filepath.Join(r.repoRoot, path)) {
 			_, _ = fmt.Fprintf(r.stdout, "  artifact: %s\n", path)
@@ -458,11 +393,11 @@ func (r *Runner) showFailureArtifacts(def suiteDef, duration time.Duration) {
 	for _, service := range def.LogServices {
 		path := filepath.Join("tests/e2e/results", def.LogPrefix+"-"+service+".log")
 		if fileExists(filepath.Join(r.repoRoot, path)) {
-			_, _ = fmt.Fprintf(r.stdout, "  logs:     %s\n", path)
+			_, _ = fmt.Fprintf(r.stdout, "  logs:     %s%s\n", path, emptyLogSuffix(filepath.Join(r.repoRoot, path)))
 		}
 	}
 	if fileExists(filepath.Join(r.repoRoot, stackOutput)) {
-		_, _ = fmt.Fprintf(r.stdout, "  logs:     %s\n", stackOutput)
+		_, _ = fmt.Fprintf(r.stdout, "  logs:     %s%s\n", stackOutput, emptyLogSuffix(filepath.Join(r.repoRoot, stackOutput)))
 	}
 	if duration > 0 {
 		_, _ = fmt.Fprintf(r.stdout, "  duration: %s\n", formatDuration(duration))
@@ -500,6 +435,8 @@ func (r *Runner) writeSuiteReports(def suiteDef, duration time.Duration, exitCod
 	if err := os.WriteFile(filepath.Join(r.repoRoot, def.Report), []byte(report), 0o644); err != nil {
 		_, _ = fmt.Fprintf(r.stderr, "e2e: failed to write %s: %v\n", def.Report, err)
 	}
+
+	r.writeSuiteTimings(def, data, timestamp)
 	return data
 }
 
@@ -630,14 +567,11 @@ func (r *Runner) printSuiteSummary(def suiteDef, data suiteReportData, duration 
 	}
 
 	total := data.Passed + data.Failed
-	nameWidth := len("Test")
-	for _, result := range data.Results {
-		if len(result.Name) > nameWidth {
-			nameWidth = len(result.Name)
-		}
-	}
-	if nameWidth < 40 {
-		nameWidth = 40
+
+	if data.Failed == 0 && total > 0 {
+		_, _ = fmt.Fprintf(r.stdout, "  %s: %d/%d passed (%s)\n",
+			suiteReportTitle(def), data.Passed, total, formatDuration(duration))
+		return
 	}
 
 	_, _ = fmt.Fprintln(r.stdout, "")
@@ -645,27 +579,13 @@ func (r *Runner) printSuiteSummary(def suiteDef, data suiteReportData, duration 
 	if total == 0 {
 		_, _ = fmt.Fprintln(r.stdout, "  no test results emitted")
 	} else {
-		_, _ = fmt.Fprintf(r.stdout, "  %-*s %10s %8s\n", nameWidth, "Test", "Duration", "Status")
-		_, _ = fmt.Fprintf(r.stdout, "  %s\n", strings.Repeat("-", nameWidth+21))
-		for _, result := range data.Results {
-			status := "PASS"
-			if result.Status == "failed" {
-				status = "FAIL"
-			}
-			_, _ = fmt.Fprintf(r.stdout, "  %-*s %10dms %8s\n", nameWidth, result.Name, result.DurationMs, status)
-		}
-	}
-
-	_, _ = fmt.Fprintf(r.stdout, "  Passed: %d/%d\n", data.Passed, total)
-	_, _ = fmt.Fprintf(r.stdout, "  Failed: %d/%d\n", data.Failed, total)
-	_, _ = fmt.Fprintf(r.stdout, "  Test time: %dms\n", data.TotalMs)
-	_, _ = fmt.Fprintf(r.stdout, "  Suite wall time: %s\n", formatDuration(duration))
-
-	if data.Failed > 0 {
+		_, _ = fmt.Fprintf(r.stdout, "  Passed: %d/%d | Failed: %d | Wall time: %s\n",
+			data.Passed, total, data.Failed, formatDuration(duration))
+		_, _ = fmt.Fprintln(r.stdout, "")
 		_, _ = fmt.Fprintln(r.stdout, "  Failed tests:")
 		for _, result := range data.Results {
 			if result.Status == "failed" {
-				_, _ = fmt.Fprintf(r.stdout, "  - %s\n", result.Name)
+				_, _ = fmt.Fprintf(r.stdout, "    ✗ %s (%dms)\n", result.Name, result.DurationMs)
 			}
 		}
 	}
@@ -872,6 +792,20 @@ func formatDuration(d time.Duration) string {
 	minutes := seconds / 60
 	remSec := seconds % 60
 	return fmt.Sprintf("%dm%02d.%03ds", minutes, remSec, remMs)
+}
+
+// emptyLogSuffix marks a log artifact that has nothing in it. An empty file
+// listed as `logs:` is worse than no listing at all — it sends whoever is
+// diagnosing a failure to a file that cannot explain it — so say so on the line
+// that advertises it. The named causes have to be ones that can still happen: a
+// server discarding its logs was the original suspect and is no longer possible,
+// so pointing at it would send a maintainer after a removed cause.
+func emptyLogSuffix(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > 0 {
+		return ""
+	}
+	return "  (EMPTY — captured nothing; the service may never have started, or its --log-level excludes everything it logged)"
 }
 
 func fileExists(path string) bool {

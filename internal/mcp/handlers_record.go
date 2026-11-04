@@ -7,14 +7,25 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/pinchtab/pinchtab/internal/readiness"
 )
 
-// maxRecordFileBytes caps the output file written by record_stop to prevent
-// unbounded disk writes (matches the server-side maxOutputBytes).
-const maxRecordFileBytes = 256 << 20 // 256 MiB
+func handleRecord(c *Client) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	actions := map[string]func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error){
+		"start":  handleRecordStart(c),
+		"stop":   handleRecordStop(c),
+		"status": handleRecordStatus(c),
+	}
+	return func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_, action, refusal := pickMode(r, "action", actions)
+		if refusal != nil {
+			return refusal, nil
+		}
+		return action(ctx, r)
+	}
+}
 
 func handleRecordStart(c *Client) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -54,11 +65,7 @@ func handleRecordStart(c *Client) func(context.Context, mcp.CallToolRequest) (*m
 			payload["tabId"] = tabID
 		}
 
-		body, code, err := c.Post(ctx, "/record/start", payload)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return resultFromBytes(body, code)
+		return toolResult(c.Post(ctx, "/record/start", payload))
 	}
 }
 
@@ -79,8 +86,6 @@ func handleRecordStop(c *Client) func(context.Context, mcp.CallToolRequest) (*mc
 			return mcp.NewToolResultError(msg), nil
 		}
 
-		// Server encodes to a controlled recordings directory; we move the
-		// file to the caller's desired destination after encoding completes.
 		body, code, err := c.Post(ctx, "/record/stop", map[string]any{})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -96,7 +101,6 @@ func handleRecordStop(c *Client) func(context.Context, mcp.CallToolRequest) (*mc
 			return resultFromBytes(body, code)
 		}
 
-		// Poll until encoding finishes, then move the file.
 		serverPath := stopResp.Path
 		if err := pollRecordingFinished(ctx, c); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf(
@@ -113,37 +117,13 @@ func handleRecordStop(c *Client) func(context.Context, mcp.CallToolRequest) (*mc
 	}
 }
 
-// pollRecordingFinished polls /record/status until state is "finished" or "idle".
+// pollRecordingFinished polls /record/status until the encode reaches a
+// terminal state, sharing the timeout/terminal-state contract with the CLI.
 func pollRecordingFinished(ctx context.Context, c *Client) error {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			body, _, err := c.Get(ctx, "/record/status", nil)
-			if err != nil {
-				continue
-			}
-			var status struct {
-				State string `json:"state"`
-				Error string `json:"error"`
-			}
-			if json.Unmarshal(body, &status) != nil {
-				continue
-			}
-			switch status.State {
-			case "finished":
-				if status.Error != "" {
-					return fmt.Errorf("encode failed: %s", status.Error)
-				}
-				return nil
-			case "idle":
-				return nil
-			}
-		}
-	}
+	return readiness.WaitForRecordEncode(ctx, func() ([]byte, error) {
+		body, _, err := c.Get(ctx, "/record/status", nil)
+		return body, err
+	})
 }
 
 // moveFile moves src to dst using rename (fast, same filesystem) or
@@ -153,7 +133,6 @@ func moveFile(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
-	// Cross-filesystem: copy with exclusive creation.
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -215,35 +194,8 @@ func safeRecordPath(file string) (string, error) {
 	return cleaned, nil
 }
 
-// streamToFile writes from r to path using O_CREATE|O_EXCL (no overwrite),
-// capped at maxRecordFileBytes. Returns the number of bytes written.
-func streamToFile(path string, r io.Reader) (int64, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return 0, err
-	}
-
-	n, copyErr := io.Copy(f, io.LimitReader(r, maxRecordFileBytes+1))
-	if closeErr := f.Close(); closeErr != nil && copyErr == nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil {
-		_ = os.Remove(path)
-		return 0, copyErr
-	}
-	if n > maxRecordFileBytes {
-		_ = os.Remove(path)
-		return 0, fmt.Errorf("recording exceeds %d MiB limit", maxRecordFileBytes>>20)
-	}
-	return n, nil
-}
-
 func handleRecordStatus(c *Client) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		body, code, err := c.Get(ctx, "/record/status", nil)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return resultFromBytes(body, code)
+		return toolResult(c.Get(ctx, "/record/status", nil))
 	}
 }

@@ -1,0 +1,381 @@
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pinchtab/pinchtab/internal/browsers/providerhooks"
+	"github.com/pinchtab/pinchtab/internal/config"
+)
+
+var (
+	shutdownRequestTimeout      = 4 * time.Second
+	registeredBridgeStopTimeout = 5 * time.Second
+	gracefulProcessStopTimeout  = 5 * time.Second
+	termProcessStopTimeout      = 3 * time.Second
+	killProcessStopTimeout      = 2 * time.Second
+)
+
+func (o *Orchestrator) Stop(id string) error {
+	o.mu.Lock()
+	inst, ok := o.instances[id]
+	if !ok {
+		o.mu.Unlock()
+		return fmt.Errorf("instance %q not found", id)
+	}
+	if inst.Status == "stopped" && !instanceIsActive(inst) {
+		o.mu.Unlock()
+		o.markStopped(id)
+		return nil
+	}
+	inst.Status = "stopping"
+	o.mu.Unlock()
+
+	if inst.cmd == nil {
+		if inst.AttachType == "bridge" || inst.AttachType == "cdp-bridge" {
+			if err := o.stopRegisteredBridge(inst); err != nil {
+				o.setStopError(id, err.Error())
+				return err
+			}
+		}
+		o.markStopped(id)
+		return nil
+	}
+
+	pid := inst.cmd.PID()
+	if !o.stopChildProcess(id, inst) {
+		o.setStopError(id, fmt.Sprintf("failed to stop process %d; still running", pid))
+		return fmt.Errorf("failed to stop instance %q gracefully", id)
+	}
+
+	o.markStopped(id)
+	return nil
+}
+
+// stopChildProcess runs the child shutdown escalation: ask the bridge to shut
+// down, then SIGTERM, SIGKILL, and finally cancel the command context. It
+// reports whether the process is gone. Stop and the detached failed-attempt
+// teardown share it; they differ only in the bookkeeping around it.
+func (o *Orchestrator) stopChildProcess(id string, inst *InstanceInternal) bool {
+	o.requestChildShutdown(inst)
+
+	pid := inst.cmd.PID()
+	if pid > 0 {
+		if waitForProcessExit(pid, gracefulProcessStopTimeout) {
+			return true
+		}
+
+		if err := killProcessGroup(pid, sigTERM); err != nil {
+			slog.Warn("failed to send SIGTERM to instance", "id", id, "pid", pid, "err", err)
+		}
+		if waitForProcessExit(pid, termProcessStopTimeout) {
+			return true
+		}
+
+		if err := killProcessGroup(pid, sigKILL); err != nil {
+			slog.Warn("failed to send SIGKILL to instance", "id", id, "pid", pid, "err", err)
+		}
+	}
+
+	inst.cmd.Cancel()
+	return pid <= 0 || waitForProcessExit(pid, killProcessStopTimeout)
+}
+
+// requestChildShutdown asks a child bridge to shut itself down. Failures are
+// the caller's cue to escalate, not an error to report.
+func (o *Orchestrator) requestChildShutdown(inst *InstanceInternal) {
+	reqCtx, cancel := context.WithTimeout(context.Background(), shutdownRequestTimeout)
+	defer cancel()
+	targetURL, targetErr := o.instancePathURL(inst, "/shutdown", "")
+	if targetErr != nil {
+		return
+	}
+	req, _ := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL.String(), nil)
+	o.applyInstanceAuth(req, inst)
+	if resp, err := o.client.Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func (o *Orchestrator) stopRegisteredBridge(inst *InstanceInternal) error {
+	shutdownURL, err := o.instancePathURL(inst, "/shutdown", "")
+	if err != nil {
+		return fmt.Errorf("cannot stop registered bridge %q: %w", inst.ID, err)
+	}
+	requestCtx, cancel := context.WithTimeout(context.Background(), shutdownRequestTimeout)
+	request, requestErr := http.NewRequestWithContext(requestCtx, http.MethodPost, shutdownURL.String(), nil)
+	if requestErr == nil {
+		o.applyInstanceAuth(request, inst)
+		response, doErr := o.client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				requestErr = fmt.Errorf("shutdown returned HTTP %d", response.StatusCode)
+			}
+		}
+		if doErr != nil {
+			requestErr = doErr
+		}
+	}
+	cancel()
+
+	if o.waitForBridgeEndpointExit(inst, registeredBridgeStopTimeout) {
+		return nil
+	}
+	if requestErr != nil {
+		return fmt.Errorf("registered bridge %q did not stop: %w", inst.ID, requestErr)
+	}
+	return fmt.Errorf("registered bridge %q acknowledged shutdown but its endpoint is still reachable", inst.ID)
+}
+
+func (o *Orchestrator) waitForBridgeEndpointExit(inst *InstanceInternal, timeout time.Duration) bool {
+	healthURL, err := o.instancePathURL(inst, "/health", "")
+	if err != nil {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		request, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL.String(), nil)
+		o.applyInstanceAuth(request, inst)
+		response, probeErr := o.client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		cancel()
+		if probeErr != nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+func (o *Orchestrator) StopProfile(name string) error {
+	o.mu.RLock()
+	ids := make([]string, 0, 1)
+	for id, inst := range o.instances {
+		if inst.ProfileName == name && instanceIsActive(inst) {
+			ids = append(ids, id)
+		}
+	}
+	o.mu.RUnlock()
+
+	if len(ids) == 0 {
+		return fmt.Errorf("no active instance for profile %q", name)
+	}
+
+	var errs []string
+	for _, id := range ids {
+		if err := o.Stop(id); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to stop profile %q: %s", name, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (o *Orchestrator) markStopped(id string) {
+	o.mu.Lock()
+	inst, ok := o.instances[id]
+	if !ok {
+		o.mu.Unlock()
+		return
+	}
+
+	profileName := inst.ProfileName
+	browser := inst.browser
+	attached := inst.Attached
+	delete(o.instances, id)
+	o.mu.Unlock()
+
+	o.releaseInstancePorts(id, inst)
+	o.removeInstanceFromManager(id)
+
+	slog.Info("instance stopped and removed", "id", id, "profile", profileName)
+	o.cleanupStoppedProfile(profileName, browser)
+	if attached {
+		// Attach children write per-instance state under baseDir/attach/<id>;
+		// without this the dirs accumulate across attach/detach cycles.
+		stateDir := filepath.Join(o.baseDir, "attach", id)
+		if err := os.RemoveAll(stateDir); err != nil {
+			slog.Warn("failed to remove attach state dir", "id", id, "dir", stateDir, "err", err)
+		}
+	}
+}
+
+func (o *Orchestrator) releaseInstancePorts(id string, inst *InstanceInternal) {
+	if o == nil || o.ports() == nil || inst == nil {
+		return
+	}
+	portStr := inst.Port
+	if portInt, err := strconv.Atoi(portStr); err == nil {
+		o.ports().ReleasePort(portInt)
+		slog.Debug("released port", "id", id, "port", portStr)
+	}
+	if inst.cdpPort > 0 {
+		o.ports().ReleasePort(inst.cdpPort)
+		slog.Debug("released browser debug port", "id", id, "port", inst.cdpPort)
+	}
+}
+
+func (o *Orchestrator) removeInstanceFromManager(id string) {
+	if o != nil && o.instanceMgr != nil {
+		o.instanceMgr.Locator.InvalidateInstance(id)
+		o.instanceMgr.Repo.Remove(id)
+	}
+}
+
+func (o *Orchestrator) cleanupStoppedProfile(profileName, browser string) {
+	profilePath := filepath.Join(o.baseDir, profileName)
+	if cfg := o.cfg(); browser == "" && cfg != nil {
+		browser = config.NormalizeBrowser(cfg.DefaultBrowser)
+	}
+	if browser == "" {
+		// Every provider's cleanup hook is the same chrome-process sweep;
+		// skipping orphan cleanup entirely (no hook registered under "") is
+		// strictly worse than a chrome-targeted one.
+		browser = config.BrowserChrome
+	}
+	providerhooks.CleanupProfile(browser, profilePath)
+
+	if strings.HasPrefix(profileName, "instance-") {
+		if err := os.RemoveAll(profilePath); err != nil {
+			slog.Warn("failed to delete temporary profile directory", "name", profileName, "err", err)
+		} else {
+			slog.Info("deleted temporary profile", "name", profileName)
+		}
+
+		if o.profiles != nil {
+			if err := o.profiles.Delete(profileName); err != nil {
+				slog.Warn("failed to delete profile metadata", "name", profileName, "err", err)
+			}
+		}
+	}
+}
+
+func (o *Orchestrator) setStopError(id, msg string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if inst, ok := o.instances[id]; ok {
+		inst.Status = "error"
+		inst.Error = msg
+	}
+}
+
+func (o *Orchestrator) Shutdown() {
+	o.endSessionCloses()
+	o.mu.RLock()
+	ids := make([]string, 0, len(o.instances))
+	for id, inst := range o.instances {
+		if instanceIsActive(inst) {
+			ids = append(ids, id)
+		}
+	}
+	o.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(instanceID string) {
+			defer wg.Done()
+			slog.Info("stopping instance", "id", instanceID)
+			if err := o.Stop(instanceID); err != nil {
+				slog.Warn("stop instance failed", "id", instanceID, "err", err)
+			}
+		}(id)
+	}
+	wg.Wait()
+
+	// Signal after the instances are stopped, so a monitor still probing a
+	// healthy instance gets to record its outcome, then join every goroutine
+	// the orchestrator detached. The monitors are bounded by one poll interval
+	// rather than instanceStartupTimeout because the probe loop watches
+	// shutdownCh; the teardowns run a failed attempt's own process escalation,
+	// which nothing else stops for them.
+	o.signalShutdown()
+	joinDetached("startup monitors", &o.monitors, monitorShutdownGrace)
+	joinDetached("failed-attempt teardowns", &o.detachedStops, detachedStopShutdownGrace)
+	joinDetached("session tab closes", &o.sessionCloses, sessionCloseShutdownGrace)
+}
+
+// joinDetached waits for wg, then reports rather than hangs. Every wait here is
+// bounded so a goroutine blocked somewhere unexpected can never hold the
+// process open.
+func joinDetached(work string, wg *sync.WaitGroup, grace time.Duration) {
+	if waitGroupWithin(wg, grace) {
+		return
+	}
+	slog.Warn("detached goroutines did not finish within the shutdown grace period",
+		"work", work, "grace", grace)
+}
+
+// monitorShutdownGrace bounds how long Shutdown waits for startup monitors.
+// Generous next to the poll interval they watch shutdownCh on, and far below
+// instanceStartupTimeout.
+const monitorShutdownGrace = 5 * time.Second
+
+// detachedStopShutdownGrace bounds how long Shutdown waits for failed-attempt
+// teardowns. One runs stopChildProcess, whose own escalation is bounded by the
+// shutdown request plus the three process waits, so a teardown that is making
+// progress finishes inside this.
+var detachedStopShutdownGrace = shutdownRequestTimeout + gracefulProcessStopTimeout +
+	termProcessStopTimeout + killProcessStopTimeout + time.Second
+
+// waitGroupWithin reports whether wg finished inside d.
+func waitGroupWithin(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// signalShutdown closes shutdownCh exactly once. Safe to call on an
+// Orchestrator built without the constructor, where the channel is nil.
+func (o *Orchestrator) signalShutdown() {
+	o.shutdownOnce.Do(func() {
+		if o.shutdownCh != nil {
+			close(o.shutdownCh)
+		}
+	})
+}
+
+func (o *Orchestrator) ForceShutdown() {
+	o.mu.RLock()
+	instances := make([]*InstanceInternal, 0, len(o.instances))
+	for _, inst := range o.instances {
+		if instanceIsActive(inst) {
+			instances = append(instances, inst)
+		}
+	}
+	o.mu.RUnlock()
+
+	for _, inst := range instances {
+		pid := 0
+		if inst.cmd != nil {
+			pid = inst.cmd.PID()
+			inst.cmd.Cancel()
+		}
+		if pid > 0 {
+			_ = killProcessGroup(pid, sigKILL)
+		}
+		o.markStopped(inst.ID)
+	}
+}

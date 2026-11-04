@@ -87,7 +87,7 @@ assert_output_contains() {
   local expected="$1"
   local desc="${2:-output contains '$expected'}"
 
-  if echo "$PT_OUT" | grep -q "$expected"; then
+  if grep -q -- "$expected" <<<"$PT_OUT"; then
     pass_assert "$desc"
   else
     fail_assert "$desc"
@@ -136,6 +136,19 @@ assert_file_exists() {
   else
     fail_assert "$desc (not found)"
   fi
+}
+
+config_setup() {
+  TMPDIR=$(mktemp -d)
+  CFG="$TMPDIR/config.json"
+}
+
+config_cleanup() {
+  rm -rf "$TMPDIR"
+}
+
+config_init() {
+  PINCHTAB_CONFIG="$CFG" HOME="$TMPDIR" pt_ok config init
 }
 
 config_version_of() {
@@ -196,7 +209,7 @@ assert_output_not_contains() {
   local forbidden="$1"
   local desc="${2:-output does not contain '$forbidden'}"
 
-  if echo "$PT_OUT" | grep -q "$forbidden"; then
+  if grep -q -- "$forbidden" <<<"$PT_OUT"; then
     fail_assert "$desc"
     echo -e "  ${RED}  output was: $PT_OUT${NC}"
   else

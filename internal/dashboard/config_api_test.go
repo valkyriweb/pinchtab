@@ -3,6 +3,7 @@ package dashboard
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,7 +14,11 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/pinchtab/pinchtab/internal/browsers/all"
+
 	"github.com/pinchtab/pinchtab/internal/authn"
+	"github.com/pinchtab/pinchtab/internal/bridge"
+	"github.com/pinchtab/pinchtab/internal/browsersession"
 	"github.com/pinchtab/pinchtab/internal/config"
 )
 
@@ -59,7 +64,7 @@ func TestNewConfigAPISnapshotsBootConfigFromFile(t *testing.T) {
 	}
 
 	runtime := config.Load()
-	api := NewConfigAPI(runtime, nil, nil, nil, nil, "test", time.Now())
+	api := newConfigAPIForTest(runtime, nil, nil, nil, nil, "test", time.Now())
 
 	if api.boot.MultiInstance.Restart.MaxRestarts != nil {
 		t.Fatalf("boot restart maxRestarts = %v, want nil from file snapshot", *api.boot.MultiInstance.Restart.MaxRestarts)
@@ -77,9 +82,64 @@ func TestNewConfigAPISnapshotsBootConfigFromFile(t *testing.T) {
 	}
 }
 
+// TestCurrentConfigCachesByMtime verifies currentConfig serves the cached snapshot
+// while the file mtime is unchanged and reloads only when the mtime advances.
+func TestCurrentConfigCachesByMtime(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("PINCHTAB_CONFIG", configPath)
+
+	if err := os.WriteFile(configPath, []byte(`{"server":{"port":"8888"}}`), 0644); err != nil {
+		t.Fatalf("WriteFile A: %v", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	origMtime := info.ModTime()
+
+	api := newConfigAPIForTest(config.Load(), nil, nil, nil, nil, "test", time.Now())
+
+	cfg, _, _, err := api.currentConfig()
+	if err != nil {
+		t.Fatalf("currentConfig A: %v", err)
+	}
+	if cfg.Server.Port != "8888" {
+		t.Fatalf("port = %q, want 8888", cfg.Server.Port)
+	}
+
+	// Rewrite with different content but FORCE the same mtime: the cache must serve
+	// the stale snapshot (proving it did not re-read the file).
+	if err := os.WriteFile(configPath, []byte(`{"server":{"port":"9999"}}`), 0644); err != nil {
+		t.Fatalf("WriteFile B: %v", err)
+	}
+	if err := os.Chtimes(configPath, origMtime, origMtime); err != nil {
+		t.Fatalf("Chtimes same: %v", err)
+	}
+	cfg, _, _, err = api.currentConfig()
+	if err != nil {
+		t.Fatalf("currentConfig cached: %v", err)
+	}
+	if cfg.Server.Port != "8888" {
+		t.Fatalf("port = %q, want 8888 (cached; same mtime should not reload)", cfg.Server.Port)
+	}
+
+	// Advance the mtime: the cache must invalidate and reload the new content.
+	later := origMtime.Add(2 * time.Second)
+	if err := os.Chtimes(configPath, later, later); err != nil {
+		t.Fatalf("Chtimes later: %v", err)
+	}
+	cfg, _, _, err = api.currentConfig()
+	if err != nil {
+		t.Fatalf("currentConfig reload: %v", err)
+	}
+	if cfg.Server.Port != "9999" {
+		t.Fatalf("port = %q, want 9999 (mtime changed → reload)", cfg.Server.Port)
+	}
+}
+
 func TestRestartReasonsIncludeStealthLevel(t *testing.T) {
 	cfg := config.DefaultFileConfig()
-	api := NewConfigAPI(config.Load(), nil, nil, nil, nil, "test", time.Now())
+	api := newConfigAPIForTest(config.Load(), nil, nil, nil, nil, "test", time.Now())
 	api.boot = cfg
 
 	next := cfg
@@ -88,6 +148,22 @@ func TestRestartReasonsIncludeStealthLevel(t *testing.T) {
 	reasons := api.restartReasonsFor(next)
 	if !slices.Contains(reasons, "Stealth level") {
 		t.Fatalf("restartReasonsFor() = %v, want Stealth level", reasons)
+	}
+}
+
+func TestRestartReasonsIncludeSecurityPolicy(t *testing.T) {
+	cfg := config.DefaultFileConfig()
+	api := newConfigAPIForTest(config.Load(), nil, nil, nil, nil, "test", time.Now())
+	api.boot = cfg
+
+	// Editing the allowlist changes the boot-snapshotted IDPI/security policy, so
+	// it must register as restart-required (the running guard won't pick it up).
+	next := cfg
+	next.Security.AllowedDomains = append(append([]string(nil), cfg.Security.AllowedDomains...), "example.com")
+
+	reasons := api.restartReasonsFor(next)
+	if !slices.Contains(reasons, "Security policy") {
+		t.Fatalf("restartReasonsFor() = %v, want Security policy", reasons)
 	}
 }
 
@@ -183,14 +259,14 @@ func TestHandlePutConfigPreservesExistingToken(t *testing.T) {
 }
 
 func TestHandlePutConfigPreservesWriteOnlySecretsFromRedactedGetPayload(t *testing.T) {
-	fc := config.DefaultFileConfig()
-	fc.Server.Token = "secret-token"
 	stateKey := "state-secret"
-	fc.Security.StateEncryptionKey = &stateKey
-	fc.AutoSolver.External.CapsolverKey = "capsolver-secret"
-	fc.AutoSolver.External.TwoCaptchaKey = "twocaptcha-secret"
-
-	api := newConfigAPITestAPI(t, fc)
+	api := newConfigAPIOverFile(t, []byte(minimalUserConfigJSON))
+	sessions := browsersession.NewManager(browsersession.Config{ElevationWindow: time.Minute})
+	sessionID, err := sessions.Create("secret-token")
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	api.SetSessionManager(sessions)
 
 	getReq := httptest.NewRequest(http.MethodGet, "/api/config", nil)
 	getRes := httptest.NewRecorder()
@@ -199,15 +275,10 @@ func TestHandlePutConfigPreservesWriteOnlySecretsFromRedactedGetPayload(t *testi
 		t.Fatalf("HandleGetConfig() status = %d, want %d", getRes.Code, http.StatusOK)
 	}
 
-	env := decodeConfigEnvelope(t, getRes)
-	env.Config.Server.Port = "9898"
-
-	body, err := json.Marshal(env.Config)
-	if err != nil {
-		t.Fatalf("Marshal() error = %v", err)
-	}
+	body := putBodyFromGetPayloadWithPort(t, getRes, "9898")
 
 	putReq := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	putReq.AddCookie(&http.Cookie{Name: authn.CookieName, Value: sessionID})
 	putRes := httptest.NewRecorder()
 	api.HandlePutConfig(putRes, putReq)
 	if putRes.Code != http.StatusOK {
@@ -295,6 +366,245 @@ func TestHandlePutConfigRejectsWriteOnlyTokenField(t *testing.T) {
 	}
 }
 
+func TestHandlePutConfigRefusesGetEnvelopeAndAppliesNothing(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	getRes := httptest.NewRecorder()
+	api.HandleGetConfig(getRes, getReq)
+
+	var envelope map[string]any
+	if err := json.Unmarshal(getRes.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("Unmarshal GET payload: %v", err)
+	}
+	inner := envelope["config"].(map[string]any)
+	inner["timeouts"].(map[string]any)["actionSec"] = 31
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal PUT body: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	api.HandlePutConfig(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "unrecognized_config_keys") {
+		t.Fatalf("response = %q, want unrecognized_config_keys error", w.Body.String())
+	}
+
+	saved, _, err := config.LoadFileConfig()
+	if err != nil {
+		t.Fatalf("LoadFileConfig() error = %v", err)
+	}
+	if saved.Timeouts.ActionSec != 30 {
+		t.Fatalf("saved timeouts.actionSec = %d, want unchanged 30", saved.Timeouts.ActionSec)
+	}
+}
+
+func TestHandlePutConfigAppliesTheInnerObject(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+
+	body := []byte(`{"timeouts":{"actionSec":45}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	api.HandlePutConfig(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	saved, _, err := config.LoadFileConfig()
+	if err != nil {
+		t.Fatalf("LoadFileConfig() error = %v", err)
+	}
+	if saved.Timeouts.ActionSec != 45 {
+		t.Fatalf("saved timeouts.actionSec = %d, want 45", saved.Timeouts.ActionSec)
+	}
+}
+
+func TestHandlePutConfigRefusesAnyUnrecognizedTopLevelKey(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+
+	body := []byte(`{"timeoutz":{"actionSec":45}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	api.HandlePutConfig(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "timeoutz") {
+		t.Fatalf("response = %q, want the unrecognized key named", w.Body.String())
+	}
+}
+
+func TestHandlePutConfigRefusesBodyWithNoRecognizedFields(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	api.HandlePutConfig(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "empty_config_update") {
+		t.Fatalf("response = %q, want empty_config_update error", w.Body.String())
+	}
+
+	saved, _, err := config.LoadFileConfig()
+	if err != nil {
+		t.Fatalf("LoadFileConfig() error = %v", err)
+	}
+	if saved.Timeouts.ActionSec != fc.Timeouts.ActionSec {
+		t.Fatalf("saved timeouts.actionSec = %d, want unchanged %d", saved.Timeouts.ActionSec, fc.Timeouts.ActionSec)
+	}
+}
+
+func TestHandlePutConfigRequiresElevationForProxyChangeWithDashboardCookie(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+	sessions := browsersession.NewManager(browsersession.Config{ElevationWindow: time.Minute})
+	sessionID, err := sessions.Create("secret-token")
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	api.SetSessionManager(sessions)
+
+	payload := config.DefaultFileConfig()
+	payload.Browser.Proxy = config.BrowserProxyConfig{
+		Server:   "http://proxy.example.com:8080",
+		Username: "alice",
+		Password: "secret",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: authn.CookieName, Value: sessionID})
+	w := httptest.NewRecorder()
+	api.HandlePutConfig(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "session_elevation_required") {
+		t.Fatalf("response = %q, want session_elevation_required", w.Body.String())
+	}
+}
+
+func TestHandlePutConfigAllowsElevatedProxyChange(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+	sessions := browsersession.NewManager(browsersession.Config{ElevationWindow: time.Minute})
+	sessionID, err := sessions.Create("secret-token")
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	if !sessions.Elevate(sessionID, "secret-token") {
+		t.Fatal("Elevate() = false, want true")
+	}
+	api.SetSessionManager(sessions)
+
+	payload := config.DefaultFileConfig()
+	payload.Browser.Proxy = config.BrowserProxyConfig{
+		Server:   "http://proxy.example.com:8080",
+		Username: "alice",
+		Password: "secret",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: authn.CookieName, Value: sessionID})
+	w := httptest.NewRecorder()
+	api.HandlePutConfig(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+}
+
+func TestHandlePutConfigAuditsProxyChangeServers(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	fc.Server.Token = "secret-token"
+	api := newConfigAPITestAPI(t, fc)
+	sessions := browsersession.NewManager(browsersession.Config{ElevationWindow: time.Minute})
+	sessionID, err := sessions.Create("secret-token")
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	if !sessions.Elevate(sessionID, "secret-token") {
+		t.Fatal("Elevate() = false, want true")
+	}
+	api.SetSessionManager(sessions)
+
+	payload := config.DefaultFileConfig()
+	payload.Browser.Proxy = config.BrowserProxyConfig{
+		Server:   "http://proxy.example.com:8080",
+		Username: "alice",
+		Password: "secret",
+	}
+	payload.Browser.Targets = config.BrowserTargetsConfig{
+		"proxy-target": {
+			Provider: config.BrowserChrome,
+			Proxy: config.BrowserProxyConfig{
+				Server:   "socks5://10.0.0.1:1080",
+				Username: "bob",
+				Password: "target-secret",
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: authn.CookieName, Value: sessionID})
+	w := httptest.NewRecorder()
+	logs := captureDashboardSlog(t, func() {
+		api.HandlePutConfig(w, req)
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandlePutConfig() status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	for _, needle := range []string{
+		`"event":"config.proxy_changed"`,
+		`"scope":"browser.proxy"`,
+		`"server":"http://proxy.example.com:8080"`,
+		`"scope":"browser.targets.proxy-target.proxy"`,
+		`"server":"socks5://10.0.0.1:1080"`,
+	} {
+		if !strings.Contains(logs, needle) {
+			t.Fatalf("expected audit log to contain %q\n%s", needle, logs)
+		}
+	}
+	for _, secret := range []string{"secret-token", "secret", "target-secret"} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("audit log leaked secret %q\n%s", secret, logs)
+		}
+	}
+}
+
 func TestHandleHealthIncludesAgentCount(t *testing.T) {
 	fc := config.DefaultFileConfig()
 	api := newConfigAPITestAPI(t, fc)
@@ -315,6 +625,16 @@ func TestHandleHealthIncludesAgentCount(t *testing.T) {
 	if health.Agents != 3 {
 		t.Fatalf("health agents = %d, want 3", health.Agents)
 	}
+}
+
+func captureDashboardSlog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer slog.SetDefault(old)
+	fn()
+	return buf.String()
 }
 
 func TestHandleHealthSecurityVisibilityByAuthMethod(t *testing.T) {
@@ -362,13 +682,27 @@ func TestHandleHealthSecurityVisibilityByAuthMethod(t *testing.T) {
 func newConfigAPITestAPI(t *testing.T, fc config.FileConfig) *ConfigAPI {
 	t.Helper()
 
+	data, err := json.MarshalIndent(fc, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent() error = %v", err)
+	}
+	return newConfigAPIOverFile(t, data)
+}
+
+// newConfigAPIOverFile builds the API over the exact bytes given, so a test can
+// exercise the shape a real config file has: keys the user never set are absent,
+// which loads them as nil rather than as the empty slices a materialised file
+// carries.
+func newConfigAPIOverFile(t *testing.T, data []byte) *ConfigAPI {
+	t.Helper()
+
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	t.Setenv("PINCHTAB_CONFIG", configPath)
-	if err := config.SaveFileConfig(&fc, configPath); err != nil {
-		t.Fatalf("SaveFileConfig() error = %v", err)
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	return NewConfigAPI(config.Load(), nil, nil, nil, nil, "test", time.Now())
+	return newConfigAPIForTest(config.Load(), nil, nil, nil, nil, "test", time.Now())
 }
 
 func decodeConfigEnvelope(t *testing.T, w *httptest.ResponseRecorder) configEnvelope {
@@ -386,17 +720,47 @@ func decodeConfigEnvelope(t *testing.T, w *httptest.ResponseRecorder) configEnve
 // name) and verifies they are all redacted. This test will fail if a new sensitive
 // field is added to FileConfig without updating redactToken().
 func TestRedactTokenCoversAllSensitiveFields(t *testing.T) {
-	// Populate all known sensitive fields with non-zero values
 	fc := config.DefaultFileConfig()
 	fc.Server.Token = "test-token"
 	encKey := "test-encryption-key"
 	fc.Security.StateEncryptionKey = &encKey
 	fc.AutoSolver.External.CapsolverKey = "test-capsolver-key"
 	fc.AutoSolver.External.TwoCaptchaKey = "test-twocaptcha-key"
+	fc.Browser.Proxy = config.BrowserProxyConfig{
+		Server:   "http://proxy.example.com:8080",
+		Username: "alice",
+		Password: "raw-proxy-password",
+	}
+	fc.Browser.Targets = config.BrowserTargetsConfig{
+		"with-proxy": {
+			Provider: config.BrowserChrome,
+			Proxy: config.BrowserProxyConfig{
+				Server:   "socks5://10.0.0.1:1080",
+				Username: "bob",
+				Password: "target-proxy-password",
+			},
+		},
+	}
 
 	redacted := redactToken(fc)
 
-	// Use reflection to find any sensitive fields that weren't redacted
+	// Masked to "***" (not empty) so the dashboard knows credentials are configured.
+	if redacted.Browser.Proxy.Password != "***" {
+		t.Errorf("Browser.Proxy.Password not redacted: got %q", redacted.Browser.Proxy.Password)
+	}
+	if redacted.Browser.Proxy.Server != fc.Browser.Proxy.Server {
+		t.Errorf("Browser.Proxy.Server should be preserved, got %q", redacted.Browser.Proxy.Server)
+	}
+	if tp := redacted.Browser.Targets["with-proxy"].Proxy.Password; tp != "***" {
+		t.Errorf("per-target proxy password not redacted: got %q", tp)
+	}
+	if fc.Browser.Proxy.Password != "raw-proxy-password" {
+		t.Errorf("redactToken mutated source Browser.Proxy.Password: %q", fc.Browser.Proxy.Password)
+	}
+	if fc.Browser.Targets["with-proxy"].Proxy.Password != "target-proxy-password" {
+		t.Errorf("redactToken mutated source target proxy password")
+	}
+
 	var unredacted []string
 	findSensitiveFields(reflect.ValueOf(redacted), "", &unredacted)
 
@@ -432,7 +796,6 @@ func findSensitiveFields(v reflect.Value, path string, unredacted *[]string) {
 
 		fieldVal := v.Field(i)
 
-		// Check if field name suggests it's sensitive
 		nameLower := strings.ToLower(field.Name)
 		isSensitive := false
 		for _, pattern := range sensitivePatterns {
@@ -442,15 +805,21 @@ func findSensitiveFields(v reflect.Value, path string, unredacted *[]string) {
 			}
 		}
 
-		if isSensitive && !isZeroValue(fieldVal) {
+		if isSensitive && !isZeroValue(fieldVal) && !isMaskedString(fieldVal) {
 			*unredacted = append(*unredacted, fieldPath)
 		}
 
-		// Recurse into nested structs
 		if fieldVal.Kind() == reflect.Struct || (fieldVal.Kind() == reflect.Ptr && fieldVal.Elem().Kind() == reflect.Struct) {
 			findSensitiveFields(fieldVal, fieldPath, unredacted)
 		}
 	}
+}
+
+func isMaskedString(v reflect.Value) bool {
+	if v.Kind() == reflect.String {
+		return v.String() == "***"
+	}
+	return false
 }
 
 func isZeroValue(v reflect.Value) bool {
@@ -458,4 +827,99 @@ func isZeroValue(v reflect.Value) bool {
 		return v.IsNil()
 	}
 	return v.IsZero()
+}
+
+type stubProfileLister struct {
+	profiles []bridge.ProfileInfo
+}
+
+func (s stubProfileLister) List() ([]bridge.ProfileInfo, error) { return s.profiles, nil }
+
+func TestHandleHealthCountsQuarantinedProfilesSeparately(t *testing.T) {
+	fc := config.DefaultFileConfig()
+	api := newConfigAPITestAPI(t, fc)
+	api.profiles = stubProfileLister{profiles: []bridge.ProfileInfo{
+		{Name: "work"},
+		{Name: "quarantine-notes"},
+		{Name: "work.quarantine-1785343990", Quarantined: true},
+		{Name: "personal.quarantine-1785343991", Quarantined: true},
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	api.HandleHealth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandleHealth() status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var health healthEnvelope
+	if err := json.NewDecoder(w.Body).Decode(&health); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if health.Profiles != 2 {
+		t.Errorf("health profiles = %d, want 2 live profiles", health.Profiles)
+	}
+	if health.QuarantinedProfiles != 2 {
+		t.Errorf("health quarantinedProfiles = %d, want 2", health.QuarantinedProfiles)
+	}
+}
+
+func TestHandlePutConfigDoesNotDemandElevationForANonSensitiveEdit(t *testing.T) {
+	api := newConfigAPIOverFile(t, []byte(minimalUserConfigJSON))
+
+	getRes := httptest.NewRecorder()
+	api.HandleGetConfig(getRes, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("HandleGetConfig() status = %d, want %d", getRes.Code, http.StatusOK)
+	}
+	body := putBodyFromGetPayloadWithPort(t, getRes, "9898")
+
+	putReq := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewReader(body))
+	putReq.AddCookie(&http.Cookie{Name: authn.CookieName, Value: "dashboard-session"})
+	putRes := httptest.NewRecorder()
+	api.HandlePutConfig(putRes, putReq)
+	if putRes.Code != http.StatusOK {
+		t.Fatalf("HandlePutConfig() status = %d, want %d: %s", putRes.Code, http.StatusOK, putRes.Body.String())
+	}
+}
+
+// putBodyFromGetPayloadWithPort edits the GET payload the way a dashboard client
+// does: the received JSON is sent back verbatim apart from the one field the user
+// touched. Re-marshalling through config.FileConfig instead would drop every empty
+// array the payload carries, which is exactly the difference this exercises.
+const minimalUserConfigJSON = `{
+  "server": {
+    "port": "9913",
+    "token": "secret-token"
+  },
+  "security": {
+    "stateEncryptionKey": "state-secret"
+  },
+  "autoSolver": {
+    "external": {
+      "capsolverKey": "capsolver-secret",
+      "twoCaptchaKey": "twocaptcha-secret"
+    }
+  }
+}`
+
+func putBodyFromGetPayloadWithPort(t *testing.T, getRes *httptest.ResponseRecorder, port string) []byte {
+	t.Helper()
+
+	var envelope struct {
+		Config map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(getRes.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("Unmarshal GET payload: %v", err)
+	}
+	server, ok := envelope.Config["server"].(map[string]any)
+	if !ok {
+		t.Fatalf("GET payload has no server section: %v", envelope.Config)
+	}
+	server["port"] = port
+	body, err := json.Marshal(envelope.Config)
+	if err != nil {
+		t.Fatalf("Marshal PUT body: %v", err)
+	}
+	return body
 }

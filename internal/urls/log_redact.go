@@ -4,18 +4,18 @@ import (
 	"net"
 	"net/url"
 	"strings"
+
+	"github.com/pinchtab/pinchtab/internal/sanitize"
 )
 
-const (
-	maxLogURLBytes    = 512
-	logTruncateSuffix = "..."
-)
+const maxLogURLBytes = 512
 
-// RedactForLog normalizes a URL for logs and strips sensitive components.
-// It removes userinfo, query, and fragment and caps the final string length.
-// Invalid inputs return an empty string rather than echoing raw potentially
-// sensitive data back into logs.
-func RedactForLog(raw string) string {
+// Redact is the single implementation of the URL redaction control: it strips
+// the components that must never reach a persisted record — userinfo, query and
+// fragment — lowercases the host, and caps the result at maxBytes. Inputs that
+// are not URLs return an empty string rather than echoing possibly-sensitive
+// text through. Callers differ only in the cap they pass.
+func Redact(raw string, maxBytes int) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
@@ -30,6 +30,9 @@ func RedactForLog(raw string) string {
 	if err != nil {
 		return ""
 	}
+	// Sanitize returns any string containing "://" verbatim, so this guard has
+	// to run on its success path too: a relative path such as "/path://x"
+	// arrives here parsed as neither scheme, host nor opaque.
 	if parsed.Scheme == "" && parsed.Host == "" && parsed.Opaque == "" {
 		return ""
 	}
@@ -48,30 +51,10 @@ func RedactForLog(raw string) string {
 		}
 	}
 
-	return truncateForLog(parsed.String(), maxLogURLBytes)
+	return sanitize.TruncateUTF8BytesWithEllipsis(parsed.String(), maxBytes)
 }
 
-func truncateForLog(s string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if len(s) <= maxBytes {
-		return s
-	}
-	if maxBytes <= len(logTruncateSuffix) {
-		return logTruncateSuffix[:maxBytes]
-	}
-
-	limit := maxBytes - len(logTruncateSuffix)
-	cut := 0
-	for i := range s {
-		if i > limit {
-			break
-		}
-		cut = i
-	}
-	if cut == 0 && limit > 0 {
-		return logTruncateSuffix
-	}
-	return s[:cut] + logTruncateSuffix
+// RedactForLog redacts raw for log output.
+func RedactForLog(raw string) string {
+	return Redact(raw, maxLogURLBytes)
 }

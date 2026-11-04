@@ -2,14 +2,12 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 )
@@ -22,6 +20,9 @@ type inspectResponse struct {
 	HTML      string         `json:"html,omitempty"`
 	Styles    map[string]any `json:"styles,omitempty"`
 	Truncated bool           `json:"truncated,omitempty"`
+	// IDPIWarning carries the scanner's advisory when a threat was detected but
+	// not blocked, so a caller reading only the body still sees it.
+	IDPIWarning string `json:"idpiWarning,omitempty"`
 }
 
 type inspectPayload struct {
@@ -45,7 +46,7 @@ func (h *Handlers) HandleTitle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleTabTitle(w http.ResponseWriter, r *http.Request) {
-	h.forwardInspectTabRoute(w, r, h.HandleTitle)
+	h.withPathTabID(w, r, h.HandleTitle)
 }
 
 func (h *Handlers) HandleURL(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +54,7 @@ func (h *Handlers) HandleURL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleTabURL(w http.ResponseWriter, r *http.Request) {
-	h.forwardInspectTabRoute(w, r, h.HandleURL)
+	h.withPathTabID(w, r, h.HandleURL)
 }
 
 func (h *Handlers) HandleHTML(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +62,7 @@ func (h *Handlers) HandleHTML(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleTabHTML(w http.ResponseWriter, r *http.Request) {
-	h.forwardInspectTabRoute(w, r, h.HandleHTML)
+	h.withPathTabID(w, r, h.HandleHTML)
 }
 
 func (h *Handlers) HandleStyles(w http.ResponseWriter, r *http.Request) {
@@ -69,45 +70,31 @@ func (h *Handlers) HandleStyles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleTabStyles(w http.ResponseWriter, r *http.Request) {
-	h.forwardInspectTabRoute(w, r, h.HandleStyles)
+	h.withPathTabID(w, r, h.HandleStyles)
 }
 
 func (h *Handlers) handleInspect(w http.ResponseWriter, r *http.Request, kind inspectKind) {
 	tabID := r.URL.Query().Get("tabId")
 	h.recordReadRequest(r, string(kind), tabID)
 
-	if err := h.ensureChrome(); err != nil {
-		if h.writeBridgeUnavailable(w, err) {
-			return
-		}
-		httpx.Error(w, 500, fmt.Errorf("chrome initialization: %w", err))
+	if !h.ensureBrowserOrRespond(w, h.Config) {
 		return
 	}
 
-	ctx, resolvedTabID, err := h.tabContextWithHeader(w, r, tabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
+	resolvedTabID, tCtx, cancel, ok := h.resolveReadContext(w, r, tabID, h.Config.ActionTimeout)
+	if !ok {
 		return
 	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
-		return
-	}
-	defer h.armAutoCloseIfEnabled(resolvedTabID)
+	defer h.armIdleLifecycle(resolvedTabID)
+	defer cancel()
 
-	tCtx, tCancel := context.WithTimeout(ctx, h.Config.ActionTimeout)
-	defer tCancel()
-	go httpx.CancelOnClientDone(r.Context(), tCancel)
+	targetFrameID := h.resolveTargetFrameID(r, resolvedTabID)
 
-	targetFrameID := r.URL.Query().Get("frameId")
-	if targetFrameID == "" {
-		if scope, ok := h.currentFrameScope(resolvedTabID); ok {
-			targetFrameID = scope.FrameID
-		}
-	}
-
+	vocabBefore := h.tabVocab(resolvedTabID)
 	payload, err := h.inspectPayload(tCtx, resolvedTabID, targetFrameID, r.URL.Query().Get("selector"), r.URL.Query().Get("ref"), kind)
+	h.publishVocabIfReepoched(w, resolvedTabID, vocabBefore)
 	if err != nil {
-		httpx.Error(w, 500, err)
+		respondSelectorFailure(w, err)
 		return
 	}
 
@@ -119,9 +106,8 @@ func (h *Handlers) handleInspect(w http.ResponseWriter, r *http.Request, kind in
 	}
 	if kind == inspectKindHTML {
 		resp.HTML = payload.HTML
-		if maxChars := parsePositiveInt(r.URL.Query().Get("maxChars")); maxChars > 0 && len(resp.HTML) > maxChars {
-			resp.HTML = resp.HTML[:maxChars]
-			resp.Truncated = true
+		if maxChars := parsePositiveInt(r.URL.Query().Get("maxChars")); maxChars > 0 {
+			resp.HTML, resp.Truncated = truncateChars(resp.HTML, maxChars)
 		}
 	}
 	if kind == inspectKindStyles {
@@ -132,6 +118,18 @@ func (h *Handlers) handleInspect(w http.ResponseWriter, r *http.Request, kind in
 			resp.Styles = sortCSSMap(styles)
 		}
 	}
+
+	// Scan what the caller actually receives, not what was read: resp is scanned
+	// after truncation and after the ?prop= narrowing above, so the verdict
+	// always describes the bytes in the response.
+	warning, blocked := h.scanInspectContentForIDPI(w, kind, inspectScanCorpus(kind, inspectPayload{
+		HTML:   resp.HTML,
+		Styles: resp.Styles,
+	}))
+	if blocked {
+		return
+	}
+	resp.IDPIWarning = warning
 
 	h.recordResolvedURL(r, resp.URL)
 	httpx.JSON(w, 200, resp)
@@ -171,19 +169,27 @@ func inspectDocumentExpression(kind inspectKind) string {
 			return {
 				title: doc.title || "",
 				url: String(doc.location ? doc.location.href : win.location.href),
-				html: doc.documentElement ? doc.documentElement.outerHTML : "",
 				styles
 			};
 		})()`
-	default:
+	case inspectKindHTML:
 		return `(() => {
 			const doc = document;
 			const win = doc.defaultView || window;
 			return {
 				title: doc.title || "",
 				url: String(doc.location ? doc.location.href : win.location.href),
-				html: doc.documentElement ? doc.documentElement.outerHTML : "",
-				styles: {}
+				html: doc.documentElement ? doc.documentElement.outerHTML : ""
+			};
+		})()`
+	default:
+		// title / url: no outerHTML, no computed styles.
+		return `(() => {
+			const doc = document;
+			const win = doc.defaultView || window;
+			return {
+				title: doc.title || "",
+				url: String(doc.location ? doc.location.href : win.location.href)
 			};
 		})()`
 	}
@@ -198,7 +204,7 @@ func (h *Handlers) inspectByRef(ctx context.Context, tabID, ref string, kind ins
 	if !ok {
 		return inspectPayload{}, fmt.Errorf("ref not found: %s", ref)
 	}
-	return inspectByBackendNodeID(ctx, target.BackendNodeID, kind)
+	return h.inspectByBackendNodeID(ctx, target.BackendNodeID, kind)
 }
 
 func (h *Handlers) inspectBySelector(ctx context.Context, tabID, rawSelector, frameID string, kind inspectKind) (inspectPayload, error) {
@@ -206,63 +212,20 @@ func (h *Handlers) inspectBySelector(ctx context.Context, tabID, rawSelector, fr
 	if err != nil {
 		return inspectPayload{}, frameScopedSelectorError("selector", err)
 	}
-	return inspectByBackendNodeID(ctx, nodeID, kind)
+	return h.inspectByBackendNodeID(ctx, nodeID, kind)
 }
 
-func inspectByBackendNodeID(ctx context.Context, nodeID int64, kind inspectKind) (inspectPayload, error) {
+func (h *Handlers) inspectByBackendNodeID(ctx context.Context, nodeID int64, kind inspectKind) (inspectPayload, error) {
 	var payload inspectPayload
 	if nodeID == 0 {
 		return payload, fmt.Errorf("element not found in DOM (backendNodeId=%d)", nodeID)
 	}
 
-	var resolveResult json.RawMessage
-	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return chromedp.FromContext(ctx).Target.Execute(ctx, "DOM.resolveNode", map[string]any{
-			"backendNodeId": nodeID,
-		}, &resolveResult)
-	})); err != nil {
-		return payload, fmt.Errorf("resolve node: %w", err)
-	}
-
-	var resolved struct {
-		Object struct {
-			ObjectID string `json:"objectId"`
-		} `json:"object"`
-	}
-	if err := json.Unmarshal(resolveResult, &resolved); err != nil {
-		return payload, fmt.Errorf("parse resolved node: %w", err)
-	}
-	if resolved.Object.ObjectID == "" {
-		return payload, fmt.Errorf("element not found in DOM (backendNodeId=%d)", nodeID)
-	}
-
 	functionDeclaration := inspectFunctionDeclaration(kind)
-	var callResult json.RawMessage
-	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return chromedp.FromContext(ctx).Target.Execute(ctx, "Runtime.callFunctionOn", map[string]any{
-			"functionDeclaration": functionDeclaration,
-			"objectId":            resolved.Object.ObjectID,
-			"returnByValue":       true,
-		}, &callResult)
-	})); err != nil {
-		return payload, fmt.Errorf("inspect %s: %w", kind, err)
+	if err := h.Bridge.CallFunctionOnNode(ctx, nodeID, functionDeclaration, nil, &payload); err != nil {
+		return inspectPayload{}, fmt.Errorf("inspect %s: %w", kind, err)
 	}
-
-	var result struct {
-		Result struct {
-			Value inspectPayload `json:"value"`
-		} `json:"result"`
-		ExceptionDetails *struct {
-			Text string `json:"text"`
-		} `json:"exceptionDetails,omitempty"`
-	}
-	if err := json.Unmarshal(callResult, &result); err != nil {
-		return payload, fmt.Errorf("inspect %s parse: %w", kind, err)
-	}
-	if result.ExceptionDetails != nil && result.ExceptionDetails.Text != "" {
-		return payload, fmt.Errorf("inspect %s: %s", kind, result.ExceptionDetails.Text)
-	}
-	return result.Result.Value, nil
+	return payload, nil
 }
 
 func inspectFunctionDeclaration(kind inspectKind) string {
@@ -281,7 +244,7 @@ func inspectFunctionDeclaration(kind inspectKind) string {
 				styles,
 			};
 		}`
-	default:
+	case inspectKindHTML:
 		return `function() {
 			const el = this;
 			const doc = el.ownerDocument || document;
@@ -292,46 +255,22 @@ func inspectFunctionDeclaration(kind inspectKind) string {
 				html: el.outerHTML || '',
 			};
 		}`
+	default:
+		// title / url: no outerHTML.
+		return `function() {
+			const el = this;
+			const doc = el.ownerDocument || document;
+			const win = doc.defaultView || window;
+			return {
+				title: doc.title || '',
+				url: String(doc.location ? doc.location.href : win.location.href),
+			};
+		}`
 	}
 }
 
 func (h *Handlers) evalInspectExpression(ctx context.Context, frameID, expr string, out any) error {
-	if frameID == "" {
-		return h.evalRuntime(ctx, expr, out)
-	}
-	execID, err := bridge.FrameExecutionContextID(ctx, frameID)
-	if err != nil {
-		return fmt.Errorf("resolve frame context: %w", err)
-	}
-	var raw json.RawMessage
-	err = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return chromedp.FromContext(ctx).Target.Execute(ctx, "Runtime.evaluate", map[string]any{
-			"expression":    expr,
-			"returnByValue": true,
-			"contextId":     execID,
-		}, &raw)
-	}))
-	if err != nil {
-		return err
-	}
-	var result struct {
-		Result struct {
-			Value json.RawMessage `json:"value"`
-		} `json:"result"`
-		ExceptionDetails *struct {
-			Text string `json:"text"`
-		} `json:"exceptionDetails,omitempty"`
-	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return fmt.Errorf("inspect parse: %w", err)
-	}
-	if result.ExceptionDetails != nil && result.ExceptionDetails.Text != "" {
-		return fmt.Errorf("%s", result.ExceptionDetails.Text)
-	}
-	if len(result.Result.Value) == 0 {
-		return nil
-	}
-	return json.Unmarshal(result.Result.Value, out)
+	return h.Bridge.EvaluateInFrame(ctx, frameID, expr, out, bridge.EvalOpts{})
 }
 
 func parsePositiveInt(raw string) int {
@@ -359,19 +298,4 @@ func sortCSSMap(css map[string]any) map[string]any {
 		out[k] = css[k]
 	}
 	return out
-}
-
-func (h *Handlers) forwardInspectTabRoute(w http.ResponseWriter, r *http.Request, next func(http.ResponseWriter, *http.Request)) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
-		return
-	}
-	q := r.URL.Query()
-	q.Set("tabId", tabID)
-	req := r.Clone(r.Context())
-	u := *r.URL
-	u.RawQuery = q.Encode()
-	req.URL = &u
-	next(w, req)
 }

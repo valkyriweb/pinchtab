@@ -1,24 +1,44 @@
 package scheduler
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
 	"github.com/pinchtab/pinchtab/internal/activity"
+	"github.com/pinchtab/pinchtab/internal/config"
 )
+
+// ActivitySink records one activity event per dispatched task into the process
+// recorder that feeds the dashboard stream.
+type ActivitySink interface {
+	Enabled() bool
+	Record(activity.Event) error
+}
 
 // InstanceResolver finds the localhost port for a given tab ID.
 type InstanceResolver interface {
 	ResolveTabInstance(tabID string) (port string, err error)
+}
+
+// RequestAuthorizer applies per-instance hop auth (bearer token, plus the internal token on
+// trusted child hops) to a request bound for the instance that owns tabID, so the instance
+// honors the X-PinchTab-* identity headers instead of stripping them at ingress. The
+// orchestrator implements it; the scheduler must not read the token itself. A resolver that
+// does not implement it leaves the request unauthorized and the action records as "client".
+type RequestAuthorizer interface {
+	AuthorizeTabRequest(tabID string, req *http.Request) error
+}
+
+// NewActionExecutor builds the executor that dispatches a task to an instance's action
+// endpoint, using resolver for port resolution and, when it also implements RequestAuthorizer,
+// for hop auth. Exposed so a test can drive a scheduler-executed action with a real resolver.
+func NewActionExecutor(resolver InstanceResolver) TaskExecutor {
+	return &actionEndpointExecutor{resolver: resolver, client: &http.Client{Timeout: 60 * time.Second}}
 }
 
 // Config holds scheduler tuning knobs.
@@ -35,18 +55,59 @@ type Config struct {
 	WatcherInterval   time.Duration `json:"watcherInterval"`
 }
 
-// DefaultConfig returns safe defaults.
+// DefaultConfig returns safe defaults. The knobs an operator can set live in
+// internal/config, which owns their defaults and reports them through `config get`;
+// only the one this package does not expose as a config key is written here.
 func DefaultConfig() Config {
+	out := ConfigFromRuntime(config.DefaultSchedulerConfig())
+	out.WatcherInterval = 30 * time.Second
+	return out
+}
+
+// ConfigFromRuntime maps the operator-facing scheduler settings onto this package's
+// Config. It is the one place that conversion happens, so the seconds-to-duration
+// step cannot drift between callers.
+func ConfigFromRuntime(s config.SchedulerConfig) Config {
 	return Config{
-		Strategy:          "fair-fifo",
-		MaxQueueSize:      1000,
-		MaxPerAgent:       100,
-		MaxInflight:       20,
-		MaxPerAgentFlight: 10,
-		ResultTTL:         5 * time.Minute,
-		WorkerCount:       4,
-		MaxBatchSize:      50,
-		WatcherInterval:   30 * time.Second,
+		Enabled:           s.Enabled,
+		Strategy:          s.Strategy,
+		MaxQueueSize:      s.MaxQueueSize,
+		MaxPerAgent:       s.MaxPerAgent,
+		MaxInflight:       s.MaxInflight,
+		MaxPerAgentFlight: s.MaxPerAgentFlight,
+		ResultTTL:         time.Duration(s.ResultTTLSec) * time.Second,
+		WorkerCount:       s.WorkerCount,
+		MaxBatchSize:      s.MaxBatchSize,
+	}
+}
+
+// withDefaults fills every knob left at or below zero. A configured zero has always
+// meant "use the default" here, never unlimited.
+func withDefaults(cfg *Config) {
+	defaults := DefaultConfig()
+	if cfg.Strategy == "" {
+		cfg.Strategy = defaults.Strategy
+	}
+	for _, knob := range []struct {
+		value    *int
+		fallback int
+	}{
+		{&cfg.MaxQueueSize, defaults.MaxQueueSize},
+		{&cfg.MaxPerAgent, defaults.MaxPerAgent},
+		{&cfg.MaxInflight, defaults.MaxInflight},
+		{&cfg.MaxPerAgentFlight, defaults.MaxPerAgentFlight},
+		{&cfg.WorkerCount, defaults.WorkerCount},
+		{&cfg.MaxBatchSize, defaults.MaxBatchSize},
+	} {
+		if *knob.value <= 0 {
+			*knob.value = knob.fallback
+		}
+	}
+	if cfg.ResultTTL <= 0 {
+		cfg.ResultTTL = defaults.ResultTTL
+	}
+	if cfg.WatcherInterval <= 0 {
+		cfg.WatcherInterval = defaults.WatcherInterval
 	}
 }
 
@@ -56,18 +117,16 @@ type Scheduler struct {
 	cfgMu    sync.RWMutex
 	queue    *TaskQueue
 	results  *ResultStore
-	resolver InstanceResolver
-	client   *http.Client
+	executor TaskExecutor
+	activity ActivitySink
 	metrics  *Metrics
 
 	// tracks all live tasks (queued + in-flight) for lookup by ID.
 	live   map[string]*Task
 	liveMu sync.RWMutex
 
-	// webhookSem bounds the number of concurrent webhook delivery goroutines.
-	webhookSem chan struct{}
+	webhooks *webhookDispatcher
 
-	// cancellation
 	cancels   map[string]context.CancelFunc
 	cancelsMu sync.Mutex
 
@@ -78,44 +137,22 @@ type Scheduler struct {
 	noAutoStart bool // testing only: suppress ensureRunning from Submit
 }
 
-// New creates a scheduler with the given config and instance resolver.
-func New(cfg Config, resolver InstanceResolver) *Scheduler {
-	if cfg.MaxQueueSize <= 0 {
-		cfg.MaxQueueSize = 1000
-	}
-	if cfg.MaxPerAgent <= 0 {
-		cfg.MaxPerAgent = 100
-	}
-	if cfg.MaxInflight <= 0 {
-		cfg.MaxInflight = 20
-	}
-	if cfg.MaxPerAgentFlight <= 0 {
-		cfg.MaxPerAgentFlight = 10
-	}
-	if cfg.ResultTTL <= 0 {
-		cfg.ResultTTL = 5 * time.Minute
-	}
-	if cfg.WorkerCount <= 0 {
-		cfg.WorkerCount = 4
-	}
-	if cfg.MaxBatchSize <= 0 {
-		cfg.MaxBatchSize = 50
-	}
-	if cfg.WatcherInterval <= 0 {
-		cfg.WatcherInterval = 30 * time.Second
-	}
+// New creates a scheduler with the given config, instance resolver, and activity
+// sink. A nil sink disables per-task activity recording.
+func New(cfg Config, resolver InstanceResolver, sink ActivitySink) *Scheduler {
+	withDefaults(&cfg)
 
 	return &Scheduler{
-		cfg:        cfg,
-		queue:      NewTaskQueue(cfg.MaxQueueSize, cfg.MaxPerAgent),
-		results:    NewResultStore(cfg.ResultTTL),
-		resolver:   resolver,
-		client:     &http.Client{Timeout: 60 * time.Second},
-		metrics:    newMetrics(),
-		live:       make(map[string]*Task),
-		cancels:    make(map[string]context.CancelFunc),
-		stopCh:     make(chan struct{}),
-		webhookSem: make(chan struct{}, 16),
+		cfg:      cfg,
+		queue:    NewTaskQueue(cfg.MaxQueueSize, cfg.MaxPerAgent),
+		results:  NewResultStore(cfg.ResultTTL),
+		executor: NewActionExecutor(resolver),
+		activity: sink,
+		metrics:  newMetrics(),
+		live:     make(map[string]*Task),
+		cancels:  make(map[string]context.CancelFunc),
+		stopCh:   make(chan struct{}),
+		webhooks: newWebhookDispatcher(16),
 	}
 }
 
@@ -192,6 +229,7 @@ func (s *Scheduler) Submit(req SubmitRequest) (*Task, error) {
 		AgentID:     req.AgentID,
 		Action:      req.Action,
 		TabID:       req.TabID,
+		Selector:    req.Selector,
 		Ref:         req.Ref,
 		Params:      req.Params,
 		Priority:    req.Priority,
@@ -203,7 +241,10 @@ func (s *Scheduler) Submit(req SubmitRequest) (*Task, error) {
 
 	pos, err := s.queue.Enqueue(t)
 	if err != nil {
-		t.State = StateRejected
+		// Route through SetState so the reject is stamped (CompletedAt) like
+		// other terminal states; the Queued→Rejected transition is always valid
+		// here, so the error is intentionally ignored.
+		_ = t.SetState(StateRejected)
 		t.Error = err.Error()
 		s.results.Store(t)
 		s.metrics.recordReject(req.AgentID)
@@ -318,6 +359,15 @@ func (s *Scheduler) worker(id int) {
 }
 
 func (s *Scheduler) dispatch(t *Task) {
+	// The in-flight slot belongs to the dequeue that produced this task, so it is
+	// released here and nowhere else: finishTask also runs for tasks that expired
+	// or were cancelled while QUEUED, which never took a slot, and for a running
+	// task that was cancelled, whose slot this dispatch is still holding. Releasing
+	// there decremented another task's count, and the count is what bounds both
+	// MaxPerAgentFlight and MaxInflight. Deferred so every exit path — including a
+	// panic in an executor — gives the slot back.
+	defer s.queue.Complete(t.AgentID)
+
 	dispatchStart := timeNow()
 
 	if err := t.SetState(StateAssigned); err != nil {
@@ -349,7 +399,7 @@ func (s *Scheduler) dispatch(t *Task) {
 	slog.Info("task running", "task", t.ID, "agent", t.AgentID)
 	s.results.Store(t)
 
-	result, execErr := s.executeTask(ctx, t)
+	result, execErr := s.executor.Execute(ctx, t)
 
 	latency := timeNow().Sub(dispatchStart)
 	s.metrics.recordDispatchLatency(latency)
@@ -370,94 +420,52 @@ func (s *Scheduler) dispatch(t *Task) {
 		slog.Info("task completed", "task", t.ID, "agent", t.AgentID, "action", t.Action, "latencyMs", latency.Milliseconds())
 	}
 
+	s.recordActivity(t, execErr, latency)
 	s.finishTask(t)
 }
 
-func (s *Scheduler) executeTask(ctx context.Context, t *Task) (any, error) {
-	if t.TabID == "" {
-		return nil, fmt.Errorf("tabId is required for task execution")
+func (s *Scheduler) recordActivity(t *Task, execErr error, latency time.Duration) {
+	if s.activity == nil || !s.activity.Enabled() {
+		return
 	}
-
-	port, err := s.resolver.ResolveTabInstance(t.TabID)
-	if err != nil {
-		return nil, fmt.Errorf("could not resolve tab %q: %w", t.TabID, err)
+	status := http.StatusOK
+	var errMsg string
+	if execErr != nil {
+		status = http.StatusBadGateway
+		errMsg = execErr.Error()
+		var upstream *InstanceError
+		if errors.As(execErr, &upstream) {
+			status = upstream.Status
+		}
 	}
-
-	// Build the request body matching the immediate-path action format.
-	body := map[string]any{
-		"kind": t.Action,
+	if err := s.activity.Record(activity.Event{
+		Timestamp:  timeNow().UTC(),
+		Source:     activity.SourceScheduler,
+		AgentID:    t.AgentID,
+		Method:     http.MethodPost,
+		Path:       fmt.Sprintf("/tabs/%s/action", t.TabID),
+		Status:     status,
+		DurationMs: latency.Milliseconds(),
+		TabID:      t.TabID,
+		Action:     t.Action,
+		Ref:        t.Ref,
+		Error:      errMsg,
+	}); err != nil {
+		slog.Warn("scheduler activity recording failed", "task", t.ID, "err", err)
 	}
-	if t.Ref != "" {
-		body["ref"] = t.Ref
-	}
-	for k, v := range t.Params {
-		body[k] = v
-	}
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode task body: %w", err)
-	}
-
-	targetURL := &url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort("localhost", port),
-		Path:   fmt.Sprintf("/tabs/%s/action", t.TabID),
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL.String(), bytes.NewReader(payload))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(activity.HeaderPTSource, "scheduler")
-	req.Header.Set(activity.HeaderPTTabID, t.TabID)
-	if t.AgentID != "" {
-		req.Header.Set(activity.HeaderAgentID, t.AgentID)
-	}
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executor request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read executor response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("executor returned %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result any
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return string(respBody), nil
-	}
-	return result, nil
 }
 
+// finishTask publishes a task's terminal state. It does NOT release an in-flight
+// slot: it is reached from the deadline reaper and from Cancel for tasks that were
+// still queued, and dispatch owns the slot for the ones that were not.
 func (s *Scheduler) finishTask(t *Task) {
 	s.results.Store(t)
-	s.queue.Complete(t.AgentID)
 
 	s.liveMu.Lock()
 	delete(s.live, t.ID)
 	s.liveMu.Unlock()
 
-	// Fire webhook asynchronously if configured.
-	if t.CallbackURL != "" && t.GetState().IsTerminal() {
-		select {
-		case s.webhookSem <- struct{}{}:
-			go func() {
-				defer func() { <-s.webhookSem }()
-				sendWebhook(t.CallbackURL, t)
-			}()
-		default:
-			slog.Warn("webhook: too many in-flight deliveries, dropping", "task", t.ID)
-		}
-	}
+	s.webhooks.fire(t)
 }
 
 func (s *Scheduler) deadlineReaper() {

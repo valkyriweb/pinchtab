@@ -3,52 +3,68 @@ package orchestrator
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/pinchtab/pinchtab/internal/api/types"
 	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/config"
+	"github.com/pinchtab/pinchtab/internal/httpx"
 	"github.com/pinchtab/pinchtab/internal/ids"
 	"github.com/pinchtab/pinchtab/internal/instance"
 	"github.com/pinchtab/pinchtab/internal/profiles"
-	internalurls "github.com/pinchtab/pinchtab/internal/urls"
 )
 
-// InstanceEvent is emitted when instance state changes.
 type InstanceEvent struct {
 	Type     string           `json:"type"` // "instance.started", "instance.stopped", "instance.error"
 	Instance *bridge.Instance `json:"instance"`
 }
 
-// EventHandler receives instance lifecycle events.
 type EventHandler func(InstanceEvent)
 
 type Orchestrator struct {
-	instances      map[string]*InstanceInternal
-	baseDir        string
-	binary         string
-	profiles       *profiles.ProfileManager
-	runner         HostRunner
-	mu             sync.RWMutex
-	client         *http.Client
-	childAuthToken string
-	allowEvaluate  bool
-	internalToken  string
-	bindings       *Bindings
+	instances     map[string]*InstanceInternal
+	crashes       map[string]bridge.CrashSummary
+	refreshMu     sync.Mutex
+	refreshDone   chan struct{}
+	baseDir       string
+	binary        string
+	profiles      *profiles.ProfileManager
+	runner        HostRunner
+	mu            sync.RWMutex
+	client        *http.Client
+	internalToken string
+	bindings      *Bindings
+	// detachedStops tracks async failed-attempt teardowns so tests (and
+	// shutdown paths) can wait for them instead of leaking goroutines that
+	// race with stubbed package vars.
+	detachedStops sync.WaitGroup
+	sessionCloses sync.WaitGroup
+
+	sessionCloseMu      sync.Mutex
+	sessionCloseCtx     context.Context
+	cancelSessionCloses context.CancelFunc
+	sessionCloseSlotSem chan struct{}
+	sessionClosesEnded  bool
+
+	// monitors tracks the per-instance startup monitors for the same reason.
+	// A monitor writes instance state for up to instanceStartupTimeout after
+	// launch, so one that outlives its orchestrator keeps touching memory the
+	// owner has finished with — and, in tests, package vars the test has already
+	// restored. Shutdown waits on this.
+	monitors sync.WaitGroup
+
+	// shutdownCh is closed once, by Shutdown, to cut short in-flight startup
+	// probes. Without it, waiting on monitors would mean waiting out the full
+	// instanceStartupTimeout for any instance still starting.
+	//
+	// Nil when an Orchestrator is built as a bare struct literal rather than
+	// through the constructor, which some tests do. A nil channel is never
+	// ready, so every select below simply falls through to its other case.
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
 
 	// strictCrossInstanceTab toggles the cross-instance explicit-tab rule.
 	// When false (default), a request that targets a tab on a different
@@ -59,16 +75,18 @@ type Orchestrator struct {
 
 	// tabsCache stores per-instance snapshots of /tabs results to absorb
 	// repeated dashboard visibility queries. Routing never reads it.
-	tabsCache     *TabsCache
-	portAllocator *PortAllocator
-	idMgr         *ids.Manager
-	eventHandlers []EventHandler
-	instanceMgr   *instance.Manager
-	runtimeCfg    *config.RuntimeConfig
+	tabsCache        *TabsCache
+	portAllocator    *PortAllocator
+	idMgr            *ids.Manager
+	eventHandlers    []EventHandler
+	instanceMgr      *instance.Manager
+	live             config.Live
+	fallbackLauncher Launcher
+
+	// attachHealthCheckTimeout overrides the default health-check timeout in tests.
+	attachHealthCheckTimeout time.Duration
 }
 
-// OnEvent adds an event handler for instance lifecycle events.
-// Multiple handlers can be registered; all will be called in order.
 func (o *Orchestrator) OnEvent(handler EventHandler) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -86,8 +104,6 @@ func (o *Orchestrator) emitEvent(eventType string, inst *bridge.Instance) {
 	}
 }
 
-// EmitEvent allows external components (e.g. strategies) to broadcast
-// lifecycle events through the orchestrator's event system.
 func (o *Orchestrator) EmitEvent(eventType string, inst *bridge.Instance) {
 	o.emitEvent(eventType, inst)
 }
@@ -103,11 +119,33 @@ type InstanceInternal struct {
 	logBuf    *ringBuffer
 
 	requestedSecurityPolicy *bridge.SecurityPolicy
+
+	requestedProvider string
+	browser           string
+	effectiveBinary   string
+
+	lastFailureReason LaunchFailureReason
 }
 
 type LaunchOptions struct {
 	ExtensionPaths []string
 	SecurityPolicy *bridge.SecurityPolicy
+
+	RequestedProvider string
+	Browser           string
+	// TargetName is the resolved browser target name. When set,
+	// LaunchWithOptions uses this exact target's config instead of
+	// re-deriving a target from Browser — with several targets sharing a
+	// provider, re-derivation picks the wrong one.
+	TargetName string
+}
+
+type AttachOptions struct {
+	Browser string
+}
+
+var waitForChildBridgeHealthyFunc = func(o *Orchestrator, inst *InstanceInternal, timeout time.Duration) error {
+	return o.waitForChildBridgeHealthy(inst, timeout)
 }
 
 // generateInternalToken returns a random hex string used as the shared
@@ -129,81 +167,65 @@ func NewOrchestrator(baseDir string) *Orchestrator {
 }
 
 func NewOrchestratorWithRunner(baseDir string, runner HostRunner) *Orchestrator {
-	binDir := filepath.Join(filepath.Dir(baseDir), "bin")
-	stableBin := filepath.Join(binDir, "pinchtab")
-	exe, _ := os.Executable()
-	binary := exe
-	if binary == "" {
-		binary = os.Args[0]
-	}
-
-	if err := os.MkdirAll(binDir, 0755); err != nil {
-		slog.Warn("failed to create bin directory", "path", binDir, "err", err)
-	}
-
-	if exe != "" {
-		if err := installStableBinary(exe, stableBin); err != nil {
-			slog.Warn("failed to install pinchtab binary", "path", stableBin, "err", err)
-		} else {
-			slog.Debug("installed pinchtab binary", "path", stableBin)
-		}
-	}
-
-	if _, err := os.Stat(binary); err != nil {
-		if _, stableErr := os.Stat(stableBin); stableErr == nil {
-			binary = stableBin
-		}
-	}
-
 	orch := &Orchestrator{
-		instances: make(map[string]*InstanceInternal),
-		baseDir:   baseDir,
-		binary:    binary,
-		runner:    runner,
-		// Client timeout for proxying to instances: 60 seconds
-		// Why so high?
-		// - First request to an instance triggers lazy Chrome initialization (8-20+ seconds)
-		// - Navigation can take up to 60s (NavigateTimeout in bridge config)
-		// - Proxied requests (e.g., POST /tabs/{tabId}/navigate) must wait for:
-		//   1. Instance /health handler to initialize Chrome (via ensureChrome())
-		//   2. Tab operations to complete (navigate, snapshot, actions, etc.)
-		// - Short timeout (<5s) would break first-request scenarios
-		// See: internal/orchestrator/health.go (monitor), internal/bridge/init.go (InitChrome)
-		client:         &http.Client{Timeout: 60 * time.Second},
-		childAuthToken: "",
-		allowEvaluate:  false,
-		internalToken:  generateInternalToken(),
-		bindings:       NewBindings(nil),
-		tabsCache:      NewTabsCache(0, nil),
-		portAllocator:  NewPortAllocator(9868, 9968),
-		idMgr:          ids.NewManager(),
+		instances:     make(map[string]*InstanceInternal),
+		baseDir:       baseDir,
+		binary:        resolveStableBinary(baseDir),
+		runner:        runner,
+		client:        &http.Client{Timeout: httpx.MaxNavigationHTTPDuration},
+		internalToken: generateInternalToken(),
+		bindings:      NewBindings(nil),
+		tabsCache:     NewTabsCache(0, nil),
+		portAllocator: NewPortAllocator(9868, 9968),
+		idMgr:         ids.NewManager(),
+		shutdownCh:    make(chan struct{}),
 	}
 
-	// Drop identity → instance bindings and any cached tab snapshots when
-	// an instance stops or errors so a restarted instance does not keep
-	// receiving routed traffic and dashboards do not show ghost tabs.
-	orch.OnEvent(func(evt InstanceEvent) {
-		switch evt.Type {
-		case "instance.stopped", "instance.error":
-			if evt.Instance != nil {
-				orch.bindings.ClearInstance(evt.Instance.ID)
-				orch.tabsCache.Invalidate(evt.Instance.ID)
-			}
-		}
-	})
-
-	bridgeClient := instance.NewBridgeClient()
-	orch.instanceMgr = instance.NewManager(
-		&orchestratorLauncher{orch: orch},
-		bridgeClient,
-	)
+	orch.registerInstanceCleanupHook()
+	orch.initInstanceManager()
 
 	return orch
 }
 
-// RunMaintenance runs periodic background maintenance tasks for the
-// orchestrator (currently: pruning idle agent bindings). Returns when ctx
-// is cancelled.
+// registerInstanceCleanupHook drops identity → instance bindings and any cached
+// tab snapshots when an instance stops or errors, so a restarted instance does
+// not keep receiving routed traffic and dashboards do not show ghost tabs.
+func (o *Orchestrator) registerInstanceCleanupHook() {
+	o.OnEvent(func(evt InstanceEvent) {
+		switch evt.Type {
+		case "instance.stopped", "instance.error":
+			if evt.Instance != nil {
+				o.bindings.ClearInstance(evt.Instance.ID)
+				o.tabsCache.Invalidate(evt.Instance.ID)
+			}
+		}
+	})
+}
+
+func (o *Orchestrator) initInstanceManager() {
+	bridgeClient := instance.NewBridgeClientWithAuth(o.authorizeInstanceRequest)
+	o.instanceMgr = instance.NewManager(
+		&orchestratorLauncher{orch: o},
+		bridgeClient,
+	)
+}
+
+// authorizeInstanceRequest stamps the target instance's own credential on a
+// request the instance manager built for it. A spawned instance runs the same
+// auth middleware as this process, so a bare call to its /tabs is answered 401 —
+// which the locator's discovery swallowed at debug level, leaving the tab→instance
+// cache to be filled only by lookups that had already succeeded some other way.
+//
+// Resolved per request rather than closed over one token because an attached
+// external bridge authenticates with its own, which applyInstanceAuth knows and a
+// captured server token would not.
+func (o *Orchestrator) authorizeInstanceRequest(req *http.Request) {
+	if o == nil || req == nil {
+		return
+	}
+	o.applyInstanceAuth(req, o.proxyTargetInstance(req.URL))
+}
+
 func (o *Orchestrator) RunMaintenance(ctx context.Context) {
 	if o == nil {
 		return
@@ -220,13 +242,22 @@ func (o *Orchestrator) RunMaintenance(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			o.bindings.PruneAgents(idleTTL, maxAgent)
+			o.runMaintenanceOnce(idleTTL, maxAgent)
 		}
 	}
 }
 
-// Bindings returns the identity → instance binding map. Exposed for tests
-// and for handlers that need to inspect routing state.
+// runMaintenanceOnce bounds the caches that nothing else prunes. Agent bindings
+// have no lifecycle signal, and the tab→instance cache misses every tab that
+// closes without passing through the proxy — bridge-side idle eviction and
+// window.close() among them — so both need periodic reconciliation.
+func (o *Orchestrator) runMaintenanceOnce(idleTTL time.Duration, maxAgent int) {
+	o.bindings.PruneAgents(idleTTL, maxAgent)
+	if o.instanceMgr != nil {
+		o.instanceMgr.Locator.RefreshAll()
+	}
+}
+
 func (o *Orchestrator) Bindings() *Bindings {
 	if o == nil {
 		return nil
@@ -234,8 +265,15 @@ func (o *Orchestrator) Bindings() *Bindings {
 	return o.bindings
 }
 
-// SetStrictCrossInstanceTab toggles strict cross-instance handling. See
-// the strictCrossInstanceTab field for semantics.
+// SessionTabIDs reports tabs created for a session and still present in the
+// orchestrator's ownership ledger.
+func (o *Orchestrator) SessionTabIDs(sessionID string) []string {
+	if o == nil || o.bindings == nil {
+		return []string{}
+	}
+	return o.bindings.SessionTabIDs(sessionID)
+}
+
 func (o *Orchestrator) SetStrictCrossInstanceTab(strict bool) {
 	if o == nil {
 		return
@@ -245,12 +283,10 @@ func (o *Orchestrator) SetStrictCrossInstanceTab(strict bool) {
 	o.mu.Unlock()
 }
 
-// InstanceManager returns the decomposed instance manager.
 func (o *Orchestrator) InstanceManager() *instance.Manager {
 	return o.instanceMgr
 }
 
-// SetAllocationPolicy changes the allocation policy at runtime.
 func (o *Orchestrator) SetAllocationPolicy(name string) error {
 	return o.instanceMgr.SetAllocationPolicy(name)
 }
@@ -278,15 +314,14 @@ func (o *Orchestrator) SetProfileManager(pm *profiles.ProfileManager) {
 	o.profiles = pm
 }
 
+// ApplyRuntimeConfig publishes the value every reader will see from here on. The
+// config is never written in place, so publication is a single pointer store and
+// only the derived state that lives outside it needs the lock.
 func (o *Orchestrator) ApplyRuntimeConfig(cfg *config.RuntimeConfig) {
-	o.runtimeCfg = cfg
+	o.live.Publish(cfg)
 	if cfg == nil {
-		o.childAuthToken = ""
-		o.allowEvaluate = false
 		return
 	}
-	o.childAuthToken = cfg.Token
-	o.allowEvaluate = cfg.AllowEvaluate
 	o.SetPortRange(cfg.InstancePortStart, cfg.InstancePortEnd)
 	if cfg.AllocationPolicy != "" {
 		if err := o.SetAllocationPolicy(cfg.AllocationPolicy); err != nil {
@@ -295,837 +330,97 @@ func (o *Orchestrator) ApplyRuntimeConfig(cfg *config.RuntimeConfig) {
 	}
 }
 
+// LiveConfig hands out the publication point so every other holder of the runtime
+// config in this process reads and writes the same one. A save through the
+// dashboard is then visible to the orchestrator's goroutines by construction,
+// rather than by two holders agreeing to mutate one shared object.
+func (o *Orchestrator) LiveConfig() *config.Live {
+	if o == nil {
+		return nil
+	}
+	return &o.live
+}
+
+// cfg is the ONE accessor for the published runtime config. Nothing reads a bare
+// field: a nil Live (a bare struct literal in a test) answers nil, which every
+// caller already handles.
+func (o *Orchestrator) cfg() *config.RuntimeConfig {
+	if o == nil {
+		return nil
+	}
+	return o.live.Get()
+}
+
+// ports is the same discipline for the allocator, which is a swap rather than a
+// publication: SetPortRange replaces it while launches are reading it.
+func (o *Orchestrator) ports() *PortAllocator {
+	if o == nil {
+		return nil
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.portAllocator
+}
+
+// cfgToken is the child auth token: derived from the published config on every
+// read rather than copied into a field, so a reader cannot observe a token that
+// disagrees with the config in effect.
+func (o *Orchestrator) cfgToken() string {
+	cfg := o.cfg()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.Token
+}
+
 func (o *Orchestrator) AllowsEvaluate() bool {
-	return o != nil && o.allowEvaluate
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowEvaluate
 }
 
 func (o *Orchestrator) AllowsMacro() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowMacro
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowMacro
 }
 
 func (o *Orchestrator) AllowsScreencast() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowScreencast
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowScreencast
 }
 
 func (o *Orchestrator) AllowsDownload() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowDownload
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowDownload
 }
 
 func (o *Orchestrator) AllowsCookies() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowCookies
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowCookies
 }
 
 func (o *Orchestrator) AllowsUpload() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowUpload
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowUpload
 }
 
 func (o *Orchestrator) AllowsStateExport() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowStateExport
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowStateExport
 }
 
 func (o *Orchestrator) AllowsNetworkIntercept() bool {
-	return o != nil && o.runtimeCfg != nil && o.runtimeCfg.AllowNetworkIntercept
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowNetworkIntercept
+}
+
+func (o *Orchestrator) AllowsMemory() bool {
+	cfg := o.cfg()
+	return cfg != nil && cfg.AllowMemory
 }
 
 func (o *Orchestrator) SetPortRange(start, end int) {
-	o.portAllocator = NewPortAllocator(start, end)
-}
-
-func installStableBinary(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-
-	_, err = io.Copy(out, in)
-	return err
-}
-
-func (o *Orchestrator) Launch(name, port string, headless bool, extensionPaths []string) (*bridge.Instance, error) {
-	return o.LaunchWithOptions(name, port, headless, LaunchOptions{
-		ExtensionPaths: extensionPaths,
-	})
-}
-
-func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts LaunchOptions) (*bridge.Instance, error) {
-	o.mu.RLock()
-	policyEnabled := o.runtimeCfg != nil && o.runtimeCfg.TransactionPolicy.Enabled
-	o.mu.RUnlock()
-	if policyEnabled && len(opts.ExtensionPaths) > 0 {
-		return nil, fmt.Errorf("request-supplied extensionPaths are not allowed while transaction policy is enabled")
-	}
-	// Validate profile name to prevent path traversal attacks
-	if err := profiles.ValidateProfileName(name); err != nil {
-		return nil, err
-	}
-	reservedPorts := make([]int, 0, 2)
-	defer func() {
-		for _, reserved := range reservedPorts {
-			o.portAllocator.ReleasePort(reserved)
-		}
-	}()
-
-	o.mu.Lock()
-
-	if port == "" || port == "0" {
-		o.mu.Unlock()
-		allocatedPort, err := o.portAllocator.AllocatePort()
-		if err != nil {
-			return nil, fmt.Errorf("failed to allocate port: %w", err)
-		}
-		port = fmt.Sprintf("%d", allocatedPort)
-		reservedPorts = append(reservedPorts, allocatedPort)
-		o.mu.Lock()
-	} else {
-		o.mu.Unlock()
-		portInt, err := parsePortNumber(port)
-		if err != nil {
-			return nil, err
-		}
-		port = strconv.Itoa(portInt)
-		if err := o.portAllocator.ReservePort(portInt); err != nil {
-			return nil, fmt.Errorf("failed to reserve port %s: %w", port, err)
-		}
-		if portInt >= o.portAllocator.start && portInt <= o.portAllocator.end {
-			reservedPorts = append(reservedPorts, portInt)
-		}
-		o.mu.Lock()
-	}
-
-	for _, inst := range o.instances {
-		if inst.Port == port && instanceIsActive(inst) {
-			o.mu.Unlock()
-			return nil, fmt.Errorf("port %s already in use by instance %q", port, inst.ProfileName)
-		}
-		if inst.ProfileName == name && instanceIsActive(inst) {
-			o.mu.Unlock()
-			return nil, fmt.Errorf("profile %q already has an active instance (%s)", name, inst.Status)
-		}
-	}
-	portInspection := o.runner.InspectPort(port)
-	if !portInspection.Available {
-		o.mu.Unlock()
-		err := portConflictError(port, portInspection)
-		slog.Error("instance launch blocked by port conflict", "profile", name, "port", port, "pid", portInspection.PID, "command", portInspection.Command, "error", err.Error())
-		return nil, err
-	}
-
-	profileID := o.idMgr.ProfileID(name)
-	instanceID := o.idMgr.InstanceID(profileID, name)
-
-	if inst, ok := o.instances[instanceID]; ok && inst.Status == "running" {
-		o.mu.Unlock()
-		return nil, fmt.Errorf("instance already running for profile %q", name)
-	}
-
-	o.mu.Unlock()
-
-	cdpPort, err := o.portAllocator.AllocatePort()
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate chrome debug port: %w", err)
-	}
-	reservedPorts = append(reservedPorts, cdpPort)
-
-	profilePath := filepath.Join(o.baseDir, name)
-	if o.profiles != nil {
-		if resolvedPath, err := o.profiles.ProfilePath(name); err == nil {
-			profilePath = resolvedPath
-		}
-	}
-	if err := os.MkdirAll(filepath.Join(profilePath, "Default"), 0755); err != nil {
-		return nil, fmt.Errorf("create profile dir: %w", err)
-	}
-	instanceStateDir := filepath.Join(profilePath, ".pinchtab-state")
-	if err := os.MkdirAll(instanceStateDir, 0700); err != nil {
-		return nil, fmt.Errorf("create state dir: %w", err)
-	}
-	if err := os.Chmod(instanceStateDir, 0700); err != nil {
-		return nil, fmt.Errorf("set state dir permissions: %w", err)
-	}
-
-	requestedPolicy := cloneSecurityPolicy(opts.SecurityPolicy)
-	effectivePolicy := effectiveSecurityPolicy(o.runtimeCfg, requestedPolicy)
-
-	childConfigPath, err := o.writeChildConfig(port, cdpPort, profilePath, instanceStateDir, headless, opts.ExtensionPaths, effectivePolicy)
-	if err != nil {
-		return nil, fmt.Errorf("write child config: %w", err)
-	}
-
-	envOverrides := map[string]string{
-		"PINCHTAB_PORT":   port,
-		"PINCHTAB_CONFIG": childConfigPath,
-	}
-	if o.internalToken != "" {
-		envOverrides["PINCHTAB_INTERNAL_TOKEN"] = o.internalToken
-	}
-	// filterEnvWithPrefixes strips ALL PINCHTAB_-prefixed vars from the parent
-	// environment before spawning the per-instance child process, so runtime
-	// container-compatibility overrides (e.g. the no-sandbox flag needed under
-	// containerd/CRI-O, which lack a Docker-only /.dockerenv marker) must be
-	// explicitly re-forwarded here or every profile-managed instance silently
-	// loses them, even though the top-level always-on bridge process (which
-	// inherits the full container env directly) keeps working fine.
-	if v := os.Getenv(config.ChromeNoSandboxEnvVar()); v != "" {
-		envOverrides[config.ChromeNoSandboxEnvVar()] = v
-	}
-	env := mergeEnvWithOverrides(filterEnvWithPrefixes(os.Environ(), "PINCHTAB_"), envOverrides)
-
-	logBuf := newRingBuffer(256 * 1024)
-	slog.Info("starting instance process", "id", instanceID, "profile", name, "port", port)
-
-	cmd, err := o.runner.Run(context.Background(), o.binary, []string{"bridge"}, env, logBuf, logBuf)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start: %w", err)
-	}
-
-	inst := &InstanceInternal{
-		Instance: bridge.Instance{
-			ID:             instanceID,
-			ProfileID:      profileID,
-			ProfileName:    name,
-			Port:           port,
-			URL:            o.childInstanceBaseURL(port),
-			Mode:           bridge.ModeFromHeadless(headless),
-			Headless:       headless,
-			Status:         "starting",
-			StartTime:      time.Now(),
-			SecurityPolicy: effectivePolicy,
-		},
-		URL:     o.childInstanceBaseURL(port),
-		cdpPort: cdpPort,
-		cmd:     cmd,
-		logBuf:  logBuf,
-
-		requestedSecurityPolicy: requestedPolicy,
-	}
-
-	o.mu.Lock()
-	o.instances[instanceID] = inst
-	o.mu.Unlock()
-	reservedPorts = nil
-
-	go o.monitor(inst)
-
-	return &inst.Instance, nil
-}
-
-func (o *Orchestrator) childInstanceBaseURL(port string) string {
-	host := configuredChildInstanceHost("")
-	if o != nil && o.runtimeCfg != nil {
-		host = configuredChildInstanceHost(o.runtimeCfg.Bind)
-	}
-	return httpBaseURL(host, port)
-}
-
-func portConflictError(port string, inspection PortInspection) error {
-	if inspection.PID > 0 {
-		process := fmt.Sprintf("pid %d", inspection.PID)
-		if command := strings.TrimSpace(inspection.Command); command != "" {
-			process = fmt.Sprintf("%s (%s)", process, command)
-		}
-		if strings.Contains(strings.ToLower(inspection.Command), "pinchtab") {
-			return fmt.Errorf("instance port %s is already in use by %s; stop the stale process and restart PinchTab, for example: kill %d", port, process, inspection.PID)
-		}
-		return fmt.Errorf("instance port %s is already in use by %s; stop the process and restart PinchTab, for example: kill %d", port, process, inspection.PID)
-	}
-	return fmt.Errorf("instance port %s is already in use on this machine", port)
-}
-
-func (o *Orchestrator) writeChildConfig(port string, cdpPort int, profilePath, instanceStateDir string, headless bool, extensionPaths []string, securityPolicy *bridge.SecurityPolicy) (string, error) {
-	fc := config.FileConfigFromRuntime(o.runtimeCfg)
-	fc.Server.Port = port
-	fc.Server.StateDir = instanceStateDir
-	activityEnabled := false
-	fc.Observability.Activity.Enabled = &activityEnabled
-	fc.Browser.ChromeDebugPort = intPtr(cdpPort)
-	fc.Profiles.BaseDir = filepath.Dir(profilePath)
-	fc.Profiles.DefaultProfile = filepath.Base(profilePath)
-	if headless {
-		fc.InstanceDefaults.Mode = "headless"
-	} else {
-		fc.InstanceDefaults.Mode = "headed"
-	}
-	if securityPolicy != nil {
-		fc.Security.AllowedDomains = append([]string(nil), securityPolicy.AllowedDomains...)
-	}
-
-	if len(extensionPaths) > 0 {
-		seen := make(map[string]bool)
-		unique := make([]string, 0, len(fc.Browser.ExtensionPaths)+len(extensionPaths))
-		for _, p := range fc.Browser.ExtensionPaths {
-			if !seen[p] {
-				seen[p] = true
-				unique = append(unique, p)
-			}
-		}
-		for _, p := range extensionPaths {
-			if !seen[p] {
-				seen[p] = true
-				unique = append(unique, p)
-			}
-		}
-		fc.Browser.ExtensionPaths = unique
-	}
-
-	configPath := filepath.Join(instanceStateDir, "config.json")
-	data, err := json.MarshalIndent(fc, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(configPath, data, 0600); err != nil {
-		return "", err
-	}
-	if err := os.Chmod(configPath, 0600); err != nil {
-		return "", err
-	}
-	return configPath, nil
-}
-
-func effectiveSecurityPolicy(cfg *config.RuntimeConfig, requested *bridge.SecurityPolicy) *bridge.SecurityPolicy {
-	var merged []string
-	if cfg != nil {
-		merged = mergeAllowedDomains(merged, cfg.AllowedDomains)
-	}
-	if requested != nil {
-		merged = mergeAllowedDomains(merged, requested.AllowedDomains)
-	}
-	if len(merged) == 0 {
-		return nil
-	}
-	return &bridge.SecurityPolicy{AllowedDomains: merged}
-}
-
-func cloneSecurityPolicy(policy *bridge.SecurityPolicy) *bridge.SecurityPolicy {
-	if policy == nil {
-		return nil
-	}
-	return &bridge.SecurityPolicy{
-		AllowedDomains: append([]string(nil), policy.AllowedDomains...),
-	}
-}
-
-func mergeAllowedDomains(base []string, extras []string) []string {
-	seen := make(map[string]bool, len(base)+len(extras))
-	out := make([]string, 0, len(base)+len(extras))
-	for _, domain := range base {
-		trimmed := strings.TrimSpace(domain)
-		if trimmed == "" || seen[trimmed] {
-			continue
-		}
-		seen[trimmed] = true
-		out = append(out, trimmed)
-	}
-	for _, domain := range extras {
-		trimmed := strings.TrimSpace(domain)
-		if trimmed == "" || seen[trimmed] {
-			continue
-		}
-		seen[trimmed] = true
-		out = append(out, trimmed)
-	}
-	return out
-}
-
-func intPtr(v int) *int {
-	if v <= 0 {
-		return nil
-	}
-	n := v
-	return &n
-}
-
-// attachExternalInstance registers an external instance or updates an existing
-// bridge in place (upsert). Non-bridge duplicates still return an error.
-func (o *Orchestrator) attachExternalInstance(name string, inst bridge.Instance, authToken string) (*bridge.Instance, bool, error) {
-	o.mu.Lock()
-	if o.runtimeCfg != nil && o.runtimeCfg.TransactionPolicy.Enabled {
-		o.mu.Unlock()
-		return nil, false, fmt.Errorf("transaction policy requires a PinchTab-managed browser launch; attached browsers are not protected")
-	}
-	for _, existing := range o.instances {
-		if existing.ProfileName == name && instanceIsActive(existing) {
-			if existing.Attached && inst.AttachType == "bridge" && existing.AttachType == "bridge" {
-				if existing.authToken != "" && subtle.ConstantTimeCompare([]byte(existing.authToken), []byte(authToken)) != 1 {
-					o.mu.Unlock()
-					return nil, false, fmt.Errorf("bridge %q already attached: token mismatch", name)
-				}
-				existing.URL = inst.URL
-				existing.Instance.URL = inst.URL
-				existing.authToken = authToken
-				existing.Status = "running"
-				existing.Error = ""
-				existing.StartTime = time.Now()
-				result := existing.Instance
-				o.mu.Unlock()
-
-				o.syncInstanceToManager(&result)
-				return &result, false, nil
-			}
-			o.mu.Unlock()
-			return nil, false, fmt.Errorf("instance with name %q already exists", name)
-		}
-	}
-	o.mu.Unlock()
-
-	profileID := o.idMgr.ProfileID(name)
-	instanceID := o.idMgr.InstanceID(profileID, name)
-	inst.ID = instanceID
-	inst.ProfileID = profileID
-	inst.ProfileName = name
-	inst.Status = "running"
-	inst.StartTime = time.Now()
-	internal := &InstanceInternal{
-		Instance:  inst,
-		URL:       inst.URL,
-		authToken: authToken,
-	}
-
-	o.mu.Lock()
-	o.instances[instanceID] = internal
-	o.mu.Unlock()
-
-	o.syncInstanceToManager(&internal.Instance)
-	return &internal.Instance, true, nil
-}
-
-// Attach connects to an externally managed Chrome instance via CDP URL.
-// Unlike Launch, this does not start a Chrome process - it only registers
-// the external instance for tracking and proxying.
-func (o *Orchestrator) Attach(name, cdpURL string) (*bridge.Instance, error) {
-	inst, _, err := o.attachExternalInstance(name, bridge.Instance{
-		Attached:   true,
-		AttachType: "cdp",
-		CdpURL:     cdpURL,
-		URL:        cdpURL,
-		Mode:       bridge.ModeFromHeadless(false),
-	}, "")
-	if err != nil {
-		return nil, err
-	}
-
-	slog.Info("attached to external Chrome", "id", inst.ID, "name", name, "cdpUrl", internalurls.RedactForLog(cdpURL))
-
-	// Emit event
-	o.emitEvent("instance.attached", inst)
-	return inst, nil
-}
-
-// AttachBridge registers an already-running bridge server as an attached instance.
-// If a bridge with the same name is already attached, it is updated in place (upsert)
-// provided the caller presents the current bridge token.
-func (o *Orchestrator) AttachBridge(name, baseURL, token string) (*bridge.Instance, bool, error) {
-	normalizedBaseURL := strings.TrimRight(baseURL, "/")
-	if parsed, err := url.Parse(normalizedBaseURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
-		normalizedBaseURL = parsed.Scheme + "://" + parsed.Host
-	}
-
-	inst, created, err := o.attachExternalInstance(name, bridge.Instance{
-		Attached:   true,
-		AttachType: "bridge",
-		URL:        normalizedBaseURL,
-		Mode:       bridge.ModeFromHeadless(false),
-	}, token)
-	if err != nil {
-		return nil, false, err
-	}
-
-	slog.Info("attached to external bridge", "id", inst.ID, "name", name, "url", internalurls.RedactForLog(inst.URL))
-	o.emitEvent("instance.attached", inst)
-	if created {
-		o.mu.RLock()
-		internal := o.instances[inst.ID]
-		o.mu.RUnlock()
-		if internal != nil {
-			go o.monitorAttachedBridge(internal)
-		}
-	}
-	return inst, created, nil
-}
-
-func (o *Orchestrator) Stop(id string) error {
-	o.mu.Lock()
-	inst, ok := o.instances[id]
-	if !ok {
-		o.mu.Unlock()
-		return fmt.Errorf("instance %q not found", id)
-	}
-	if inst.Status == "stopped" && !instanceIsActive(inst) {
-		o.mu.Unlock()
-		o.markStopped(id)
-		return nil
-	}
-	inst.Status = "stopping"
-	o.mu.Unlock()
-
-	if inst.cmd == nil {
-		if inst.AttachType == "bridge" {
-			reqCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			defer cancel()
-			targetURL, targetErr := o.instancePathURL(inst, "/shutdown", "")
-			if targetErr == nil {
-				req, _ := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL.String(), nil)
-				o.applyInstanceAuth(req, inst)
-				if resp, err := o.client.Do(req); err == nil {
-					_ = resp.Body.Close()
-				}
-			}
-		}
-		o.markStopped(id)
-		return nil
-	}
-
-	pid := inst.cmd.PID()
-
-	reqCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	if targetURL, targetErr := o.instancePathURL(inst, "/shutdown", ""); targetErr == nil {
-		req, _ := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL.String(), nil)
-		o.applyInstanceAuth(req, inst)
-		resp, err := o.client.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-		}
-	}
-
-	if pid > 0 {
-		if waitForProcessExit(pid, 5*time.Second) {
-			o.markStopped(id)
-			return nil
-		}
-
-		if err := killProcessGroup(pid, sigTERM); err != nil {
-			slog.Warn("failed to send SIGTERM to instance", "id", id, "pid", pid, "err", err)
-		}
-		if waitForProcessExit(pid, 3*time.Second) {
-			o.markStopped(id)
-			return nil
-		}
-
-		if err := killProcessGroup(pid, sigKILL); err != nil {
-			slog.Warn("failed to send SIGKILL to instance", "id", id, "pid", pid, "err", err)
-		}
-	}
-
-	inst.cmd.Cancel()
-
-	if pid > 0 {
-		if waitForProcessExit(pid, 2*time.Second) {
-			o.markStopped(id)
-			return nil
-		}
-		o.setStopError(id, fmt.Sprintf("failed to stop process %d; still running", pid))
-		return fmt.Errorf("failed to stop instance %q gracefully", id)
-	}
-
-	o.markStopped(id)
-	return nil
-}
-
-func (o *Orchestrator) StopProfile(name string) error {
-	o.mu.RLock()
-	ids := make([]string, 0, 1)
-	for id, inst := range o.instances {
-		if inst.ProfileName == name && instanceIsActive(inst) {
-			ids = append(ids, id)
-		}
-	}
-	o.mu.RUnlock()
-
-	if len(ids) == 0 {
-		return fmt.Errorf("no active instance for profile %q", name)
-	}
-
-	var errs []string
-	for _, id := range ids {
-		if err := o.Stop(id); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("failed to stop profile %q: %s", name, strings.Join(errs, "; "))
-	}
-	return nil
-}
-
-func (o *Orchestrator) markStopped(id string) {
-	o.mu.Lock()
-	inst, ok := o.instances[id]
-	if !ok {
-		o.mu.Unlock()
-		return
-	}
-
-	portStr := inst.Port
-	if portInt, err := strconv.Atoi(portStr); err == nil {
-		o.portAllocator.ReleasePort(portInt)
-		slog.Debug("released port", "id", id, "port", portStr)
-	}
-	if inst.cdpPort > 0 {
-		o.portAllocator.ReleasePort(inst.cdpPort)
-		slog.Debug("released chrome debug port", "id", id, "port", inst.cdpPort)
-	}
-
-	profileName := inst.ProfileName
-	delete(o.instances, id)
-	o.mu.Unlock()
-
-	if o.instanceMgr != nil {
-		o.instanceMgr.Locator.InvalidateInstance(id)
-		o.instanceMgr.Repo.Remove(id)
-	}
-
-	slog.Info("instance stopped and removed", "id", id, "profile", profileName)
-
-	// Kill any orphaned Chrome processes using this profile's directory.
-	// Chrome spawns helpers (GPU, renderer) in their own process groups,
-	// so killing the bridge process group doesn't reach them.
-	profilePath := filepath.Join(o.baseDir, profileName)
-	bridge.CleanupOrphanedChromeProcesses(profilePath)
-
-	if strings.HasPrefix(profileName, "instance-") {
-		profilePath := filepath.Join(o.baseDir, profileName)
-		if err := os.RemoveAll(profilePath); err != nil {
-			slog.Warn("failed to delete temporary profile directory", "name", profileName, "err", err)
-		} else {
-			slog.Info("deleted temporary profile", "name", profileName)
-		}
-
-		if o.profiles != nil {
-			if err := o.profiles.Delete(profileName); err != nil {
-				slog.Warn("failed to delete profile metadata", "name", profileName, "err", err)
-			}
-		}
-	}
-}
-
-func (o *Orchestrator) setStopError(id, msg string) {
+	allocator := NewPortAllocator(start, end)
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if inst, ok := o.instances[id]; ok {
-		inst.Status = "error"
-		inst.Error = msg
-	}
-}
-
-func (o *Orchestrator) List() []bridge.Instance {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-
-	result := make([]bridge.Instance, 0, len(o.instances))
-	for _, inst := range o.instances {
-		copyInst := inst.Instance
-		if instanceIsActive(inst) && copyInst.Status == "stopped" {
-			copyInst.Status = "running"
-		}
-		if !instanceIsActive(inst) &&
-			(copyInst.Status == "starting" || copyInst.Status == "running" || copyInst.Status == "stopping") {
-			copyInst.Status = "stopped"
-		}
-
-		result = append(result, copyInst)
-	}
-	return result
-}
-
-func (o *Orchestrator) Logs(id string) (string, error) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-
-	inst, ok := o.instances[id]
-	if !ok {
-		return "", fmt.Errorf("instance %q not found", id)
-	}
-	if inst.logBuf == nil {
-		return "", nil
-	}
-	return inst.logBuf.String(), nil
-}
-
-func (o *Orchestrator) FirstRunningURL() string {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	// Collect running instances and sort by start time for determinism.
-	// This works for both local launched instances and attached remote bridges.
-	type candidate struct {
-		start time.Time
-		url   string
-	}
-	var candidates []candidate
-	for _, inst := range o.instances {
-		if inst.Status == "running" && instanceIsActive(inst) {
-			if inst.URL == "" {
-				continue
-			}
-			candidates = append(candidates, candidate{start: inst.StartTime, url: inst.URL})
-		}
-	}
-	if len(candidates) == 0 {
-		return ""
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].start.Equal(candidates[j].start) {
-			return candidates[i].url < candidates[j].url
-		}
-		return candidates[i].start.Before(candidates[j].start)
-	})
-	return candidates[0].url
-}
-
-// instanceTabsCached returns the tab list for inst using the per-instance
-// cache. fresh=true forces a bypass and refresh. Returned tabs are
-// InstanceTab-shaped (with InstanceID set) so callers can hand them
-// straight to JSON encoders.
-func (o *Orchestrator) instanceTabsCached(inst *InstanceInternal, fresh bool) ([]bridge.InstanceTab, error) {
-	if inst == nil {
-		return nil, fmt.Errorf("nil instance")
-	}
-	if !fresh {
-		if cached, ok := o.tabsCache.Get(inst.ID); ok {
-			return cached, nil
-		}
-	}
-	tabs, err := o.fetchTabs(inst)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]bridge.InstanceTab, 0, len(tabs))
-	for _, tab := range tabs {
-		out = append(out, bridge.InstanceTab{
-			ID:         tab.ID,
-			InstanceID: inst.ID,
-			URL:        tab.URL,
-			Title:      tab.Title,
-		})
-	}
-	o.tabsCache.Set(inst.ID, out)
-	return out, nil
-}
-
-func (o *Orchestrator) AllTabs() []bridge.InstanceTab {
-	return o.allTabs(false)
-}
-
-func (o *Orchestrator) allTabs(fresh bool) []bridge.InstanceTab {
-	o.mu.RLock()
-	instances := make([]*InstanceInternal, 0)
-	for _, inst := range o.instances {
-		if inst.Status == "running" && instanceIsActive(inst) {
-			instances = append(instances, inst)
-		}
-	}
-	o.mu.RUnlock()
-
-	all := make([]bridge.InstanceTab, 0)
-	for _, inst := range instances {
-		tabs, err := o.instanceTabsCached(inst, fresh)
-		if err != nil {
-			continue
-		}
-		all = append(all, tabs...)
-	}
-	return all
-}
-
-func (o *Orchestrator) AllMetrics() []types.InstanceMetrics {
-	o.mu.RLock()
-	instances := make([]*InstanceInternal, 0)
-	for _, inst := range o.instances {
-		if inst.Status == "running" && instanceIsActive(inst) {
-			instances = append(instances, inst)
-		}
-	}
-	o.mu.RUnlock()
-
-	all := make([]types.InstanceMetrics, 0)
-	for _, inst := range instances {
-		mem, err := o.fetchMetrics(inst)
-		if err != nil || mem == nil {
-			continue
-		}
-		all = append(all, types.InstanceMetrics{
-			InstanceID:    inst.ID,
-			ProfileName:   inst.ProfileName,
-			JSHeapUsedMB:  mem.JSHeapUsedMB,
-			JSHeapTotalMB: mem.JSHeapTotalMB,
-			Documents:     mem.Documents,
-			Frames:        mem.Frames,
-			Nodes:         mem.Nodes,
-			Listeners:     mem.Listeners,
-		})
-	}
-	return all
-}
-
-func (o *Orchestrator) ScreencastURL(instanceID, tabID string) string {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	inst, ok := o.instances[instanceID]
-	if !ok {
-		return ""
-	}
-	target, err := o.instancePathURL(inst, "/screencast", "tabId="+url.QueryEscape(tabID))
-	if err != nil {
-		return ""
-	}
-	switch target.Scheme {
-	case "https":
-		target.Scheme = "wss"
-	default:
-		target.Scheme = "ws"
-	}
-	return target.String()
-}
-
-func (o *Orchestrator) Shutdown() {
-	o.mu.RLock()
-	ids := make([]string, 0, len(o.instances))
-	for id, inst := range o.instances {
-		if instanceIsActive(inst) {
-			ids = append(ids, id)
-		}
-	}
-	o.mu.RUnlock()
-
-	var wg sync.WaitGroup
-	for _, id := range ids {
-		wg.Add(1)
-		go func(instanceID string) {
-			defer wg.Done()
-			slog.Info("stopping instance", "id", instanceID)
-			if err := o.Stop(instanceID); err != nil {
-				slog.Warn("stop instance failed", "id", instanceID, "err", err)
-			}
-		}(id)
-	}
-	wg.Wait()
-}
-
-func (o *Orchestrator) ForceShutdown() {
-	o.mu.RLock()
-	instances := make([]*InstanceInternal, 0, len(o.instances))
-	for _, inst := range o.instances {
-		if instanceIsActive(inst) {
-			instances = append(instances, inst)
-		}
-	}
-	o.mu.RUnlock()
-
-	for _, inst := range instances {
-		pid := 0
-		if inst.cmd != nil {
-			pid = inst.cmd.PID()
-			inst.cmd.Cancel()
-		}
-		if pid > 0 {
-			_ = killProcessGroup(pid, sigKILL)
-		}
-		o.markStopped(inst.ID)
-	}
+	o.portAllocator = allocator
 }

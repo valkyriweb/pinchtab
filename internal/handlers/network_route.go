@@ -3,12 +3,12 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
+	"github.com/pinchtab/pinchtab/internal/routes"
 )
 
 type routeRuleRequest struct {
@@ -64,9 +64,8 @@ func (h *Handlers) HandleNetworkRouteList(w http.ResponseWriter, r *http.Request
 //
 // @Endpoint POST /tabs/{id}/network/route
 func (h *Handlers) HandleTabNetworkRoute(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
+	tabID, ok := requirePathTabID(w, r)
+	if !ok {
 		return
 	}
 	h.handleNetworkRouteFor(w, r, tabID)
@@ -76,9 +75,8 @@ func (h *Handlers) HandleTabNetworkRoute(w http.ResponseWriter, r *http.Request)
 //
 // @Endpoint DELETE /tabs/{id}/network/route
 func (h *Handlers) HandleTabNetworkUnroute(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
+	tabID, ok := requirePathTabID(w, r)
+	if !ok {
 		return
 	}
 	h.handleNetworkUnrouteFor(w, r, tabID)
@@ -88,31 +86,26 @@ func (h *Handlers) HandleTabNetworkUnroute(w http.ResponseWriter, r *http.Reques
 //
 // @Endpoint GET /tabs/{id}/network/route
 func (h *Handlers) HandleTabNetworkRouteList(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
+	tabID, ok := requirePathTabID(w, r)
+	if !ok {
 		return
 	}
 	h.handleNetworkRouteListFor(w, r, tabID)
 }
 
-// requireRouteContext is the shared prelude for the network/route handlers.
-// It runs the capability gate, ensures Chrome is up, and resolves the tab
-// context. On failure the response has been written and ok=false. On success
-// the caller has tabCtx + resolved tab ID; mutation handlers should follow up
-// with enforceCurrentTabDomainPolicy(tabCtx, resolvedID).
+// requireRouteContext is the shared prelude for the network/route handlers: the
+// capability gate, browser bringup and tab resolution. It applies no tab guards
+// — each caller declares its own.
 func (h *Handlers) requireRouteContext(w http.ResponseWriter, r *http.Request, tabID string) (tabCtx context.Context, resolvedID string, ok bool) {
 	if !h.networkInterceptEnabled() {
-		httpx.ErrorCode(w, 403, "network_intercept_disabled",
-			httpx.DisabledEndpointMessage("networkIntercept", "security.allowNetworkIntercept"),
-			false, map[string]any{"setting": "security.allowNetworkIntercept"})
+		h.writeCapabilityDisabled(w, routes.CapNetworkIntercept)
 		return nil, "", false
 	}
-	if err := h.ensureChrome(); err != nil {
+	if err := h.ensureBrowser(h.Config); err != nil {
 		if h.writeBridgeUnavailable(w, err) {
 			return nil, "", false
 		}
-		httpx.Error(w, 500, fmt.Errorf("chrome initialization: %w", err))
+		httpx.Error(w, 500, fmt.Errorf("browser initialization: %w", err))
 		return nil, "", false
 	}
 	ctx, id, err := h.tabContext(r, tabID)
@@ -128,7 +121,7 @@ func (h *Handlers) handleNetworkRouteFor(w http.ResponseWriter, r *http.Request,
 	if !ok {
 		return
 	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, tabCtx, resolvedID); !ok {
+	if _, ok := h.applyTabGuards(w, r, tabCtx, resolvedID, guardDomainPolicy|guardHandoffPause); !ok {
 		return
 	}
 
@@ -190,17 +183,16 @@ func (h *Handlers) handleNetworkUnrouteFor(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, tabCtx, resolvedID); !ok {
+	if _, ok := h.applyTabGuards(w, r, tabCtx, resolvedID, guardDomainPolicy|guardHandoffPause); !ok {
 		return
 	}
 
 	pattern := r.URL.Query().Get("pattern")
-	if pattern == "" && r.ContentLength > 0 {
+	if pattern == "" {
 		var body struct {
 			Pattern string `json:"pattern"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			httpx.Error(w, 400, fmt.Errorf("decode body: %w", err))
+		if !decodeOptionalJSON(w, r, &body) {
 			return
 		}
 		pattern = body.Pattern
@@ -208,10 +200,6 @@ func (h *Handlers) handleNetworkUnrouteFor(w http.ResponseWriter, r *http.Reques
 
 	removed, err := h.Bridge.RemoveRouteRule(resolvedID, pattern)
 	if err != nil {
-		if errors.Is(err, bridge.ErrTabNotRouted) {
-			WriteTabContextError(w, err, 404)
-			return
-		}
 		httpx.Error(w, 500, err)
 		return
 	}
@@ -233,9 +221,6 @@ func (h *Handlers) handleNetworkRouteListFor(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		httpx.Error(w, 500, err)
 		return
-	}
-	if rules == nil {
-		rules = []bridge.RouteRule{}
 	}
 	httpx.JSON(w, 200, map[string]any{
 		"tabId": resolvedID,

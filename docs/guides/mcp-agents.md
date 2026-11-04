@@ -12,28 +12,28 @@ This guide walks through setting up PinchTab as an MCP tool server for AI coding
 
 ## What is MCP?
 
-The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standard for connecting AI models to external tools. PinchTab implements an MCP server that exposes 38 browser-control tools — navigation, interaction, screenshot, PDF export, waits, network inspection, and more — over a simple stdio interface that every major AI client supports.
+The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standard for connecting AI models to external tools. PinchTab implements an MCP server that exposes 47 browser-control tools — navigation, interaction, screenshot, PDF export, waits, network inspection, and more — over a simple stdio interface that every major AI client supports.
 
 ## Prerequisites
 
 - PinchTab installed (`pinchtab --version`)
 - Chrome installed and on PATH (or pointed to via config)
-- An MCP-compatible client: Claude Desktop, VS Code with GitHub Copilot, or Cursor
+- An MCP-compatible client: Claude Desktop, VS Code with GitHub Copilot, Cursor, or Grok Build
 
 ## Step 1: Start PinchTab
 
 The MCP server is a thin adapter — it needs a running PinchTab instance to delegate to.
 
-**Headless mode (recommended for agents):**
+**Single-instance bridge (headless by default, recommended for agents):**
 
 ```bash
-pinchtab bridge --headless
+pinchtab bridge
 ```
 
 **Normal server mode (if you want the dashboard too):**
 
 ```bash
-pinchtab
+pinchtab server
 ```
 
 PinchTab listens on `http://127.0.0.1:9867` by default.
@@ -91,6 +91,37 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
 }
 ```
 
+### Grok Build
+
+After PinchTab is listed in the official xAI marketplace, install the plugin with:
+
+```bash
+grok plugin install pinchtab --trust
+```
+
+Until then, or to install from the PinchTab repository marketplace:
+
+```bash
+grok plugin marketplace add pinchtab/pinchtab
+grok plugin install pinchtab --trust
+```
+
+You can also install the plugin directory directly from GitHub:
+
+```bash
+grok plugin install pinchtab/pinchtab#plugins/grok --trust
+```
+
+From the root of a local checkout, use `grok plugin install ./plugins/grok --trust`. The plugin does not install the binary. Install PinchTab separately, start `pinchtab server`, then trust the plugin so MCP tools appear in `/mcps`. See the [Grok plugin install and usage guide](../../plugins/grok/README.md) for first use, verification, domain authorization, and troubleshooting.
+
+To configure MCP without the plugin, add to `~/.grok/config.toml`:
+
+```toml
+[mcp_servers.pinchtab]
+command = "pinchtab"
+args = ["mcp"]
+```
+
 ### Any SDK-based Agent
 
 ```python
@@ -111,9 +142,15 @@ proc = subprocess.Popen(
 |----------|---------|-------------|
 | `PINCHTAB_TOKEN` | *(from config)* | Bearer token for auth-protected servers |
 
-For remote servers, use the `--server` flag: `pinchtab --server http://remote:9867 mcp`
+For remote servers, use the `--server` flag with that host's credential — a non-loopback host
+requires `PINCHTAB_TOKEN` (or `PINCHTAB_SESSION`), since the CLI refuses to send the local
+config's `server.token` off the machine:
 
-`PINCHTAB_TOKEN` comes from `server.token` in your PinchTab config file. To copy the current token without printing it to stdout, run `pinchtab config token`.
+```bash
+PINCHTAB_TOKEN=<that-host-token> pinchtab --server http://remote:9867 mcp
+```
+
+`PINCHTAB_TOKEN` comes from `server.token` in your PinchTab config file — that is the credential for your LOCAL server, not for a remote one. To copy the current token without printing it to stdout, run `pinchtab config token`. On a host with no clipboard tool — CI, Docker, headless Linux — use `PINCHTAB_TOKEN=$(pinchtab config token --stdout)`, which prints the token and nothing else.
 
 ## Typical Agent Workflow
 
@@ -140,7 +177,7 @@ Tool calls:
     → ...input[ref=e3] placeholder="Search Wikipedia"...
   pinchtab_click({selector: "e3"})
   pinchtab_type({selector: "e3", text: "climate change"})
-  pinchtab_press({key: "Enter"})
+  pinchtab_key({action: "press", key: "Enter"})
   pinchtab_snapshot({format: "compact"})
   pinchtab_get_text({})
 ```
@@ -194,8 +231,10 @@ The `pinchtab mcp` process runs locally (on the agent machine) and makes HTTP ca
 PinchTab is not running, or is on a different port. Check:
 
 ```bash
-curl http://127.0.0.1:9867/health
+pinchtab health
 ```
+
+(A raw `curl http://127.0.0.1:9867/health` also proves the port answers, but it returns `401` without `-H "Authorization: Bearer <token>"`.)
 
 **"HTTP 401" from tools**
 

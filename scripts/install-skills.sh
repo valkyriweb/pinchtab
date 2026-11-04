@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Symlink every skill under ./skills into ~/.claude/skills so Claude Code
-# picks them up globally. Editing files under ./skills/<name>/ is reflected
-# immediately because we use symlinks.
+# The DEVELOPER path for the skills: symlinks every skill under ./skills into
+# ./.claude/skills so Claude Code picks them up as repo-local skills (loaded
+# only when CWD is inside this repo), and edits under ./skills/<name>/ are
+# reflected immediately. It needs a checkout.
+#
+# Users of an installed binary have no checkout: the npm package ships a copy
+# of the pinchtab skill and `pinchtab skill update` / `pinchtab skill status`
+# (npm/scripts/sync-skills.js) manage it. That sync never writes through a
+# symlink, so the two paths do not fight over one directory.
 #
 # Override the target directory with CLAUDE_SKILLS_DIR=<path> if you want
-# to install into a different Claude home (e.g. a project-local one).
+# to install into a different Claude home (e.g. ~/.claude/skills for a
+# global install).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TARGET_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+TARGET_DIR="${CLAUDE_SKILLS_DIR:-$(pwd)/.claude/skills}"
 SOURCE_DIR="$(pwd)/skills"
 
 if [[ ! -d "$SOURCE_DIR" ]]; then

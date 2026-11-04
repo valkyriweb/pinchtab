@@ -17,8 +17,8 @@
     <td align="left" valign="middle">
       <a href="https://github.com/pinchtab/pinchtab/releases/latest"><img src="https://img.shields.io/github/v/release/pinchtab/pinchtab?style=flat-square&color=FFD700" alt="Release"/></a><br/>
       <a href="https://github.com/pinchtab/pinchtab/actions/workflows/ci-go.yml"><img src="https://img.shields.io/github/actions/workflow/status/pinchtab/pinchtab/ci-go.yml?branch=main&style=flat-square&label=Go%20CI" alt="Go CI"/></a><br/>
-      <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.25+"/><br/>
-      <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="License"/></a>
+      <img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+"/><br/>
+      <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"/></a>
     </td>
   </tr>
 </table>
@@ -52,7 +52,7 @@ If you prefer not to run a daemon, or if you're on Windows, you can instead run:
 `pinchtab server` — runs the control-plane server directly
 `pinchtab bridge` — runs a single browser instance as a lightweight runtime
 
-PinchTab also provides a CLI with an interactive entry point for local setup and common tasks:
+Running bare `pinchtab` runs the security setup on first use, then prints server status, the security posture, and suggested next steps:
 
 `pinchtab`
 
@@ -109,6 +109,21 @@ For example, an agent request like:
 
 can automatically select the appropriate profile and perform the action.
 
+### Site audits and visual comparison
+
+PinchTab can audit whole sites at the browser level — screenshots, console
+errors, broken assets, accessibility score, Core Web Vitals, and security
+findings — and compare two site versions visually before a release:
+
+```bash
+pinchtab audit https://example.com --output-dir ./audit          # report.json + screenshots/
+pinchtab audit https://example.com/sitemap.xml --sitemap --sample-size 2 --output-dir ./audit
+pinchtab compare https://example.com https://staging.example.com --fail-on-diff   # CI gate
+```
+
+See [docs/audit.md](docs/audit.md) for the full command reference, report
+anatomy, and CI examples.
+
 ### Local container isolation
 
 If you prefer stronger isolation, PinchTab can run inside Docker.
@@ -150,7 +165,19 @@ The primary user journey is:
 4. let PinchTab act as your local browser service
 
 That is the default “replace the browser runtime” scenario.
-Most users should not need to think about `pinchtab bridge` directly, and only need `pinchtab` when they want the local interactive menu.
+Most users should not need to think about `pinchtab bridge` directly, and only need bare `pinchtab` for first-run setup or a status overview.
+
+Agent plugins (binary still installed separately):
+
+```bash
+# Grok Build, after listing in the official xAI marketplace
+grok plugin install pinchtab --trust
+
+# OpenClaw
+openclaw plugins install @pinchtab/pinchtab
+```
+
+Grok users can install from the PinchTab repository marketplace or directly from GitHub. See the [Grok plugin install and usage guide](plugins/grok/README.md).
 
 ### Key Features
 
@@ -158,9 +185,10 @@ Most users should not need to think about `pinchtab bridge` directly, and only n
 - **Token-efficient** — 800 tokens/page with text extraction (5-13x cheaper than screenshots)
 - **Headless or Headed** — Run without a window or with visible Chrome
 - **Multi-instance** — Run multiple parallel Chrome processes with isolated profiles
-- **Self-contained** — ~15MB binary, no external dependencies
-- **Accessibility-first** — Stable element refs instead of fragile coordinates
+- **Self-contained** — single ~30MB binary; drives a locally installed Chrome or Chromium
+- **Accessibility-first** — Element refs that denote a DOM node, not a row: the same `e5` survives a change of filter, selector or depth (filtered views are sparse), and expires only on navigation to a new document
 - **ARM64-optimized** — First-class Raspberry Pi support with automatic Chromium detection
+- **CloakBrowser support** — Optional drop-in provider for sites that fingerprint stock Chromium. PinchTab launches a user-supplied CloakBrowser binary; no CloakBrowser is bundled in released artifacts. See [docs/guides/cloakbrowser.md](docs/guides/cloakbrowser.md).
 
 ---
 
@@ -183,11 +211,25 @@ brew install pinchtab/tap/pinchtab
 npm install -g pinchtab
 ```
 
+### Agent skill
+
+The npm package ships the `pinchtab` agent skill and copies it into every agent home it detects (`~/.claude/skills`, `~/.cursor/skills`, `~/.windsurf/skills`, `~/.codex/skills`, OpenClaw) on install and upgrade, printing what it wrote. The shipped copy carries the release version and a content hash in its frontmatter, so a stale or hand-edited copy is detectable without a source checkout:
+
+```bash
+pinchtab skill status           # each detected copy vs the bundled skill; exit 1 if any is stale
+pinchtab skill update           # install or refresh; an edited copy is kept and reported
+pinchtab skill update --force   # replace an edited copy
+```
+
+Inside a checkout, `scripts/install-skills.sh` symlinks the repo skills instead so edits are live; the sync never writes through a symlink.
+
 ### Platform Support
 
 PinchTab's primary tested operator workflow is local macOS and Linux.
 
 Windows binaries are published, but Windows support is currently limited and best-effort because the project does not have the same level of automated and manual coverage there. On Windows, prefer running `pinchtab server` or `pinchtab bridge` directly instead of relying on the daemon workflow.
+
+On **macOS**, prefer a dedicated automation browser (Google Chrome for Testing or Chromium) over your daily Google Chrome. Driving your primary Chrome headless can prevent it from opening a normal window while PinchTab is running. PinchTab now prefers a dedicated browser automatically, and `pinchtab doctor browsers` warns if automation would fall back to your primary Chrome — install Chrome for Testing or set `browser.binary` to a separate build. See [docs/reference/config.md](docs/reference/config.md).
 
 ### Shell Completion
 
@@ -263,28 +305,34 @@ pinchtab click e5
 pinchtab text
 ```
 
-Or use the HTTP API directly:
+Or use the HTTP API directly (every request needs the server token):
 ```bash
+export PINCHTAB_TOKEN=$(pinchtab config token --stdout)
+
 # Create a profile first (returns profile id)
 PROF=$(curl -s -X POST http://localhost:9867/profiles \
+  -H "Authorization: Bearer $PINCHTAB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"work"}' | jq -r '.id')
 
 # Start an instance for that profile (returns instance id)
 INST=$(curl -s -X POST http://localhost:9867/instances/start \
+  -H "Authorization: Bearer $PINCHTAB_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"profileId\":\"$PROF\",\"mode\":\"headless\"}" | jq -r '.id')
 
 # Open a tab in that instance
 TAB=$(curl -s -X POST http://localhost:9867/instances/$INST/tabs/open \
+  -H "Authorization: Bearer $PINCHTAB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"url":"https://pinchtab.com"}' | jq -r '.tabId')
 
 # Get snapshot
-curl "http://localhost:9867/tabs/$TAB/snapshot?filter=interactive"
+curl -H "Authorization: Bearer $PINCHTAB_TOKEN" "http://localhost:9867/tabs/$TAB/snapshot?filter=interactive"
 
 # Click element
 curl -X POST "http://localhost:9867/tabs/$TAB/action" \
+  -H "Authorization: Bearer $PINCHTAB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"kind":"click","ref":"e5"}'
 ```
@@ -342,7 +390,7 @@ methodology, per-run tables, and raw logs.
 
 ## Privacy
 
-PinchTab is a fully open-source, local-first tool. No telemetry, no analytics, and no required outbound service dependency. The binary binds to `127.0.0.1` by default. Persistent profiles store browser sessions locally on your machine, similar to how a human reuses their browser. Remote and distributed deployments are available for advanced use cases, but they are explicit operator-managed setups rather than the default posture. The single Go binary (~16 MB) is fully verifiable: build from source at [github.com/pinchtab/pinchtab](https://github.com/pinchtab/pinchtab).
+PinchTab is a fully open-source, local-first tool. No telemetry, no analytics, and no required outbound service dependency. The binary binds to `127.0.0.1` by default. Persistent profiles store browser sessions locally on your machine, similar to how a human reuses their browser. Remote and distributed deployments are available for advanced use cases, but they are explicit operator-managed setups rather than the default posture. The single Go binary (~30 MB) is fully verifiable: build from source at [github.com/pinchtab/pinchtab](https://github.com/pinchtab/pinchtab).
 
 ---
 
@@ -374,20 +422,22 @@ pinchtab text  # ~800 tokens instead of 10,000
 ### Multi-Instance Workflows
 
 ```bash
-# Run multiple instances in parallel
+# Run multiple instances in parallel (profiles "alice" and "bob" must already exist — see POST /profiles above)
 curl -s -X POST http://localhost:9867/instances/start \
+  -H "Authorization: Bearer $PINCHTAB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"profileId":"alice","mode":"headless"}'
 
 curl -s -X POST http://localhost:9867/instances/start \
+  -H "Authorization: Bearer $PINCHTAB_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"profileId":"bob","mode":"headless"}'
 
 # Each instance is isolated
-curl http://localhost:9867/instances
+curl -H "Authorization: Bearer $PINCHTAB_TOKEN" http://localhost:9867/instances
 ```
 
-See [chrome-files.md](chrome-files.md) for technical details on how PinchTab manages Chrome user data directories and ensures isolation between parallel instances.
+See [chrome-files.md](docs/implementations/chrome-files.md) for technical details on how PinchTab manages Chrome user data directories and ensures isolation between parallel instances.
 
 ---
 
@@ -403,6 +453,15 @@ cd pinchtab
 ./dev doctor                # Verifies environment, offers hooks/deps setup
 ./dev --help                # Shows the developer toolkit commands
 go build ./cmd/pinchtab     # Build pinchtab binary
+```
+
+For diagnostics of your installed PinchTab + browser config (config file loads, browser found and version adequate, a headless launch exposes CDP, request shapes handled; CloakBrowser adds fingerprint-flag and font checks), use:
+
+```bash
+pinchtab doctor             # human-readable report
+pinchtab doctor --json      # machine-readable
+pinchtab doctor --check <name>    # run a single check by name
+pinchtab doctor browser <name>    # scope to one browser.targets entry
 ```
 
 ---

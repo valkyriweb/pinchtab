@@ -3,12 +3,14 @@ package e2e
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -21,14 +23,16 @@ const (
 )
 
 type Runner struct {
-	args     Args
-	suite    string
-	stdout   io.Writer
-	stderr   io.Writer
-	repoRoot string
-	compose  []string
-	logsMode string
-	overall  overallReportData
+	args      Args
+	suite     string
+	stdout    io.Writer
+	stderr    io.Writer
+	repoRoot  string
+	compose   []string
+	logsMode  string
+	overall   overallReportData
+	overrides *providerOverrides
+	mem       *suiteMemory
 }
 
 type overallReportData struct {
@@ -40,23 +44,25 @@ type overallReportData struct {
 }
 
 type suiteDef struct {
-	Name        string
-	Title       string
-	Compose     string
-	GroupDir    string
-	Helper      string
-	ScenarioDir string
-	Commands    []string
-	Ready       []string
-	Runner      string
-	RunSuite    string
-	Extended    bool
-	Smoke       bool
-	Summary     string
-	Report      string
-	LogPrefix   string
-	Output      string
-	LogServices []string
+	Name         string
+	Title        string
+	Compose      string
+	GroupDir     string
+	Helper       string
+	ScenarioDir  string
+	Commands     []string
+	Ready        []string
+	Runner       string
+	RunSuite     string
+	Extended     bool
+	Smoke        bool
+	Summary      string
+	Report       string
+	Timings      string
+	LogPrefix    string
+	Output       string
+	LogServices  []string
+	RestartAfter []string
 }
 
 type suitePlan struct {
@@ -90,12 +96,12 @@ func NewRunner(args Args, stdout, stderr io.Writer) (*Runner, error) {
 		logsMode = strings.TrimSpace(os.Getenv("E2E_LOGS"))
 	}
 	if logsMode == "" {
-		logsMode = "show"
+		logsMode = "compact"
 	}
 	switch logsMode {
-	case "show", "hide":
+	case "show", "hide", "compact":
 	default:
-		return nil, fmt.Errorf("--logs must be show or hide")
+		return nil, fmt.Errorf("--logs must be show, hide, or compact")
 	}
 
 	return &Runner{
@@ -111,6 +117,16 @@ func NewRunner(args Args, stdout, stderr io.Writer) (*Runner, error) {
 
 func (r *Runner) Run() int {
 	started := time.Now()
+	overrides, err := r.prepareProviderOverrides()
+	if err != nil {
+		_, _ = fmt.Fprintf(r.stderr, "e2e: %v\n", err)
+		return 1
+	}
+	r.overrides = overrides
+	if overrides != nil {
+		defer overrides.cleanup()
+		_, _ = fmt.Fprintf(r.stdout, "  browser: %s (image: %s)\n", overrides.provider, overrides.image)
+	}
 	code := r.run()
 	duration := time.Since(started)
 	r.printOverallSummary(duration)
@@ -133,222 +149,200 @@ func (r *Runner) run() int {
 
 	switch r.suite {
 	case "basic":
-		return r.runBasic()
+		return r.runStackLane(basicLane())
 	case "extended":
-		return r.runExtended()
+		return r.runStackLane(extendedLane())
 	case "smoke":
-		return r.runSmoke()
+		return r.runSmokeLane(smokeLane())
 	case "smoke-orchestrator":
 		return r.runSmokeFiltered("orchestrator")
 	case "smoke-security":
 		return r.runSmokeFiltered("security")
 	case "smoke-lifecycle":
 		return r.runSmokeFiltered("lifecycle")
-	case "smoke-docker":
-		return r.runDockerSmoke()
-	case "api":
-		return r.runSingle(apiSuite())
-	case "cli":
-		return r.runSingle(cliSuite())
-	case "infra":
-		return r.runSingle(infraSuite())
-	case "plugin":
-		return r.runSingle(pluginSuite())
-	case "api-extended":
-		return r.runSingle(apiExtendedSuite())
-	case "cli-extended":
-		return r.runSingle(cliExtendedSuite())
-	case "infra-extended":
-		return r.runSingle(infraExtendedSuite())
-	default:
-		_, _ = fmt.Fprintf(r.stderr, "e2e: unknown suite %q\n", r.suite)
-		return 1
 	}
+	if def, ok := suiteDefByName(r.suite); ok {
+		return r.runSingle(def)
+	}
+	_, _ = fmt.Fprintf(r.stderr, "e2e: unknown suite %q\n", r.suite)
+	return 1
 }
 
 func (r *Runner) printPlanHeader() {
 	_, _ = fmt.Fprintln(r.stdout, "runner e2e (Go) - resolved plan")
-	_, _ = fmt.Fprintf(r.stdout, "  suite:  %s\n", r.suite)
-	_, _ = fmt.Fprintf(r.stdout, "  logs:   %s\n", r.logsMode)
+	_, _ = fmt.Fprintf(r.stdout, "  suite:    %s\n", r.suite)
+	_, _ = fmt.Fprintf(r.stdout, "  browser:  %s\n", r.args.Provider)
+	_, _ = fmt.Fprintf(r.stdout, "  logs:     %s\n", r.logsMode)
 	if r.args.Filter != "" {
-		_, _ = fmt.Fprintf(r.stdout, "  filter: %s\n", r.args.Filter)
+		_, _ = fmt.Fprintf(r.stdout, "  filter:   %s\n", r.args.Filter)
 	}
 	if r.args.Test != "" {
-		_, _ = fmt.Fprintf(r.stdout, "  test:   %s\n", r.args.Test)
+		_, _ = fmt.Fprintf(r.stdout, "  test:     %s\n", r.args.Test)
 	}
 	if r.args.Extra != "" {
-		_, _ = fmt.Fprintf(r.stdout, "  extra:  %s\n", r.args.Extra)
+		_, _ = fmt.Fprintf(r.stdout, "  extra:    %s\n", r.args.Extra)
 	}
 	_, _ = fmt.Fprintln(r.stdout, "")
 }
 
-func (r *Runner) runBasic() int {
-	stack := singleCompose
-	exitCodes := map[string]int{"api": 0, "cli": 0, "infra": 0}
-	plans, code := r.planSuites([]suiteDef{apiSuite(), cliSuite(), infraSuite()})
-	if code != 0 {
-		return code
-	}
-
-	if len(plans) == 0 {
-		_, _ = fmt.Fprintf(r.stderr, "e2e: no basic suites matched filter %q\n", r.args.Filter)
-		return 1
-	}
-
-	if code := r.bringUpSharedStack(stack, servicesForPlans(plans, []string{"pinchtab", "fixtures"})); code != 0 {
-		_ = r.composeDown(stack)
-		return code
-	}
-	defer r.composeDown(stack)
-
-	for _, plan := range plans {
-		if code := r.runSinglePlanWithCompose(plan, stack); code != 0 {
-			exitCodes[plan.def.Name] = code
-		}
-		_, _ = fmt.Fprintln(r.stdout, "")
-	}
-
-	if exitCodes["api"] != 0 || exitCodes["cli"] != 0 || exitCodes["infra"] != 0 {
-		_, _ = fmt.Fprintln(r.stderr, "e2e: basic suites failed")
-		_, _ = fmt.Fprintf(r.stderr, "e2e: exit codes: api=%d, cli=%d, infra=%d\n", exitCodes["api"], exitCodes["cli"], exitCodes["infra"])
-		return 1
-	}
-	if !r.args.DryRun {
-		_, _ = fmt.Fprintln(r.stdout, "E2E basic suites passed")
-	}
-	return 0
+type lane struct {
+	name  string
+	stack string
+	defs  []suiteDef
 }
 
-func (r *Runner) runExtended() int {
-	stack := multiCompose
-	exitCodes := map[string]int{
-		"api-extended":   0,
-		"cli-extended":   0,
-		"infra-extended": 0,
-		"plugin":         0,
+func basicLane() lane {
+	return lane{
+		name:  "basic",
+		stack: singleCompose,
+		defs:  []suiteDef{apiSuite(), cliSuite(), infraSuite()},
 	}
-	defs := []suiteDef{apiExtendedSuite(), cliExtendedSuite(), infraExtendedSuite(), pluginSuite()}
-	plans, code := r.planSuites(defs)
+}
+
+func extendedLane() lane {
+	return lane{
+		name:  "extended",
+		stack: multiCompose,
+		defs:  []suiteDef{apiExtendedSuite(), cliExtendedSuite(), infraExtendedSuite(), pluginSuite()},
+	}
+}
+
+func smokeLane() lane {
+	return lane{
+		name:  "smoke",
+		stack: multiCompose,
+		defs:  []suiteDef{apiSmokeSuite(), cliSmokeSuite(), infraSmokeSuite(), pluginSmokeSuite()},
+	}
+}
+
+func (r *Runner) bringUpAndRunPlans(stack string, plans []suitePlan) (codes map[string]int, restartFailed bool, setupCode int) {
+	services := servicesForPlans(plans, []string{"pinchtab", "fixtures"})
+	buildServices := servicesToBuild(plans, []string{"pinchtab", "fixtures"})
+	if code := r.bringUpSharedStack(stack, services, buildServices); code != 0 {
+		return nil, false, code
+	}
+
+	codes = map[string]int{}
+	for i, plan := range plans {
+		if code := r.runSinglePlanWithCompose(plan, stack); code != 0 {
+			codes[plan.def.Name] = code
+		}
+		if svcs := plan.def.RestartAfter; len(svcs) > 0 && i < len(plans)-1 {
+			if rc := r.restartSharedStack(stack, svcs); rc != 0 {
+				restartFailed = true
+			}
+		}
+		_, _ = fmt.Fprintln(r.stdout, "")
+	}
+	return codes, restartFailed, 0
+}
+
+func (r *Runner) reportNoSuitesMatched(l lane) int {
+	_, _ = fmt.Fprintf(r.stderr, "e2e: no %s suites matched filter %q\n", l.name, r.args.Filter)
+	return 1
+}
+
+func (r *Runner) reportLaneOutcome(l lane, codes map[string]int, otherFailure bool) int {
+	if len(codes) == 0 && !otherFailure {
+		if !r.args.DryRun {
+			_, _ = fmt.Fprintf(r.stdout, "E2E %s suites passed\n", l.name)
+		}
+		return 0
+	}
+	_, _ = fmt.Fprintf(r.stderr, "e2e: %s suites failed\n", l.name)
+	if len(codes) > 0 {
+		_, _ = fmt.Fprintf(r.stderr, "e2e: exit codes: %s\n", formatSuiteExitCodes(codes))
+	}
+	return 1
+}
+
+func formatSuiteExitCodes(codes map[string]int) string {
+	names := make([]string, 0, len(codes))
+	for name := range codes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, name := range names {
+		pairs = append(pairs, fmt.Sprintf("%s=%d", name, codes[name]))
+	}
+	return strings.Join(pairs, ", ")
+}
+
+func (r *Runner) runStackLane(l lane) int {
+	plans, code := r.planSuites(l.defs)
 	if code != 0 {
 		return code
 	}
 	if len(plans) == 0 {
-		_, _ = fmt.Fprintf(r.stderr, "e2e: no extended suites matched filter %q\n", r.args.Filter)
-		return 1
+		return r.reportNoSuitesMatched(l)
 	}
 
-	if code := r.bringUpSharedStack(stack, servicesForPlans(plans, []string{"pinchtab", "fixtures"})); code != 0 {
-		_ = r.composeDown(stack)
-		return code
+	codes, restartFailed, setupCode := r.bringUpAndRunPlans(l.stack, plans)
+	if setupCode != 0 {
+		_ = r.composeDown(l.stack)
+		return setupCode
 	}
-	defer r.composeDown(stack)
+	defer r.composeDown(l.stack)
 
-	for _, plan := range plans {
-		if code := r.runSinglePlanWithCompose(plan, stack); code != 0 {
-			exitCodes[plan.def.Name] = code
-			if plan.def.Name == "plugin" {
-				exitCodes["plugin"] = code
-			}
-		}
-		if plan.def.Name == "cli-extended" || plan.def.Name == "infra-extended" {
-			_ = r.restartSharedStack(stack, []string{"pinchtab"})
-		}
-		_, _ = fmt.Fprintln(r.stdout, "")
-	}
-
-	if exitCodes["api-extended"] != 0 || exitCodes["cli-extended"] != 0 || exitCodes["infra-extended"] != 0 || exitCodes["plugin"] != 0 {
-		_, _ = fmt.Fprintln(r.stderr, "e2e: extended suites failed")
-		_, _ = fmt.Fprintf(r.stderr, "e2e: exit codes: api-extended=%d, cli-extended=%d, infra-extended=%d, plugin=%d\n",
-			exitCodes["api-extended"], exitCodes["cli-extended"], exitCodes["infra-extended"], exitCodes["plugin"])
-		return 1
-	}
-	if !r.args.DryRun {
-		_, _ = fmt.Fprintln(r.stdout, "E2E extended suites passed")
-	}
-	return 0
+	return r.reportLaneOutcome(l, codes, restartFailed)
 }
 
 func (r *Runner) runSmokeFiltered(filter string) int {
 	if r.args.Filter == "" {
 		r.args.Filter = filter
 	}
-	return r.runSmoke()
+	return r.runSmokeLane(smokeLane())
 }
 
-func (r *Runner) runSmoke() int {
-	stack := multiCompose
-	defs := []suiteDef{apiSmokeSuite(), cliSmokeSuite(), infraSmokeSuite(), pluginSmokeSuite()}
-	plans, code := r.planSuites(defs)
+func (r *Runner) runSmokeLane(l lane) int {
+	plans, code := r.planSuites(l.defs)
 	if code != 0 {
 		return code
 	}
-	dockerSteps := r.selectedDockerSmokeSteps()
+	docker := r.selectedDockerSmokePlan()
+	dockerSteps := docker.steps
 	if len(plans) == 0 && len(dockerSteps) == 0 {
-		_, _ = fmt.Fprintf(r.stderr, "e2e: no smoke suites matched filter %q\n", r.args.Filter)
-		return 1
+		return r.reportNoSuitesMatched(l)
 	}
 
-	failed := false
+	codes := map[string]int{}
+	otherFailure := false
 	if len(plans) > 0 {
-		if code := r.bringUpSharedStack(stack, servicesForPlans(plans, []string{"pinchtab", "fixtures"})); code != 0 {
-			_ = r.composeDown(stack)
-			return code
+		planCodes, restartFailed, setupCode := r.bringUpAndRunPlans(l.stack, plans)
+		if setupCode != 0 {
+			_ = r.composeDown(l.stack)
+			return setupCode
 		}
-
-		for i, plan := range plans {
-			if code := r.runSinglePlanWithCompose(plan, stack); code != 0 {
-				failed = true
-			}
-			if plan.def.Name == "cli-smoke" && i < len(plans)-1 {
-				if code := r.restartSharedStack(stack, []string{"pinchtab"}); code != 0 {
-					failed = true
-				}
-			}
-			_, _ = fmt.Fprintln(r.stdout, "")
-		}
-		if code := r.composeDown(stack); code != 0 {
-			failed = true
+		codes = planCodes
+		otherFailure = restartFailed
+		if code := r.composeDown(l.stack); code != 0 {
+			otherFailure = true
 		}
 	}
 
 	if len(dockerSteps) > 0 {
-		if code := r.runDockerSmokeSteps(dockerSteps); code != 0 {
-			failed = true
+		if code := r.runDockerSmokeSteps(docker); code != 0 {
+			codes[dockerSmokeSuite().Name] = code
 		}
 		_, _ = fmt.Fprintln(r.stdout, "")
 	}
 
-	if failed {
-		_, _ = fmt.Fprintln(r.stderr, "e2e: smoke suites failed")
-		return 1
-	}
-	if !r.args.DryRun {
-		_, _ = fmt.Fprintln(r.stdout, "E2E smoke suites passed")
-	}
-	return 0
+	return r.reportLaneOutcome(l, codes, otherFailure)
 }
 
-func (r *Runner) runDockerSmoke() int {
-	steps := r.selectedDockerSmokeSteps()
-	if len(steps) == 0 {
-		_, _ = fmt.Fprintf(r.stderr, "e2e: no docker smoke steps matched filter %q\n", r.args.Filter)
-		return 1
-	}
-	code := r.runDockerSmokeSteps(steps)
-	if code == 0 && !r.args.DryRun {
-		_, _ = fmt.Fprintln(r.stdout, "E2E docker smoke suite passed")
-	}
-	return code
-}
-
-func (r *Runner) runDockerSmokeSteps(steps []dockerSmokeStep) int {
+func (r *Runner) runDockerSmokeSteps(plan dockerSmokePlan) int {
 	def := dockerSmokeSuite()
 	r.printSuiteStart(def)
+	for _, image := range plan.images {
+		_, _ = fmt.Fprintf(r.stdout, "  image %-32s %s\n", image.Ref(), image.Reason)
+	}
+	_, _ = fmt.Fprintln(r.stdout, "")
 	r.prepareSuiteResults(def)
 	started := time.Now()
 
 	exitCode := 0
-	for _, step := range steps {
+	for _, step := range plan.steps {
 		stepStarted := time.Now()
 		code := r.runLoggedCommand("running "+step.Name, def.Output, step.Command)
 		status := "passed"
@@ -377,26 +371,52 @@ func (r *Runner) runDockerSmokeSteps(steps []dockerSmokeStep) int {
 	return exitCode
 }
 
-func (r *Runner) selectedDockerSmokeSteps() []dockerSmokeStep {
-	return selectDockerSmokeSteps(r.dockerSmokeSteps(), r.args.Filter)
+// dockerSmokePlan is the docker smoke lane's steps together with the image decisions that
+// produced them, so the run can state per image whether it built or reused and why.
+type dockerSmokePlan struct {
+	steps  []dockerSmokeStep
+	images []smokeImage
 }
 
-func (r *Runner) dockerSmokeSteps() []dockerSmokeStep {
-	releaseImage, chromeImage, customReleaseImage, customChromeImage := r.dockerSmokeImages()
+var (
+	releaseSmokeImageSpec = smokeImageSpec{
+		Repo:       "pinchtab-release-smoke",
+		Dockerfile: "Dockerfile",
+		EnvVar:     "PINCHTAB_DOCKER_SMOKE_RELEASE_IMAGE",
+	}
+	chromeSmokeImageSpec = smokeImageSpec{
+		Repo:       "pinchtab-chrome-cft-smoke",
+		Dockerfile: "tests/tools/docker/chrome-cft-smoke.Dockerfile",
+		Platform:   "linux/amd64",
+		EnvVar:     "PINCHTAB_DOCKER_SMOKE_CHROME_IMAGE",
+	}
+)
+
+func (r *Runner) selectedDockerSmokePlan() dockerSmokePlan {
+	plan := r.dockerSmokePlan()
+	plan.steps = selectDockerSmokeSteps(plan.steps, r.args.Filter)
+	return plan
+}
+
+func (r *Runner) dockerSmokePlan() dockerSmokePlan {
+	release := r.resolveSmokeImage(releaseSmokeImageSpec, r.localImageExists)
+	chrome := r.resolveSmokeImage(chromeSmokeImageSpec, r.localImageExists)
+	releaseImage, chromeImage := release.Ref(), chrome.Ref()
+
 	steps := []dockerSmokeStep{}
-	if !customReleaseImage {
+	if release.Build {
 		steps = append(steps, dockerSmokeStep{
 			Name:                 "docker: build release image",
 			Tags:                 []string{"docker", "build", "release", "image"},
-			Command:              []string{"docker", "build", "-t", releaseImage, "."},
+			Command:              []string{"docker", "build", "--load", "-t", releaseImage, "."},
 			ProvidesReleaseImage: true,
 		})
 	}
-	if !customChromeImage {
+	if chrome.Build {
 		steps = append(steps, dockerSmokeStep{
 			Name:                "docker: build Chrome for Testing image",
 			Tags:                []string{"docker", "build", "chrome", "cft", "image"},
-			Command:             []string{"docker", "build", "--platform", "linux/amd64", "-f", "tests/tools/docker/chrome-cft-smoke.Dockerfile", "-t", chromeImage, "."},
+			Command:             []string{"docker", "build", "--load", "--platform", chromeSmokeImageSpec.Platform, "-f", chromeSmokeImageSpec.Dockerfile, "-t", chromeImage, "."},
 			ProvidesChromeImage: true,
 		})
 	}
@@ -426,33 +446,7 @@ func (r *Runner) dockerSmokeSteps() []dockerSmokeStep {
 			RequiresReleaseImage: true,
 		},
 	)
-	return steps
-}
-
-func (r *Runner) dockerSmokeImages() (releaseImage, chromeImage string, customReleaseImage, customChromeImage bool) {
-	suffix := strings.TrimSpace(os.Getenv("PINCHTAB_DOCKER_SMOKE_TAG_SUFFIX"))
-	if suffix == "" {
-		if r.args.DryRun {
-			suffix = "dry-run"
-		} else {
-			suffix = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-	}
-
-	releaseImage = strings.TrimSpace(os.Getenv("PINCHTAB_DOCKER_SMOKE_RELEASE_IMAGE"))
-	if releaseImage == "" {
-		releaseImage = "pinchtab-release-smoke:" + suffix
-	} else {
-		customReleaseImage = true
-	}
-
-	chromeImage = strings.TrimSpace(os.Getenv("PINCHTAB_DOCKER_SMOKE_CHROME_IMAGE"))
-	if chromeImage == "" {
-		chromeImage = "pinchtab-chrome-cft-smoke:" + suffix
-	} else {
-		customChromeImage = true
-	}
-	return releaseImage, chromeImage, customReleaseImage, customChromeImage
+	return dockerSmokePlan{steps: steps, images: []smokeImage{release, chrome}}
 }
 
 func selectDockerSmokeSteps(steps []dockerSmokeStep, filter string) []dockerSmokeStep {
@@ -518,7 +512,9 @@ func (r *Runner) runSingle(def suiteDef) int {
 		return 1
 	}
 	plan := suitePlan{def: def, scenarios: scenarios}
-	if code := r.bringUpSharedStack(def.Compose, servicesForPlans([]suitePlan{plan}, []string{"pinchtab", "fixtures"})); code != 0 {
+	plans := []suitePlan{plan}
+	fallback := []string{"pinchtab", "fixtures"}
+	if code := r.bringUpSharedStack(def.Compose, servicesForPlans(plans, fallback), servicesToBuild(plans, fallback)); code != 0 {
 		_ = r.composeDown(def.Compose)
 		return code
 	}
@@ -538,13 +534,22 @@ func (r *Runner) runSinglePlanWithCompose(plan suitePlan, composeFile string) in
 		return 1
 	}
 
+	var probe *memoryProbe
+	if !r.args.DryRun {
+		probe = r.startMemorySampler(composeFile)
+	}
 	code := r.runLoggedCommand("running "+def.Name+" suite", def.Output, command)
+	if probe != nil {
+		r.applyMemoryResult(probe.finish())
+	}
 	duration := time.Since(started)
 	summary := r.writeSuiteReports(def, duration, code)
+	r.mem = nil
 	r.recordOverallSummary(summary)
 	r.printSuiteSummary(def, summary, duration)
 	if code != 0 {
 		r.dumpComposeFailure(composeFile, def)
+		r.reportServiceDeaths(composeFile, def.LogServices)
 		r.showFailureArtifacts(def, duration)
 	}
 	return code
@@ -567,32 +572,101 @@ func (r *Runner) planSuites(defs []suiteDef) ([]suitePlan, int) {
 	return plans, 0
 }
 
-func (r *Runner) bringUpSharedStack(composeFile string, services []string) int {
-	if code := r.buildSharedStack(composeFile); code != 0 {
+func (r *Runner) bringUpSharedStack(composeFile string, services, buildServices []string) int {
+	// Cloak pinchtab services are supplied by the provider override image.
+	// Build support images such as fixtures and runners, but keep compose from
+	// rebuilding the overridden pinchtab services.
+	skipPinchtabBuild := r.overrides != nil && r.overrides.provider == "cloak"
+	if skipPinchtabBuild {
+		// keepStockProvider services (e.g. pinchtab-ghostchrome) stay pinned to
+		// the stock e2e-pinchtab:latest image even in the cloak lane. If the
+		// suite brings any of them up, that image must exist or `up --no-build`
+		// fails with "No such image". Build that stock image via the base compose
+		// only so the cloak override cannot retag it to the provider image.
+		if needsStockPinchtabImage(services) {
+			if code := r.buildSharedStackWithOverrides(composeFile, false, "pinchtab"); code != 0 {
+				return code
+			}
+		}
+		if code := r.buildSharedStack(composeFile, cloakSupportBuildServices()...); code != 0 {
+			return code
+		}
+	} else {
+		if code := r.buildSharedStack(composeFile, buildServices...); code != 0 {
+			return code
+		}
+	}
+	args := []string{"up", "-d"}
+	if skipPinchtabBuild {
+		args = append(args, "--no-build", "--force-recreate")
+	}
+	args = append(args, services...)
+	if code := r.runLoggedCommand("starting shared stack", stackOutput, r.composeArgs(composeFile, args...)); code != 0 {
+		r.reportServiceDeaths(composeFile, services)
 		return code
 	}
-	args := append([]string{"up", "-d"}, services...)
-	return r.runLoggedCommand("starting shared stack", stackOutput, r.composeArgs(composeFile, args...))
+	if err := r.assertStealthStatus(composeFile); err != nil {
+		_, _ = fmt.Fprintf(r.stderr, "e2e: pre-suite stealth assertion failed: %v\n", err)
+		r.reportServiceDeaths(composeFile, services)
+		return 1
+	}
+	return 0
 }
 
-func (r *Runner) buildSharedStack(composeFile string) int {
-	code := r.runLoggedCommand("building shared-stack images", stackOutput, r.composeArgs(composeFile, "build"))
+func (r *Runner) buildSharedStack(composeFile string, services ...string) int {
+	return r.buildSharedStackWithOverrides(composeFile, true, services...)
+}
+
+func (r *Runner) buildSharedStackWithOverrides(composeFile string, includeOverrides bool, services ...string) int {
+	args := append([]string{"build"}, services...)
+	code := r.runLoggedCommand("building shared-stack images", stackOutput, r.composeArgsWithOverrides(composeFile, includeOverrides, args...))
 	if code == 0 {
 		return 0
+	}
+	if r.stackOutputIsOutOfDisk() {
+		_, _ = fmt.Fprintln(r.stdout, outOfDiskRemedy)
+		return code
 	}
 	if !r.stackOutputHasBuildKitCacheFailure() {
 		return code
 	}
 	_, _ = fmt.Fprintln(r.stdout, "  build cache looked stale; retrying shared-stack build with --no-cache...")
-	return r.runLoggedCommand("rebuilding shared-stack images without cache", stackOutput, r.composeArgs(composeFile, "build", "--no-cache"))
+	retryArgs := append([]string{"build", "--no-cache"}, services...)
+	return r.runLoggedCommand("rebuilding shared-stack images without cache", stackOutput, r.composeArgsWithOverrides(composeFile, includeOverrides, retryArgs...))
+}
+
+func cloakSupportBuildServices() []string {
+	return []string{"fixtures", "runner-api", "runner-cli"}
+}
+
+// needsStockPinchtabImage reports whether any service being brought up is a
+// keepStockProvider service that stays pinned to e2e-pinchtab:latest. Such
+// services require the stock pinchtab image even in the cloak lane.
+func needsStockPinchtabImage(services []string) bool {
+	for _, svc := range services {
+		for _, def := range pinchtabServiceTable {
+			if def.name == svc && def.keepStockProvider {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (r *Runner) stackOutputHasBuildKitCacheFailure() bool {
+	return isBuildKitCacheFailureLog(r.stackOutputLog())
+}
+
+func (r *Runner) stackOutputIsOutOfDisk() bool {
+	return isOutOfDiskLog(r.stackOutputLog())
+}
+
+func (r *Runner) stackOutputLog() string {
 	data, err := os.ReadFile(filepath.Join(r.repoRoot, stackOutput))
 	if err != nil {
-		return false
+		return ""
 	}
-	return isBuildKitCacheFailureLog(string(data))
+	return string(data)
 }
 
 func isBuildKitCacheFailureLog(log string) bool {
@@ -623,6 +697,10 @@ func (r *Runner) suiteRunCommand(composeFile string, def suiteDef, scenarios []s
 }
 
 func (r *Runner) suiteEnvironment(def suiteDef, scenarios []scenarioMeta) []string {
+	provider := r.args.Provider
+	if provider == "" {
+		provider = defaultProvider
+	}
 	return []string{
 		"E2E_HELPER=" + def.Helper,
 		"E2E_SCENARIO_DIR=" + def.ScenarioDir,
@@ -630,6 +708,7 @@ func (r *Runner) suiteEnvironment(def suiteDef, scenarios []scenarioMeta) []stri
 		"E2E_READY_TARGETS=" + strings.Join(readyTargetsForScenarios(def, scenarios), " "),
 		"E2E_TEST_FILTER=" + r.args.Test,
 		"E2E_SUMMARY_TITLE=" + suiteReportTitle(def),
+		"PINCHTAB_E2E_BROWSER=" + provider,
 	}
 }
 
@@ -655,8 +734,17 @@ func suiteReportTitle(def suiteDef) string {
 }
 
 func (r *Runner) composeArgs(composeFile string, args ...string) []string {
+	return r.composeArgsWithOverrides(composeFile, true, args...)
+}
+
+func (r *Runner) composeArgsWithOverrides(composeFile string, includeOverrides bool, args ...string) []string {
 	out := append([]string{}, r.compose...)
 	out = append(out, "-f", composeFile)
+	if includeOverrides && r.overrides != nil {
+		for _, override := range r.overrides.composeFiles {
+			out = append(out, "-f", override)
+		}
+	}
 	out = append(out, args...)
 	return out
 }
@@ -683,14 +771,14 @@ func (r *Runner) runLoggedCommand(label, outputFile string, command []string) in
 		return 0
 	}
 
-	if r.logsMode != "hide" {
+	if r.logsMode == "show" {
 		_, _ = fmt.Fprintf(r.stdout, "%s\n", label)
 		return r.runStreamingCommand(command, outputFile)
 	}
 	if outputFile == "" {
 		outputFile = stackOutput
 	}
-	return r.runHiddenCommand(label, outputFile, command)
+	return r.runCompactCommand(label, outputFile, command)
 }
 
 func (r *Runner) appendSuiteResult(def suiteDef, status string, duration time.Duration, name string) (err error) {
@@ -816,7 +904,7 @@ func (w *structuredEventTee) writeHumanLine(line []byte) error {
 	return err
 }
 
-func (r *Runner) runHiddenCommand(label, outputFile string, command []string) int {
+func (r *Runner) runCompactCommand(label, outputFile string, command []string) int {
 	outputPath := filepath.Join(r.repoRoot, outputFile)
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
 		_, _ = fmt.Fprintf(r.stderr, "e2e: failed to prepare output path: %v\n", err)
@@ -833,7 +921,9 @@ func (r *Runner) runHiddenCommand(label, outputFile string, command []string) in
 		}
 	}()
 
-	_, _ = fmt.Fprintf(r.stdout, "  %s...\n", label)
+	prog := newProgressLine(r.stdout)
+	prog.Update(fmt.Sprintf("  %s...", label))
+
 	cmd := exec.Command(command[0], command[1:]...) // #nosec G204 -- commands are constructed from fixed compose/script inputs.
 	cmd.Dir = r.repoRoot
 	cmd.Stdout = file
@@ -841,6 +931,7 @@ func (r *Runner) runHiddenCommand(label, outputFile string, command []string) in
 	cmd.Stdin = os.Stdin
 	cmd.Env = os.Environ()
 	if err := cmd.Start(); err != nil {
+		prog.Clear()
 		_, _ = fmt.Fprintf(r.stderr, "e2e: failed to start %s: %v\n", shellQuoteArgs(command), err)
 		return 1
 	}
@@ -848,37 +939,72 @@ func (r *Runner) runHiddenCommand(label, outputFile string, command []string) in
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	lastRunning := ""
-	heartbeat := 0
+	passed := 0
+	failed := 0
 	for {
 		select {
 		case err := <-done:
+			ticker.Stop()
+			passed, failed = r.countResults(outputFile)
 			if err == nil {
-				_, _ = fmt.Fprintf(r.stdout, "  %s: done\n", label)
+				if passed+failed > 0 {
+					prog.Complete(fmt.Sprintf("  %s: %d passed", label, passed))
+				} else {
+					prog.Complete(fmt.Sprintf("  %s: done", label))
+				}
 				return 0
 			}
 			if exitErr, ok := err.(*exec.ExitError); ok {
+				if passed+failed > 0 {
+					prog.Complete(fmt.Sprintf("  %s: %d passed, %d failed", label, passed, failed))
+				} else {
+					prog.Complete(fmt.Sprintf("  %s: failed (exit %d)", label, exitErr.ExitCode()))
+				}
 				return exitErr.ExitCode()
 			}
+			prog.Clear()
 			_, _ = fmt.Fprintf(r.stderr, "e2e: failed while running %s: %v\n", shellQuoteArgs(command), err)
 			return 1
 		case <-ticker.C:
+			p, f := r.countResults(outputFile)
+			passed, failed = p, f
 			name := r.readLastRunningName(outputFile)
+			if name != "" {
+				name = strings.TrimSuffix(name, ".sh")
+			}
 			if name != "" && name != lastRunning {
 				lastRunning = name
-				_, _ = fmt.Fprintf(r.stdout, "  running: %s\n", strings.TrimSuffix(name, ".sh"))
-				heartbeat = 0
-				continue
 			}
-			heartbeat++
-			if heartbeat >= 5 {
-				_, _ = fmt.Fprintf(r.stdout, "  %s...\n", label)
-				heartbeat = 0
+			total := passed + failed
+			if total > 0 && lastRunning != "" {
+				prog.Update(fmt.Sprintf("  %s [%d done] %s", label, total, lastRunning))
+			} else if lastRunning != "" {
+				prog.Update(fmt.Sprintf("  %s: %s", label, lastRunning))
 			}
 		}
 	}
+}
+
+func (r *Runner) countResults(outputFile string) (passed, failed int) {
+	file, err := os.Open(filepath.Join(r.repoRoot, outputFile))
+	if err != nil {
+		return 0, 0
+	}
+	defer func() { _ = file.Close() }()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "E2E_RESULT\tpassed\t") {
+			passed++
+		} else if strings.HasPrefix(line, "E2E_RESULT\tfailed\t") {
+			failed++
+		}
+	}
+	return passed, failed
 }
 
 func (r *Runner) readLastRunningName(outputFile string) string {
@@ -903,6 +1029,154 @@ func (r *Runner) readLastRunningName(outputFile string) string {
 		}
 	}
 	return last
+}
+
+func (r *Runner) provider() string {
+	if r.args.Provider != "" {
+		return r.args.Provider
+	}
+	return defaultProvider
+}
+
+type memoryResult struct {
+	containers []containerMemory
+	note       string
+}
+
+type memoryProbe struct {
+	stop   chan struct{}
+	result chan memoryResult
+}
+
+const (
+	dockerProbeTimeout    = 10 * time.Second
+	memorySamplerDeadline = 15 * time.Second
+)
+
+func (r *Runner) startMemorySampler(composeFile string) *memoryProbe {
+	probe := &memoryProbe{stop: make(chan struct{}), result: make(chan memoryResult, 1)}
+	go func() {
+		acc := newMemoryAccumulator()
+		firstErr := ""
+		note := func(err error) {
+			if err != nil && firstErr == "" {
+				firstErr = err.Error()
+			}
+		}
+
+		stackIDs, err := r.stackContainerIDs(composeFile)
+		note(err)
+		ids := make([]string, 0, len(stackIDs))
+		for id := range stackIDs {
+			ids = append(ids, id)
+		}
+
+		sampleOnce := func() {
+			if len(ids) == 0 {
+				return
+			}
+			out, err := r.dockerStatsSnapshot(ids)
+			if err != nil {
+				note(err)
+				return
+			}
+			for _, s := range selectStackSamples(out, stackIDs) {
+				acc.add(s)
+			}
+		}
+
+		sampleOnce()
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-probe.stop:
+				sampleOnce()
+				containers := acc.reduce()
+				reason := ""
+				if len(containers) == 0 {
+					reason = "no pinchtab container memory sampled"
+					if firstErr != "" {
+						reason += " (" + firstErr + ")"
+					}
+				}
+				probe.result <- memoryResult{containers: containers, note: reason}
+				return
+			case <-ticker.C:
+				sampleOnce()
+			}
+		}
+	}()
+	return probe
+}
+
+func (p *memoryProbe) finish() memoryResult {
+	close(p.stop)
+	select {
+	case result := <-p.result:
+		return result
+	case <-time.After(memorySamplerDeadline):
+		return memoryResult{note: "memory sampler did not finish within " + memorySamplerDeadline.String()}
+	}
+}
+
+func (r *Runner) applyMemoryResult(result memoryResult) {
+	if len(result.containers) == 0 {
+		r.mem = nil
+		if result.note != "" {
+			_, _ = fmt.Fprintf(r.stdout, "  memory: %s\n", result.note)
+		}
+		return
+	}
+	r.mem = &suiteMemory{Provider: r.provider(), Containers: result.containers}
+}
+
+func (r *Runner) stackContainerIDs(composeFile string) (map[string]bool, error) {
+	out, err := r.captureWithTimeout(r.composeArgs(composeFile, "ps", "-q"))
+	if err != nil {
+		return nil, fmt.Errorf("docker compose ps: %w", err)
+	}
+	ids := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if id := strings.TrimSpace(line); id != "" {
+			ids[id] = true
+		}
+	}
+	return ids, nil
+}
+
+func (r *Runner) dockerStatsSnapshot(ids []string) (string, error) {
+	command := append([]string{"docker", "stats", "--no-stream", "--format", "{{.ID}},{{.Name}},{{.MemUsage}},{{.PIDs}}"}, ids...)
+	out, err := r.captureWithTimeout(command)
+	if err != nil {
+		return "", fmt.Errorf("docker stats unavailable: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Runner) captureWithTimeout(command []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dockerProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...) // #nosec G204 -- commands are fixed docker/compose invocations
+	cmd.Dir = r.repoRoot
+	cmd.Env = os.Environ()
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("timed out after %s", dockerProbeTimeout)
+	}
+	if err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(buf.String()))
+	}
+	return buf.String(), nil
+}
+
+func isPinchtabBrowserContainer(name string) bool {
+	return strings.Contains(name, "pinchtab") &&
+		!strings.Contains(name, "fixtures") &&
+		!strings.Contains(name, "runner")
 }
 
 func resolveCompose(dryRun bool) ([]string, error) {

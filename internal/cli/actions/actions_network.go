@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/pinchtab/pinchtab/internal/cli/apiclient"
+	"github.com/pinchtab/pinchtab/internal/sanitize"
 	"github.com/spf13/cobra"
 )
 
@@ -21,13 +22,11 @@ func Network(client *http.Client, base, token string, cmd *cobra.Command, args [
 		return
 	}
 
-	// Check for --clear flag
 	if v, _ := cmd.Flags().GetBool("clear"); v {
 		NetworkClear(client, base, token, cmd)
 		return
 	}
 
-	// Check for --stream flag
 	if v, _ := cmd.Flags().GetBool("stream"); v {
 		NetworkStream(client, base, token, cmd)
 		return
@@ -80,13 +79,14 @@ func Network(client *http.Client, base, token string, cmd *cobra.Command, args [
 		return
 	}
 	for _, e := range resp.Entries {
-		truncURL := e.URL
-		if len(truncURL) > 80 {
-			truncURL = truncURL[:77] + "..."
-		}
-		fmt.Printf("%-6s %3d  %s\n", e.Method, e.Status, truncURL)
+		fmt.Printf("%-6s %3d  %s\n", e.Method, e.Status, sanitize.TruncateUTF8BytesWithEllipsis(e.URL, networkURLDisplayMaxBytes))
 	}
 }
+
+// networkURLDisplayMaxBytes is the TOTAL byte budget for a URL in the terminal
+// listing, marker included — the same total the hand-rolled cut produced (77
+// bytes plus a 3-byte marker), so the column width is unchanged.
+const networkURLDisplayMaxBytes = 80
 
 // NetworkDetail shows full details for a specific request.
 func NetworkDetail(client *http.Client, base, token string, cmd *cobra.Command, requestID string) {
@@ -107,7 +107,7 @@ func NetworkClear(client *http.Client, base, token string, cmd *cobra.Command) {
 	if v, _ := cmd.Flags().GetString("tab"); v != "" {
 		params.Set("tabId", v)
 	}
-	result := apiclient.DoPost(client, base, token, "/network/clear", map[string]any{})
+	result := apiclient.DoPost(client, base, token, "/network/clear?"+params.Encode(), map[string]any{})
 	if result == nil {
 		fmt.Fprintln(os.Stderr, "Failed to clear network data")
 	}

@@ -6,10 +6,6 @@ on:
       version:
         description: 'Release version (e.g. 0.8.0, without v prefix)'
         required: true
-      ref:
-        description: 'Git ref to release. Defaults to main.'
-        required: false
-        default: 'main'
 
 env:
   GORELEASER_VERSION: v2.14.3
@@ -26,7 +22,7 @@ jobs:
     uses: ./.github/workflows/reusable-validate-release.yml
     with:
       version: ${{ inputs.version }}
-      ref: ${{ inputs.ref }}
+      ref: ${{ github.sha }}
 
   release-secret-checks:
     needs: validate
@@ -43,12 +39,11 @@ jobs:
     uses: ./.github/workflows/reusable-go.yml
     with:
       ref: ${{ needs.validate.outputs.sha }}
+      windows_tests: true
 
   dashboard-checks:
     needs: validate
     uses: ./.github/workflows/reusable-dashboard.yml
-    with:
-      ref: ${{ needs.validate.outputs.sha }}
 
   docs-checks:
     needs: validate
@@ -66,8 +61,6 @@ jobs:
   plugin-checks:
     needs: validate
     uses: ./.github/workflows/reusable-plugin.yml
-    with:
-      ref: ${{ needs.validate.outputs.sha }}
 
   e2e-api-extended:
     needs: validate
@@ -96,6 +89,22 @@ jobs:
       summary_title: Release E2E (Infra)
       timeout_minutes: 35
 
+  # Non-chrome browser parity (cloak, ghost-chrome). Advisory, like the chrome e2e jobs.
+  e2e-extended-browsers:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [cloak, ghost-chrome]
+        suite: [api-extended, cli-extended, infra-extended]
+    uses: ./.github/workflows/reusable-e2e.yml
+    with:
+      ref: ${{ needs.validate.outputs.sha }}
+      suite: ${{ matrix.suite }}
+      browser: ${{ matrix.browser }}
+      summary_title: Release E2E (${{ matrix.suite }} / ${{ matrix.browser }})
+      timeout_minutes: 40
+
   smoke:
     needs: validate
     uses: ./.github/workflows/reusable-smoke.yml
@@ -108,22 +117,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.sha }}
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version-file: .bun-version
 
       - name: Install tygo
         run: go install github.com/gzuidhof/tygo@latest
@@ -160,18 +169,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
           registry-url: 'https://registry.npmjs.org'
 
       - name: Sync plugin version with release
-        working-directory: plugin
+        working-directory: plugins/openclaw
         env:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
@@ -189,11 +198,11 @@ jobs:
           fi
 
       - name: Install plugin deps
-        working-directory: plugin
+        working-directory: plugins/openclaw
         run: npm install --ignore-scripts --no-package-lock
 
       - name: Dry-run npm pack (validates prepack chain + files allowlist)
-        working-directory: plugin
+        working-directory: plugins/openclaw
         run: |
           npm pack --dry-run
           # Real pack so we know prepack actually emits dist/ before clawhub validates
@@ -208,7 +217,7 @@ jobs:
         run: clawhub login --token "$CLAWHUB_TOKEN" --no-browser
 
       - name: Dry-run ClawHub publish
-        working-directory: plugin
+        working-directory: plugins/openclaw
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           TAG: ${{ needs.validate.outputs.tag }}
@@ -221,7 +230,7 @@ jobs:
             --source-repo pinchtab/pinchtab \
             --source-commit "$(git rev-parse HEAD)" \
             --source-ref "$TAG" \
-            --source-path plugin \
+            --source-path plugins/openclaw \
             --dry-run
 
   approval:
@@ -237,6 +246,7 @@ jobs:
       - e2e-api-extended
       - e2e-cli-extended
       - e2e-infra-extended
+      - e2e-extended-browsers
       - smoke
       - publish-dry-run
       - plugin-publish-dry-run
@@ -273,9 +283,10 @@ jobs:
           echo "| E2E API | ${{ needs.e2e-api-extended.result == 'success' && '✅' || '⚠️ ' }}${{ needs.e2e-api-extended.result }} | ${{ needs.e2e-api-extended.outputs.passed || '-' }}/${{ needs.e2e-api-extended.outputs.tests || '-' }} | ${{ needs.e2e-api-extended.outputs.failed || '-' }} | ${{ needs.e2e-api-extended.outputs.test_time || '-' }} | ${{ needs.e2e-api-extended.outputs.overall_wall_time || '-' }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E CLI | ${{ needs.e2e-cli-extended.result == 'success' && '✅' || '⚠️ ' }}${{ needs.e2e-cli-extended.result }} | ${{ needs.e2e-cli-extended.outputs.passed || '-' }}/${{ needs.e2e-cli-extended.outputs.tests || '-' }} | ${{ needs.e2e-cli-extended.outputs.failed || '-' }} | ${{ needs.e2e-cli-extended.outputs.test_time || '-' }} | ${{ needs.e2e-cli-extended.outputs.overall_wall_time || '-' }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E Infra | ${{ needs.e2e-infra-extended.result == 'success' && '✅' || '⚠️ ' }}${{ needs.e2e-infra-extended.result }} | ${{ needs.e2e-infra-extended.outputs.passed || '-' }}/${{ needs.e2e-infra-extended.outputs.tests || '-' }} | ${{ needs.e2e-infra-extended.outputs.failed || '-' }} | ${{ needs.e2e-infra-extended.outputs.test_time || '-' }} | ${{ needs.e2e-infra-extended.outputs.overall_wall_time || '-' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| E2E cloak + ghost-chrome (advisory) | ${{ needs.e2e-extended-browsers.result == 'success' && '✅' || '⚠️ ' }}${{ needs.e2e-extended-browsers.result }} | - | - | - | - |" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${{ needs.e2e-api-extended.result }}" != "success" ] || [ "${{ needs.e2e-cli-extended.result }}" != "success" ] || [ "${{ needs.e2e-infra-extended.result }}" != "success" ] || [ "${{ needs.smoke.result }}" != "success" ]; then
+          if [ "${{ needs.e2e-api-extended.result }}" != "success" ] || [ "${{ needs.e2e-cli-extended.result }}" != "success" ] || [ "${{ needs.e2e-infra-extended.result }}" != "success" ] || [ "${{ needs.e2e-extended-browsers.result }}" != "success" ] || [ "${{ needs.smoke.result }}" != "success" ]; then
             echo "⚠️ **Some checks failed — review the E2E job summaries and uploaded result artifacts before approving.**" >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -291,7 +302,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.sha }}

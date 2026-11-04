@@ -31,27 +31,27 @@ func (o *Orchestrator) handleStartByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Port           string                 `json:"port,omitempty"`
-		Headless       bool                   `json:"headless"`
-		SecurityPolicy *bridge.SecurityPolicy `json:"securityPolicy,omitempty"`
+		Port            string                 `json:"port,omitempty"`
+		Headless        bool                   `json:"headless"`
+		SecurityPolicy  *bridge.SecurityPolicy `json:"securityPolicy,omitempty"`
+		Browser         string                 `json:"browser,omitempty"`
+		FallbackTargets []string               `json:"fallbackTargets,omitempty"`
 	}
-	if r.ContentLength > 0 {
-		if err := httpx.DecodeJSONBody(w, r, 0, &req); err != nil {
-			httpx.Error(w, httpx.StatusForJSONDecodeError(err), fmt.Errorf("invalid JSON"))
-			return
-		}
+	if err := httpx.DecodeOptionalJSONBody(w, r, 0, &req); err != nil {
+		httpx.Error(w, httpx.StatusForJSONDecodeError(err), err)
+		return
 	}
 	if err := validateStartInstanceSecurityPolicy(req.SecurityPolicy); err != nil {
 		httpx.Error(w, 400, err)
 		return
 	}
 
-	inst, err := o.LaunchWithOptions(name, req.Port, req.Headless, LaunchOptions{
+	inst, err := o.LaunchWithTargetSelection(name, req.Port, req.Headless, req.Browser, req.FallbackTargets, LaunchOptions{
 		SecurityPolicy: req.SecurityPolicy,
+		Browser:        req.Browser,
 	})
 	if err != nil {
-		statusCode := classifyLaunchError(err)
-		httpx.Error(w, statusCode, err)
+		writeLaunchError(w, err)
 		return
 	}
 	authn.AuditLog(r, "instance.started", "profileId", id, "profileName", name, "instanceId", inst.ID)
@@ -79,9 +79,11 @@ func (o *Orchestrator) handleProfileInstance(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		httpx.JSON(w, 200, map[string]any{
 			"name":    id,
+			"exists":  false,
 			"running": false,
-			"status":  "stopped",
+			"status":  "missing",
 			"port":    "",
+			"message": fmt.Sprintf("Profile %q does not exist. Creating and authenticating a reusable profile is a human setup step.", id),
 		})
 		return
 	}
@@ -91,6 +93,7 @@ func (o *Orchestrator) handleProfileInstance(w http.ResponseWriter, r *http.Requ
 		if inst.ProfileName == name && (inst.Status == "running" || inst.Status == "starting") {
 			httpx.JSON(w, 200, map[string]any{
 				"name":    name,
+				"exists":  true,
 				"running": inst.Status == "running",
 				"status":  inst.Status,
 				"port":    inst.Port,
@@ -101,6 +104,7 @@ func (o *Orchestrator) handleProfileInstance(w http.ResponseWriter, r *http.Requ
 	}
 	httpx.JSON(w, 200, map[string]any{
 		"name":    name,
+		"exists":  true,
 		"running": false,
 		"status":  "stopped",
 		"port":    "",

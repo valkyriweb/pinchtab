@@ -1,8 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pinchtab/pinchtab/internal/config"
@@ -44,7 +50,6 @@ func TestResolveCLIBase(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Save and restore global state
 			oldServerURL := serverURL
 			serverURL = tt.serverFlag
 			defer func() { serverURL = oldServerURL }()
@@ -188,8 +193,132 @@ func TestRunCLIWithInjectsAgentIDHeaders(t *testing.T) {
 	}
 }
 
+// TestPreflightBrowserBinary covers the fail-fast no-browser diagnosis that
+// replaces the bridge's opaque "instance not ready after 10s" 503 on the
+// documented `pinchtab nav` cold start.
+func TestPreflightBrowserBinary(t *testing.T) {
+	existing := filepath.Join(t.TempDir(), "chrome")
+	if err := os.WriteFile(existing, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("missing override fails fast with guidance", func(t *testing.T) {
+		err := preflightBrowserBinary(&config.RuntimeConfig{
+			DefaultBrowser: "chrome",
+			BrowserBinary:  filepath.Join(t.TempDir(), "does-not-exist"),
+		})
+		if err == nil {
+			t.Fatal("expected error for a missing browser.binary override")
+		}
+		if !strings.Contains(err.Error(), "browser executable") || !strings.Contains(err.Error(), "doctor") {
+			t.Errorf("error should describe the configured browser executable and point at doctor; got: %v", err)
+		}
+	})
+
+	t.Run("existing override passes", func(t *testing.T) {
+		if err := preflightBrowserBinary(&config.RuntimeConfig{
+			DefaultBrowser: "chrome",
+			BrowserBinary:  existing,
+		}); err != nil {
+			t.Errorf("expected nil for an existing override binary; got %v", err)
+		}
+	})
+
+	t.Run("default target binary passes", func(t *testing.T) {
+		if err := preflightBrowserBinary(&config.RuntimeConfig{
+			DefaultBrowser: config.BrowserChrome,
+			Targets: config.BrowserTargetsConfig{
+				"only": {
+					Provider: config.BrowserCloak,
+					Binary:   existing,
+				},
+			},
+		}); err != nil {
+			t.Errorf("expected nil for an existing default-target binary; got %v", err)
+		}
+	})
+
+	t.Run("external CDP attach skips local binary check", func(t *testing.T) {
+		if err := preflightBrowserBinary(&config.RuntimeConfig{
+			DefaultBrowser: "chrome",
+			CDPAttachURL:   "http://127.0.0.1:9222",
+		}); err != nil {
+			t.Errorf("expected nil when attaching to external CDP; got %v", err)
+		}
+	})
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestAnInvalidServerBaseExitsTwoNamingItsSource(t *testing.T) {
+	if args := os.Getenv("PINCHTAB_BAD_BASE_ARGS"); args != "" {
+		rootCmd.SetArgs(strings.Split(args, "\x1f"))
+		if err := rootCmd.Execute(); err != nil {
+			os.Exit(commandExitCode(err))
+		}
+		return
+	}
+
+	for _, tc := range []struct {
+		name, env, source, value string
+		args                     []string
+	}{
+		{"env without a scheme", "127.0.0.1:9867", "PINCHTAB_SERVER", "127.0.0.1:9867", []string{"tab"}},
+		{"env host read as a scheme", "localhost:9867", "PINCHTAB_SERVER", "localhost:9867", []string{"tab"}},
+		{"flag with a space in the host", "", "--server", "http://bad host:9867", []string{"--server", "http://bad host:9867", "tab"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := exec.Command(os.Args[0], "-test.run=^TestAnInvalidServerBaseExitsTwoNamingItsSource$", "-test.timeout=30s") // #nosec G204 -- re-executes this test binary with fixed arguments.
+			child.Env = append(os.Environ(),
+				"PINCHTAB_BAD_BASE_ARGS="+strings.Join(tc.args, "\x1f"),
+				"PINCHTAB_SERVER="+tc.env,
+				"PINCHTAB_TOKEN=x",
+				"HOME="+t.TempDir(),
+				"XDG_STATE_HOME="+t.TempDir(),
+			)
+			var stderr bytes.Buffer
+			child.Stderr = &stderr
+			err := child.Run()
+
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+				t.Fatalf("exit = %v, want 2; stderr:\n%s", err, stderr.String())
+			}
+			out := stderr.String()
+			if strings.Contains(out, "panic:") {
+				t.Fatalf("the CLI panicked:\n%s", out)
+			}
+			if !strings.Contains(out, tc.source) || !strings.Contains(out, `"`+tc.value+`"`) {
+				t.Fatalf("stderr does not name %s and %q:\n%s", tc.source, tc.value, out)
+			}
+		})
+	}
+}
+
+func TestValidServerBasesStillResolve(t *testing.T) {
+	oldServerURL := serverURL
+	t.Cleanup(func() { serverURL = oldServerURL })
+	for value, want := range map[string]string{
+		"http://127.0.0.1:9867":  "http://127.0.0.1:9867",
+		"https://host":           "https://host",
+		"http://127.0.0.1:9867/": "http://127.0.0.1:9867",
+	} {
+		for _, viaFlag := range []bool{true, false} {
+			serverURL = ""
+			t.Setenv("PINCHTAB_SERVER", "")
+			if viaFlag {
+				serverURL = value
+			} else {
+				t.Setenv("PINCHTAB_SERVER", value)
+			}
+			got, err := resolveBaseURL("http://127.0.0.1:9999")
+			if err != nil || got != want {
+				t.Errorf("%q (flag=%v) resolved to %q, %v; want %q", value, viaFlag, got, err, want)
+			}
+		}
+	}
 }

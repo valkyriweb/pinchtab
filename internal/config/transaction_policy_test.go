@@ -44,22 +44,21 @@ func TestLoadRejectsInvalidEnabledTransactionPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PINCHTAB_CONFIG", path)
-	defer func() {
-		if recover() == nil {
-			t.Fatal("Load did not reject invalid enabled transaction policy")
-		}
-	}()
-	Load()
+	if _, _, err := LoadConfig(); err == nil {
+		t.Fatal("LoadConfig did not reject invalid enabled transaction policy")
+	}
 }
 
-func TestLoadDoesNotPanicForUnrelatedValidationError(t *testing.T) {
+func TestLoadDoesNotFailForUnrelatedValidationError(t *testing.T) {
 	clearConfigEnvVars(t)
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"server":{"port":"invalid"},"security":{"transactionPolicy":{"enabled":true,"hosts":["supplier.example"],"denyRules":[{"method":"POST","pathPrefix":"/checkout"}]}}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PINCHTAB_CONFIG", path)
-	Load()
+	if _, _, err := LoadConfig(); err != nil {
+		t.Fatalf("unrelated validation error was fatal: %v", err)
+	}
 }
 
 func TestApplyFileConfigToRuntimeDoesNotToggleTransactionPolicy(t *testing.T) {

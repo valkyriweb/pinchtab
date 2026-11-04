@@ -14,6 +14,8 @@ const stealthLevel = (typeof __pinchtab_stealth_level !== 'undefined') ? __pinch
 const headlessMode = (typeof __pinchtab_headless !== 'undefined') ? !!__pinchtab_headless : true;
 const stealthProfile = (typeof __pinchtab_profile !== 'undefined' && __pinchtab_profile && typeof __pinchtab_profile === 'object') ? __pinchtab_profile : {};
 const navigatorProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+const nativeFunctionToString = Function.prototype.toString;
+const nativeFunctionSourceMap = (typeof WeakMap === 'function') ? new WeakMap() : null;
 
 function deriveNavigatorPlatformFromUA(ua) {
   if (ua.includes('Macintosh') || ua.includes('Mac OS X')) return 'MacIntel';
@@ -67,8 +69,44 @@ const seededRandom = (function() {
   };
 })();
 
-function maskFunctionAsNative(fn, name) {
+const stackSanitizerPatterns = [
+  /\b(?:Object|Reflect)\.(?:apply|construct|get|set)\b/,
+  /\b(?:maskFunctionAsNative|wrapCallableAsNative|wrapConstructableAsNative|createNativeLikeGetter)\b/,
+  /__pinchtab_/,
+  /\bProxy\b/
+];
+
+function makeNativeFunctionSource(name) {
+  const trimmed = (typeof name === 'string') ? name.trim() : '';
+  return trimmed ? 'function ' + trimmed + '() { [native code] }' : 'function () { [native code] }';
+}
+
+function recordNativeFunctionSource(fn, name) {
+  if (!nativeFunctionSourceMap || typeof fn !== 'function') return fn;
+  try { nativeFunctionSourceMap.set(fn, makeNativeFunctionSource(name || (fn && fn.name) || '')); } catch(e) {}
   return fn;
+}
+
+function maskFunctionAsNative(fn, name) {
+  if (typeof fn !== 'function') return fn;
+  return recordNativeFunctionSource(fn, name || (fn && fn.name) || '');
+}
+
+function installFunctionToStringMask(targetProto) {
+  if (!targetProto || !nativeFunctionSourceMap) return;
+  try {
+    function toString() {
+      if (typeof this === 'function') {
+        try { const s = nativeFunctionSourceMap.get(this); if (s) return s; } catch(e) {}
+      }
+      return Reflect.apply(nativeFunctionToString, this, []);
+    }
+    // Register the replacement toString itself so toString.call(toString) returns [native code].
+    try { nativeFunctionSourceMap.set(toString, makeNativeFunctionSource('toString')); } catch(e) {}
+    Object.defineProperty(targetProto, 'toString', {
+      value: toString, configurable: true, writable: true, enumerable: false
+    });
+  } catch(e) {}
 }
 
 function wrapCallableAsNative(fn, applyHandler) {
@@ -76,11 +114,11 @@ function wrapCallableAsNative(fn, applyHandler) {
     return fn;
   }
   try {
-    return new Proxy(fn, {
+    return new Proxy(fn, wrapProxyHandlerWithSanitizedErrors({
       apply(target, thisArg, args) {
         return applyHandler(target, thisArg, args || []);
       }
-    });
+    }));
   } catch (e) {
     return fn;
   }
@@ -91,14 +129,14 @@ function wrapConstructableAsNative(fn, constructHandler) {
     return fn;
   }
   try {
-    return new Proxy(fn, {
+    return new Proxy(fn, wrapProxyHandlerWithSanitizedErrors({
       apply(target, thisArg, args) {
         return constructHandler(target, args || [], target);
       },
       construct(target, args, newTarget) {
         return constructHandler(target, args || [], newTarget || target);
       }
-    });
+    }));
   } catch (e) {
     return fn;
   }
@@ -126,6 +164,31 @@ function sanitizeErrorStack(error) {
     }
   } catch (e) {}
   return error;
+}
+
+function sanitizeThrownError(error) {
+  if (stealthLevel !== 'full') return error;
+  return sanitizeErrorStack(error);
+}
+
+function wrapProxyHandlerWithSanitizedErrors(handler) {
+  if (!handler || typeof handler !== 'object') return handler;
+  const wrapped = {};
+  for (const trap of Object.keys(handler)) {
+    if (typeof handler[trap] === 'function') {
+      const original = handler[trap];
+      wrapped[trap] = function() {
+        try {
+          return original.apply(this, arguments);
+        } catch (e) {
+          throw sanitizeThrownError(e);
+        }
+      };
+    } else {
+      wrapped[trap] = handler[trap];
+    }
+  }
+  return wrapped;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -272,10 +335,18 @@ if (!window.chrome.runtime) {
   }
 })();
 
-Object.defineProperty(navigator.connection || {}, 'rtt', {
-  get: () => 50 + Math.floor(seededRandom(sessionSeed * 3) * 100),
-  configurable: true
-});
+if (navigator.connection && !('rtt' in navigator.connection)) {
+  try {
+    const connectionProto = Object.getPrototypeOf(navigator.connection);
+    if (connectionProto && !Object.prototype.hasOwnProperty.call(connectionProto, 'rtt')) {
+      Object.defineProperty(connectionProto, 'rtt', {
+        get: () => 50 + Math.floor(seededRandom(sessionSeed * 3) * 100),
+        configurable: true,
+        enumerable: true
+      });
+    }
+  } catch (e) {}
+}
 
 // NETWORK INFORMATION - downlinkMax is often missing in headless.
 // Define it on the prototype so page checks see a normal API surface without
@@ -303,7 +374,9 @@ if (navigator.connection) {
   const chromeHeight = Math.max(screenHeight - outerHeight, 32);
   const availHeight = Math.max(outerHeight, screenHeight - chromeHeight);
 
-  Object.defineProperty(screen, 'width', { get: () => screenWidth, configurable: true });
+  const screenWidthGetter = function width() { return screenWidth; };
+  recordNativeFunctionSource(screenWidthGetter, 'get width');
+  Object.defineProperty(screen, 'width', { get: screenWidthGetter, configurable: true });
   Object.defineProperty(screen, 'height', { get: () => screenHeight, configurable: true });
   Object.defineProperty(screen, 'availWidth', { get: () => screenWidth, configurable: true });
   Object.defineProperty(screen, 'availHeight', { get: () => availHeight, configurable: true });
@@ -323,9 +396,13 @@ if (navigator.connection) {
 })();
 
 if (!(window.devicePixelRatio > 0)) {
+  const winProto = Object.getPrototypeOf(window) || Window.prototype;
   try {
-    Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true });
-  } catch (e) {}
+    delete window.devicePixelRatio;
+    Object.defineProperty(winProto, 'devicePixelRatio', { get: () => 1, configurable: true });
+  } catch (e) {
+    try { Object.defineProperty(window, 'devicePixelRatio', { get: () => 1, configurable: true }); } catch (e2) {}
+  }
 }
 
 // BATTERY API - Headless often lacks this
@@ -391,8 +468,13 @@ if (stealthLevel === 'medium' || stealthLevel === 'full') {
     window.chrome.runtime.sendMessage = wrapCallableAsNative(sendMessage, (target, thisArg, args) => Reflect.apply(target, thisArg, args));
   }
   
-  window.chrome.runtime.onConnect = window.chrome.runtime.onConnect || { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } };
-  window.chrome.runtime.onMessage = window.chrome.runtime.onMessage || { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } };
+  const makeEventHub = () => ({
+    addListener: maskFunctionAsNative(function addListener() {}, 'addListener'),
+    removeListener: maskFunctionAsNative(function removeListener() {}, 'removeListener'),
+    hasListener: maskFunctionAsNative(function hasListener() { return false; }, 'hasListener')
+  });
+  window.chrome.runtime.onConnect = window.chrome.runtime.onConnect || makeEventHub();
+  window.chrome.runtime.onMessage = window.chrome.runtime.onMessage || makeEventHub();
   
 })();
 
@@ -444,6 +526,9 @@ if (navigator.maxTouchPoints !== 0) {
     try {
       if (!frameWindow || frameWindow === window || frameWindow.__pinchtabIframePatched) return;
       Object.defineProperty(frameWindow, '__pinchtabIframePatched', { value: true, configurable: true });
+      if (stealthLevel === 'full' && frameWindow.Function && frameWindow.Function.prototype) {
+        installFunctionToStringMask(frameWindow.Function.prototype);
+      }
 
       if (window.chrome && !frameWindow.chrome) {
         frameWindow.chrome = {};
@@ -531,6 +616,39 @@ if (navigator.maxTouchPoints !== 0) {
   }
 
   document.querySelectorAll('iframe').forEach(patchIframeElement);
+
+  if (stealthLevel === 'full') {
+    try {
+      const iframeProto = HTMLIFrameElement.prototype;
+      const nativeCWDesc = Object.getOwnPropertyDescriptor(iframeProto, 'contentWindow');
+      if (nativeCWDesc && nativeCWDesc.get) {
+        const nativeCWGet = nativeCWDesc.get;
+        function contentWindowGetter() {
+          const fw = Reflect.apply(nativeCWGet, this, []);
+          if (fw && fw !== window) { try { patchIframeWindow(fw); } catch(e) {} }
+          return fw;
+        }
+        recordNativeFunctionSource(contentWindowGetter, 'get contentWindow');
+        Object.defineProperty(iframeProto, 'contentWindow', {
+          get: contentWindowGetter, configurable: true, enumerable: true
+        });
+      }
+      const nativeCDDesc = Object.getOwnPropertyDescriptor(iframeProto, 'contentDocument');
+      if (nativeCDDesc && nativeCDDesc.get) {
+        const nativeCDGet = nativeCDDesc.get;
+        function contentDocumentGetter() {
+          const fd = Reflect.apply(nativeCDGet, this, []);
+          const fw = fd && fd.defaultView;
+          if (fw && fw !== window) { try { patchIframeWindow(fw); } catch(e) {} }
+          return fd;
+        }
+        recordNativeFunctionSource(contentDocumentGetter, 'get contentDocument');
+        Object.defineProperty(iframeProto, 'contentDocument', {
+          get: contentDocumentGetter, configurable: true, enumerable: true
+        });
+      }
+    } catch (e) {}
+  }
 })();
 
 } // end medium level
@@ -547,15 +665,22 @@ if (navigator.maxTouchPoints !== 0) {
 
 if (stealthLevel === 'full') {
 
+installFunctionToStringMask(Function.prototype);
+
 (function() {
   if (!headlessMode) return;
   const numericWindowValue = (value) => {
     return Number.isFinite(value) ? value : 0;
   };
+
+  const winProto = Object.getPrototypeOf(window) || Window.prototype;
   const defineWindowMetric = (name, value) => {
     try {
-      Object.defineProperty(window, name, { get: () => value, configurable: true });
-    } catch (e) {}
+      delete window[name];
+      Object.defineProperty(winProto, name, { get: () => value, configurable: true });
+    } catch (e) {
+      try { Object.defineProperty(window, name, { get: () => value, configurable: true }); } catch (e2) {}
+    }
   };
 
   const screenX = Math.max(numericWindowValue(window.screenX), numericWindowValue(window.screenLeft));
