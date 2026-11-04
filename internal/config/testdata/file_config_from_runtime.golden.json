@@ -122,6 +122,24 @@
       ],
       "scanTimeoutSec": 3,
       "shieldThreshold": 55
+    },
+    "transactionPolicy": {
+      "enabled": true,
+      "hosts": [
+        "supplier.example"
+      ],
+      "denyRules": [
+        {
+          "method": "POST",
+          "pathPrefix": "/checkout"
+        }
+      ],
+      "allowRules": [
+        {
+          "method": "GET",
+          "pathPrefix": "/checkout/status"
+        }
+      ]
     }
   },
   "profiles": {

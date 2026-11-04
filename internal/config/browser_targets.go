@@ -265,7 +265,20 @@ func CloneRuntimeConfig(in *RuntimeConfig) *RuntimeConfig {
 	out.AutoSolver.Solvers = cloneStringSlice(in.AutoSolver.Solvers)
 	out.Proxy = cloneBrowserProxyConfig(in.Proxy)
 	out.Targets = cloneBrowserTargetsConfig(in.Targets)
+	out.TransactionPolicy = cloneTransactionPolicyConfig(in.TransactionPolicy)
 	return &out
+}
+
+func cloneTransactionPolicyConfig(in TransactionPolicyConfig) TransactionPolicyConfig {
+	out := in
+	out.Hosts = cloneStringSlice(in.Hosts)
+	if len(in.DenyRules) > 0 {
+		out.DenyRules = append([]TransactionPolicyRule(nil), in.DenyRules...)
+	}
+	if len(in.AllowRules) > 0 {
+		out.AllowRules = append([]TransactionPolicyRule(nil), in.AllowRules...)
+	}
+	return out
 }
 
 func cloneStringSlice(in []string) []string {

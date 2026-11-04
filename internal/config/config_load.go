@@ -508,7 +508,7 @@ func applySecurityConfig(cfg *RuntimeConfig, s SecurityConfig) {
 		cfg.IDPI = *s.IDPI
 	}
 	// TransactionPolicy – copy the whole struct; disabled by default.
-	cfg.TransactionPolicy = s.TransactionPolicy
+	cfg.TransactionPolicy = cloneTransactionPolicyConfig(s.TransactionPolicy)
 	cfg.AllowedDomains = effectiveSecurityAllowedDomains(s)
 	if s.Attach.Enabled != nil {
 		cfg.AttachEnabled = *s.Attach.Enabled

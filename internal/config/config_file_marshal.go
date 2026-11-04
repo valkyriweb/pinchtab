@@ -496,7 +496,7 @@ func securityConfigFromRuntime(cfg *RuntimeConfig) SecurityConfig {
 			ForwardProxyAuth: ptr(cfg.AttachForwardProxyAuth),
 		},
 		IDPI:              &idpi,
-		TransactionPolicy: cfg.TransactionPolicy,
+		TransactionPolicy: cloneTransactionPolicyConfig(cfg.TransactionPolicy),
 	}
 }
 

@@ -286,6 +286,14 @@ var directoryRemovers = []directoryRemover{
 		why:               "remove is id-addressed and in-use-gated but NOT eligibility-gated, so it can reach a live profile by design — that is why a reclaim must never route through it; Import only rolls back the destination it just created; resetProfileDir removes named caches inside one profile, never the profile directory",
 	},
 	{
+		path:              "internal/bridge/runtime/transaction_policy_state.go",
+		funcs:             []string{"writeTransactionPolicyExtension", "retainTransactionPolicyGenerations"},
+		underProfilesBase: false,
+		quarantineGated:   false,
+		route:             "bridge launch with security.transactionPolicy enabled (PrepareTransactionPolicyExtension)",
+		why:               "removes only its own staging directory and superseded generated extension generations under the private transaction-policy state root, never a profile",
+	},
+	{
 		path:              "internal/orchestrator/instance_stop.go",
 		funcs:             []string{"cleanupStoppedProfile", "markStopped"},
 		underProfilesBase: true,

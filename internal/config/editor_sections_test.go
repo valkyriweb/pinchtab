@@ -168,7 +168,8 @@ var unreachableConfigLeaves = map[string]string{
 // unreachableConfigSubtrees are whole blocks excluded by one reason, so the table does not
 // have to list every leaf of a retired structure.
 var unreachableConfigSubtrees = map[string]string{
-	"browsers.config.": "retired block, never applied anywhere and superseded by browser.targets; parsed only so validation can reject it with guidance and so existing files round-trip",
+	"security.transactionPolicy.": "deliberately file-only: hosts and rule lists are structured, validated as one unit (FatalAtLoad) and only take effect on browser restart, so a per-leaf setter could stage a half-written deny policy",
+	"browsers.config.":            "retired block, never applied anywhere and superseded by browser.targets; parsed only so validation can reject it with guidance and so existing files round-trip",
 }
 
 // The section walk one level down. The section vocabulary is derived from FileConfig and
