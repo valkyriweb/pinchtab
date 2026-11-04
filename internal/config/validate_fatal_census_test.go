@@ -22,6 +22,24 @@ var fatalAtLoadMembers = map[string]fatalAtLoadMember{
 		reason:       "an uninterpretable authentication posture must not silently fall back to a weaker mode",
 		declarations: 2, // the unsupported-required and invalid-value refusals are both fatal
 	},
+	// An enabled-but-invalid transaction policy must never load: a half-configured
+	// deny policy silently permits the supplier traffic it was meant to block.
+	"security.transactionPolicy.hosts": {
+		reason:       "an enabled transaction policy without valid hosts guards nothing",
+		declarations: 2, // empty list and malformed host
+	},
+	"security.transactionPolicy.denyRules": {
+		reason:       "an enabled transaction policy without deny rules blocks nothing",
+		declarations: 1,
+	},
+	"browser.extensionPaths": {
+		reason:       "operator extensions alongside the transaction policy extension void its activation proof",
+		declarations: 1,
+	},
+	"<non-literal field>": {
+		reason:       "transaction policy deny/allow rule errors (field chosen per rule group) are fatal for the same reason",
+		declarations: 6,
+	},
 }
 
 func TestFatalAtLoadMembershipIsExplicitAndExhaustive(t *testing.T) {

@@ -85,6 +85,9 @@ func (o *Orchestrator) AttachWithProvider(name, cdpURL, provider string) (*bridg
 }
 
 func (o *Orchestrator) AttachWithOptions(name, cdpURL string, opts AttachOptions) (*bridge.Instance, error) {
+	if rc := o.cfg(); rc != nil && rc.TransactionPolicy.Enabled {
+		return nil, fmt.Errorf("transaction policy requires a PinchTab-managed browser launch; attached browsers are not protected")
+	}
 	if err := profiles.ValidateProfileName(name); err != nil {
 		return nil, err
 	}
