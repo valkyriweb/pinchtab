@@ -42,6 +42,27 @@ var screenshotCmd = &cobra.Command{
 	},
 }
 
+var annotateCmd = &cobra.Command{
+	Use:   "annotate",
+	Short: "Inject a persistent, clickable annotation overlay on the live page (--clear to remove)",
+	Run: func(cmd *cobra.Command, args []string) {
+		runCLI(func(rt cliRuntime) {
+			browseractions.Annotate(rt.client, rt.base, rt.token, cmd)
+		})
+	},
+}
+
+var captureCmd = &cobra.Command{
+	Use:     "capture",
+	Aliases: []string{"cap"},
+	Short:   "Paired screenshot + accessibility snapshot from the same DOM epoch",
+	Run: func(cmd *cobra.Command, args []string) {
+		runCLI(func(rt cliRuntime) {
+			browseractions.Capture(rt.client, rt.base, rt.token, cmd)
+		})
+	},
+}
+
 var evalCmd = &cobra.Command{
 	Use:   "eval <expression>",
 	Short: "Evaluate JavaScript",
@@ -151,8 +172,12 @@ var boxCmd = &cobra.Command{
 
 var visibleCmd = &cobra.Command{
 	Use:   "visible <ref>",
-	Short: "Check if an element is visible by ref",
-	Args:  cobra.ExactArgs(1),
+	Short: "Check if an element is rendered (display/visibility/opacity/size) by ref",
+	Long: `Check if an element is rendered by ref: display, visibility, opacity and a
+non-zero box. Scroll position is not an input, so an element far below the fold
+is still rendered. Use --json to also read onScreen, the viewport-intersection
+answer that the capture snapshot's per-node visible field publishes.`,
+	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		runCLI(func(rt cliRuntime) {
 			browseractions.Visible(rt.client, rt.base, rt.token, cmd, args)
@@ -200,7 +225,7 @@ var downloadCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		args[0] = urls.Normalize(args[0])
 		runCLI(func(rt cliRuntime) {
-			browseractions.Download(rt.client, rt.base, rt.token, args, stringFlag(cmd, "output"))
+			browseractions.Download(rt.client, rt.base, rt.token, args, stringFlag(cmd, "output"), stringFlag(cmd, "tab"))
 		})
 	},
 }
@@ -211,7 +236,7 @@ var uploadCmd = &cobra.Command{
 	Args:  cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		runCLI(func(rt cliRuntime) {
-			browseractions.Upload(rt.client, rt.base, rt.token, args, stringFlag(cmd, "selector"))
+			browseractions.Upload(rt.client, rt.base, rt.token, args, stringFlag(cmd, "selector"), stringFlag(cmd, "tab"))
 		})
 	},
 }
@@ -223,6 +248,17 @@ var findCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		runCLI(func(rt cliRuntime) {
 			browseractions.Find(rt.client, rt.base, rt.token, args[0], cmd)
+		})
+	},
+}
+
+var extractCmd = &cobra.Command{
+	Use:   "extract --schema <file|->",
+	Short: "Extract schema-typed data from the page as JSON",
+	Args:  cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		runCLI(func(rt cliRuntime) {
+			browseractions.Extract(rt.client, rt.base, rt.token, cmd)
 		})
 	},
 }

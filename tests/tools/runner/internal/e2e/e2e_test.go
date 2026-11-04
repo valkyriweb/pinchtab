@@ -2,12 +2,19 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestDryRunBasicSuitePlan(t *testing.T) {
@@ -26,14 +33,14 @@ func TestDryRunBasicSuitePlan(t *testing.T) {
 		"E2E_HELPER=api",
 		"E2E_SCENARIO_DIR=scenarios/api",
 		"E2E_SUMMARY_TITLE=PinchTab E2E API Suite",
-		"runner-api /bin/bash /e2e/run.sh scenario=actions-basic.sh",
+		"runner-api /bin/bash /e2e/run.sh scenario=",
 		"E2E_HELPER=cli",
 		"E2E_SCENARIO_DIR=scenarios/cli",
 		"E2E_SUMMARY_TITLE=PinchTab E2E CLI Suite",
-		"runner-cli /bin/bash /e2e/run.sh scenario=actions-basic.sh",
+		"runner-cli /bin/bash /e2e/run.sh scenario=",
 		"E2E_SCENARIO_DIR=scenarios/infra",
 		"E2E_SUMMARY_TITLE=PinchTab E2E Infra Suite",
-		"runner-api /bin/bash /e2e/run.sh scenario=network-basic.sh",
+		"scenario=network-basic.sh",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dry-run output missing %q:\n%s", want, out)
@@ -52,19 +59,21 @@ func TestDryRunExtendedPlan(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"suite:  extended",
-		"docker compose -f tests/e2e/docker-compose-multi.yml up -d pinchtab pinchtab-secure pinchtab-medium pinchtab-full pinchtab-lite pinchtab-bridge fixtures",
+		"suite:    extended",
+		"docker compose -f tests/e2e/docker-compose-multi.yml up -d pinchtab pinchtab-secure pinchtab-medium pinchtab-full pinchtab-retain pinchtab-ghostchrome pinchtab-bridge fixtures",
 		"run --rm --no-deps",
 		"E2E_READY_TARGETS=E2E_SERVER E2E_SECURE_SERVER",
 		"E2E_SUMMARY_TITLE=PinchTab E2E API Extended Suite",
-		"runner-api /bin/bash /e2e/run.sh scenario=actions-basic.sh",
+		"runner-api /bin/bash /e2e/run.sh scenario=",
 		"scenario=actions-extended.sh",
+		"scenario=network-retain-body.sh",
 		"E2E_SUMMARY_TITLE=PinchTab E2E CLI Extended Suite",
-		"runner-cli /bin/bash /e2e/run.sh scenario=actions-basic.sh",
+		"runner-cli /bin/bash /e2e/run.sh scenario=",
 		"scenario=actions-extended.sh",
 		"E2E_SUMMARY_TITLE=PinchTab E2E Infra Extended Suite",
-		"E2E_READY_TARGETS=E2E_SERVER E2E_SECURE_SERVER E2E_MEDIUM_SERVER E2E_FULL_SERVER E2E_LITE_SERVER E2E_BRIDGE_URL|60|E2E_BRIDGE_TOKEN",
-		"runner-api /bin/bash /e2e/run.sh scenario=network-basic.sh",
+		"E2E_READY_TARGETS=E2E_SERVER E2E_SECURE_SERVER E2E_MEDIUM_SERVER E2E_FULL_SERVER E2E_SERVER_GHOSTCHROME E2E_BRIDGE_URL|60|E2E_BRIDGE_TOKEN",
+		"scenario=browser-config-basic.sh",
+		"scenario=network-basic.sh",
 		"scenario=orchestrator-extended.sh",
 		"E2E_SUMMARY_TITLE=PinchTab E2E Plugin Suite",
 		"runner-api /bin/bash /e2e/run.sh scenario=plugin-basic.sh",
@@ -87,8 +96,8 @@ func TestDryRunSingleSuiteWithFilterAndLogs(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"suite:  infra-extended",
-		"logs:   hide",
+		"suite:    infra-extended",
+		"logs:     hide",
 		"filter: orchestrator",
 		"docker compose -f tests/e2e/docker-compose-multi.yml up -d pinchtab pinchtab-bridge fixtures",
 		"run --rm --no-deps",
@@ -171,6 +180,20 @@ func TestScenarioMetadataDefaultsAndManifestOverrides(t *testing.T) {
 	}
 	if !hasString(orchestrator.Tags, "multiinstance") || !hasString(orchestrator.Tags, "bridge") {
 		t.Fatalf("expected orchestrator tags, got: %#v", orchestrator.Tags)
+	}
+
+	retain, ok := catalog.find("api", "network-retain-body.sh")
+	if !ok {
+		t.Fatal("api/network-retain-body.sh missing from scenario catalog")
+	}
+	if got := strings.Join(retain.Services, " "); got != "pinchtab pinchtab-retain fixtures" {
+		t.Fatalf("unexpected retained-body services: %s", got)
+	}
+	if got := strings.Join(retain.Ready, " "); got != "E2E_SERVER E2E_RETAIN_SERVER" {
+		t.Fatalf("unexpected retained-body ready targets: %s", got)
+	}
+	if !hasString(retain.Tags, "retain") || !hasString(retain.Tags, "smoke") {
+		t.Fatalf("expected retained-body tags, got: %#v", retain.Tags)
 	}
 }
 
@@ -325,13 +348,9 @@ func TestPrintSuiteSummaryFromGoReportData(t *testing.T) {
 	out := stdout.String()
 	for _, want := range []string{
 		"== PinchTab E2E API Suite summary ==",
-		"[browser-basic] browser: health",
-		"Passed: 1/2",
-		"Failed: 1/2",
-		"Test time: 46ms",
-		"Suite wall time: 1.500s",
+		"Passed: 1/2 | Failed: 1 | Wall time: 1.500s",
 		"Failed tests:",
-		"- [browser-basic] browser: bad",
+		"✗ [browser-basic] browser: bad (34ms)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("summary output missing %q:\n%s", want, out)
@@ -483,6 +502,9 @@ func TestWriteGitHubActionsMetadataAddsRunnerFailureWithoutSuiteResults(t *testi
 }
 
 func TestBuildSharedStackRetriesNoCacheOnBuildKitSnapshotFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("compose retry test uses a POSIX shell script stub")
+	}
 	tmp := t.TempDir()
 	callsPath := filepath.Join(tmp, "calls.txt")
 	scriptPath := filepath.Join(tmp, "compose.sh")
@@ -535,6 +557,9 @@ exit 0
 }
 
 func TestBuildSharedStackDoesNotRetryNonCacheFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("compose retry test uses a POSIX shell script stub")
+	}
 	tmp := t.TempDir()
 	callsPath := filepath.Join(tmp, "calls.txt")
 	scriptPath := filepath.Join(tmp, "compose.sh")
@@ -573,6 +598,106 @@ exit 23
 	}
 }
 
+func TestBringUpSharedStackCloakBuildsSupportImagesOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	r := &Runner{
+		args:     Args{DryRun: true},
+		stdout:   &stdout,
+		stderr:   &stderr,
+		compose:  []string{"docker", "compose"},
+		logsMode: "hide",
+		overrides: &providerOverrides{
+			provider:     "cloak",
+			image:        defaultCloakImage,
+			composeFiles: []string{"/tmp/docker-compose.cloak.yml"},
+		},
+	}
+
+	if code := r.bringUpSharedStack("compose.yml", []string{"pinchtab", "fixtures"}, nil); code != 0 {
+		t.Fatalf("bringUpSharedStack returned %d, stderr: %s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"docker compose -f compose.yml -f /tmp/docker-compose.cloak.yml build fixtures runner-api runner-cli",
+		"docker compose -f compose.yml -f /tmp/docker-compose.cloak.yml up -d --no-build --force-recreate pinchtab fixtures",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, " build ") && strings.Contains(line, " pinchtab") {
+			t.Fatalf("cloak provider must not rebuild pinchtab services:\n%s", out)
+		}
+	}
+}
+
+func TestBringUpSharedStackCloakBuildsStockImageForGhostChrome(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	r := &Runner{
+		args:     Args{DryRun: true},
+		stdout:   &stdout,
+		stderr:   &stderr,
+		compose:  []string{"docker", "compose"},
+		logsMode: "hide",
+		overrides: &providerOverrides{
+			provider:     "cloak",
+			image:        defaultCloakImage,
+			composeFiles: []string{"/tmp/docker-compose.cloak.yml"},
+		},
+	}
+
+	// pinchtab-ghostchrome is keepStockProvider: it stays on e2e-pinchtab:latest
+	// even under cloak, so the stock pinchtab image must be built or the
+	// `up --no-build` fails with "No such image: e2e-pinchtab:latest".
+	services := []string{"pinchtab", "pinchtab-ghostchrome", "fixtures"}
+	if code := r.bringUpSharedStack("compose.yml", services, nil); code != 0 {
+		t.Fatalf("bringUpSharedStack returned %d, stderr: %s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	for _, want := range []string{
+		"docker compose -f compose.yml build pinchtab",
+		"docker compose -f compose.yml -f /tmp/docker-compose.cloak.yml build fixtures runner-api runner-cli",
+		"docker compose -f compose.yml -f /tmp/docker-compose.cloak.yml up -d --no-build --force-recreate pinchtab pinchtab-ghostchrome fixtures",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("cloak ghostchrome flow missing %q:\n%s", want, out)
+		}
+	}
+	bad := "docker compose -f compose.yml -f /tmp/docker-compose.cloak.yml build fixtures runner-api runner-cli pinchtab"
+	if strings.Contains(out, bad) {
+		t.Fatalf("stock pinchtab image must be built without cloak override:\n%s", out)
+	}
+}
+
+func TestDryRunCloakProviderDoesNotRequireImage(t *testing.T) {
+	t.Setenv("E2E_LOGS", "")
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{"--suite", "api", "--browser", "cloak", "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("Run returned %d, stderr: %s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	quotedOverride := "'" + dryRunCloakComposeOverride + "'"
+	for _, want := range []string{
+		"browser: cloak",
+		"docker compose -f tests/e2e/docker-compose.yml -f " + quotedOverride + " build fixtures runner-api runner-cli",
+		"docker compose -f tests/e2e/docker-compose.yml -f " + quotedOverride + " up -d --no-build --force-recreate pinchtab fixtures",
+		"PINCHTAB_E2E_BROWSER=cloak",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(stderr.String(), "image not found") {
+		t.Fatalf("dry-run should not inspect the cloak image, stderr:\n%s", stderr.String())
+	}
+}
+
 func TestStructuredEventTeeFiltersHumanOutputOnly(t *testing.T) {
 	var human, log bytes.Buffer
 	tee := &structuredEventTee{human: &human, log: &log}
@@ -594,7 +719,7 @@ func TestStructuredEventTeeFiltersHumanOutputOnly(t *testing.T) {
 
 func TestRejectsRemovedLegacyAliases(t *testing.T) {
 	t.Setenv("E2E_LOGS", "")
-	for _, suite := range []string{"pr", "release", "all"} {
+	for _, suite := range []string{"pr", "release", "all", "smoke-docker"} {
 		var stdout, stderr bytes.Buffer
 		if code := Run([]string{"--suite", suite, "--dry-run"}, &stdout, &stderr); code == 0 {
 			t.Fatalf("Run should reject legacy alias %q, stdout: %s", suite, stdout.String())
@@ -629,19 +754,20 @@ func TestDryRunSmokePlan(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"suite:  smoke",
-		`Skipping plugin-smoke: filter "" has no matching scenarios`,
+		"suite:    smoke",
 		"docker compose -f tests/e2e/docker-compose-multi.yml up -d pinchtab pinchtab-secure pinchtab-autoclose pinchtab-medium pinchtab-full fixtures",
 		"E2E_SUMMARY_TITLE=PinchTab E2E API Smoke Suite",
 		"runner-api /bin/bash /e2e/run.sh scenario=auto-switch-smoke.sh scenario=network-route-smoke.sh scenario=recording-smoke.sh scenario=tabs-autoclose-smoke.sh",
 		"E2E_SUMMARY_TITLE=PinchTab E2E CLI Smoke Suite",
-		"runner-cli /bin/bash /e2e/run.sh scenario=system-smoke.sh scenario=tabs-smoke.sh",
+		"runner-cli /bin/bash /e2e/run.sh scenario=library-mode-smoke.sh scenario=system-smoke.sh scenario=tabs-smoke.sh",
 		"docker compose -f tests/e2e/docker-compose-multi.yml restart pinchtab",
 		"E2E_SUMMARY_TITLE=PinchTab E2E Infra Smoke Suite",
-		"runner-api /bin/bash /e2e/run.sh scenario=autosolver-smoke.sh scenario=dashboard-smoke.sh scenario=orchestrator-smoke.sh scenario=security-smoke.sh",
+		"runner-api /bin/bash /e2e/run.sh scenario=autosolver-smoke.sh scenario=browser-routing-smoke.sh scenario=dashboard-smoke.sh scenario=orchestrator-smoke.sh scenario=security-smoke.sh",
+		"E2E_SUMMARY_TITLE=PinchTab E2E Plugin Smoke Suite",
+		"runner-api /bin/bash /e2e/run.sh scenario=plugin-smoke.sh",
 		"== E2E Docker Smoke tests (host) ==",
-		"docker build -t pinchtab-release-smoke:dry-run .",
-		"docker build --platform linux/amd64 -f tests/tools/docker/chrome-cft-smoke.Dockerfile -t pinchtab-chrome-cft-smoke:dry-run .",
+		"docker build --load -t pinchtab-release-smoke:dry-run .",
+		"docker build --load --platform linux/amd64 -f tests/tools/docker/chrome-cft-smoke.Dockerfile -t pinchtab-chrome-cft-smoke:dry-run .",
 		"bash scripts/docker-smoke.sh pinchtab-release-smoke:dry-run",
 		"bash scripts/docker-chrome-cft-smoke.sh pinchtab-chrome-cft-smoke:dry-run",
 		"bash scripts/docker-port-conflict-smoke.sh pinchtab-chrome-cft-smoke:dry-run",
@@ -661,19 +787,20 @@ func TestDryRunSmokePlan(t *testing.T) {
 	}
 }
 
-func TestDryRunSmokeDockerPlan(t *testing.T) {
+func TestDryRunSmokeFilterDockerPlan(t *testing.T) {
 	t.Setenv("E2E_LOGS", "")
 	var stdout, stderr bytes.Buffer
 
-	if code := Run([]string{"--suite", "smoke-docker", "--dry-run"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"--suite", "smoke", "--filter", "docker", "--dry-run"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("Run returned %d, stderr: %s", code, stderr.String())
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"suite:  smoke-docker",
+		"suite:    smoke",
+		"filter: docker",
 		"== E2E Docker Smoke tests (host) ==",
-		"docker build -t pinchtab-release-smoke:dry-run .",
-		"docker build --platform linux/amd64 -f tests/tools/docker/chrome-cft-smoke.Dockerfile -t pinchtab-chrome-cft-smoke:dry-run .",
+		"docker build --load -t pinchtab-release-smoke:dry-run .",
+		"docker build --load --platform linux/amd64 -f tests/tools/docker/chrome-cft-smoke.Dockerfile -t pinchtab-chrome-cft-smoke:dry-run .",
 		"bash scripts/docker-smoke.sh pinchtab-release-smoke:dry-run",
 		"bash scripts/docker-chrome-cft-smoke.sh pinchtab-chrome-cft-smoke:dry-run",
 		"bash scripts/docker-port-conflict-smoke.sh pinchtab-chrome-cft-smoke:dry-run",
@@ -684,20 +811,20 @@ func TestDryRunSmokeDockerPlan(t *testing.T) {
 		}
 	}
 	if strings.Contains(out, "docker compose -f tests/e2e/docker-compose-multi.yml up") {
-		t.Fatalf("smoke-docker should not start the compose stack:\n%s", out)
+		t.Fatalf("smoke --filter docker should not start the compose stack:\n%s", out)
 	}
 }
 
-func TestDryRunSmokeDockerFilterAddsImageBuildDependency(t *testing.T) {
+func TestDryRunSmokeFilterMCPAddsImageBuildDependency(t *testing.T) {
 	t.Setenv("E2E_LOGS", "")
 	var stdout, stderr bytes.Buffer
 
-	if code := Run([]string{"--suite", "smoke-docker", "--filter", "mcp", "--dry-run"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"--suite", "smoke", "--filter", "mcp", "--dry-run"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("Run returned %d, stderr: %s", code, stderr.String())
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"docker build -t pinchtab-release-smoke:dry-run .",
+		"docker build --load -t pinchtab-release-smoke:dry-run .",
 		"bash scripts/docker-mcp-smoke.sh pinchtab-release-smoke:dry-run",
 	} {
 		if !strings.Contains(out, want) {
@@ -724,7 +851,7 @@ func TestDryRunSmokeOrchestratorDoesNotRunDockerSmoke(t *testing.T) {
 	}
 	out := stdout.String()
 	for _, want := range []string{
-		"suite:  smoke-orchestrator",
+		"suite:    smoke-orchestrator",
 		"runner-api /bin/bash /e2e/run.sh scenario=orchestrator-smoke.sh",
 	} {
 		if !strings.Contains(out, want) {
@@ -733,5 +860,467 @@ func TestDryRunSmokeOrchestratorDoesNotRunDockerSmoke(t *testing.T) {
 	}
 	if strings.Contains(out, "E2E Docker Smoke tests") {
 		t.Fatalf("smoke-orchestrator should not run Docker smoke steps:\n%s", out)
+	}
+}
+
+func TestDryRunChromeProviderShowsChromeInPlan(t *testing.T) {
+	t.Setenv("E2E_LOGS", "")
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{"--suite", "api", "--browser", "chrome", "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("Run returned %d, stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"browser:  chrome",
+		"PINCHTAB_E2E_BROWSER=chrome",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDryRunProviderMatrixShowsBothProviders(t *testing.T) {
+	t.Setenv("E2E_LOGS", "")
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{"--suite", "api", "--browser", "all", "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("Run returned %d, stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"browser matrix: chrome, cloak, ghost-chrome",
+		"browser matrix [1/3]: chrome",
+		"browser matrix [2/3]: cloak",
+		"browser matrix [3/3]: ghost-chrome",
+		"PINCHTAB_E2E_BROWSER=chrome",
+		"PINCHTAB_E2E_BROWSER=cloak",
+		"PINCHTAB_E2E_BROWSER=ghost-chrome",
+		"Browser matrix completed: all 3 browsers passed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("matrix dry-run output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDryRunProviderMatrixCommaSeparated(t *testing.T) {
+	t.Setenv("E2E_LOGS", "")
+	var stdout, stderr bytes.Buffer
+
+	code := Run([]string{"--suite", "api", "--browser", "chrome,cloak", "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("Run returned %d, stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"browser matrix: chrome, cloak",
+		"browser matrix [1/2]: chrome",
+		"browser matrix [2/2]: cloak",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("comma-separated matrix dry-run output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRejectsUnknownProvider(t *testing.T) {
+	t.Setenv("E2E_LOGS", "")
+	var stdout, stderr bytes.Buffer
+
+	if code := Run([]string{"--suite", "basic", "--browser", "firefox", "--dry-run"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("Run should reject unknown provider, stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown browser") {
+		t.Fatalf("stderr should mention unknown provider: %s", stderr.String())
+	}
+}
+
+func TestRejectsPartiallyUnknownProviderList(t *testing.T) {
+	t.Setenv("E2E_LOGS", "")
+	var stdout, stderr bytes.Buffer
+
+	if code := Run([]string{"--suite", "basic", "--browser", "chrome,firefox", "--dry-run"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("Run should reject unknown provider in list, stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown browser") {
+		t.Fatalf("stderr should mention unknown provider: %s", stderr.String())
+	}
+}
+
+func TestResolveProviderList(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{"chrome", []string{"chrome"}},
+		{"cloak", []string{"cloak"}},
+		{"all", []string{"chrome", "cloak", "ghost-chrome"}},
+		{"chrome,cloak", []string{"chrome", "cloak"}},
+		{"cloak,chrome", []string{"cloak", "chrome"}},
+		{"chrome,chrome", []string{"chrome"}},
+		{"", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := resolveProviderList(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("resolveProviderList(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			for i, v := range got {
+				if v != tt.want[i] {
+					t.Fatalf("resolveProviderList(%q)[%d] = %q, want %q", tt.input, i, v, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseArgsProviderDefaults(t *testing.T) {
+	args, err := ParseArgs([]string{"--suite", "basic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Provider != "chrome" {
+		t.Fatalf("default provider = %q, want chrome", args.Provider)
+	}
+	if len(args.Providers) != 1 || args.Providers[0] != "chrome" {
+		t.Fatalf("default providers = %v, want [chrome]", args.Providers)
+	}
+}
+
+func TestParseArgsProviderAll(t *testing.T) {
+	args, err := ParseArgs([]string{"--suite", "basic", "--browser", "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Provider != "all" {
+		t.Fatalf("provider = %q, want all", args.Provider)
+	}
+	if len(args.Providers) != 3 || args.Providers[0] != "chrome" || args.Providers[1] != "cloak" || args.Providers[2] != "ghost-chrome" {
+		t.Fatalf("providers = %v, want [chrome cloak ghost-chrome]", args.Providers)
+	}
+}
+
+func TestParseArgsProviderEqualsFormat(t *testing.T) {
+	args, err := ParseArgs([]string{"--suite", "basic", "--browser=cloak"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Provider != "cloak" {
+		t.Fatalf("provider = %q, want cloak", args.Provider)
+	}
+	if len(args.Providers) != 1 || args.Providers[0] != "cloak" {
+		t.Fatalf("providers = %v, want [cloak]", args.Providers)
+	}
+}
+
+func TestNewBrowserScenariosInCatalog(t *testing.T) {
+	r := &Runner{repoRoot: resolveRepoRoot()}
+	catalog, err := r.loadScenarioCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range []string{
+		"api/browser-route-basic.sh",
+		"api/browser-selection-basic.sh",
+		"api/browser-activity-basic.sh",
+		"infra/browser-instance-basic.sh",
+		"infra/browser-config-basic.sh",
+	} {
+		parts := strings.SplitN(key, "/", 2)
+		meta, ok := catalog.find(parts[0], parts[1])
+		if !ok {
+			t.Fatalf("scenario %s missing from catalog", key)
+		}
+		if meta.Tier != tierBasic {
+			t.Fatalf("scenario %s has tier %q, want basic", key, meta.Tier)
+		}
+		if !hasString(meta.Tags, "browser") {
+			t.Fatalf("scenario %s missing 'browser' tag: %v", key, meta.Tags)
+		}
+		if !hasString(meta.Tags, "pr") {
+			t.Fatalf("scenario %s missing 'pr' tag: %v", key, meta.Tags)
+		}
+	}
+}
+
+// A log artifact the runner advertises but that captured nothing sends whoever
+// is diagnosing a failure to a useless file; the listing has to say so.
+func TestEmptyLogSuffixMarksZeroByteArtifacts(t *testing.T) {
+	dir := t.TempDir()
+
+	empty := filepath.Join(dir, "logs-cli-smoke-pinchtab.log")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := emptyLogSuffix(empty); got == "" {
+		t.Error("a zero-byte log artifact is listed with no warning")
+	}
+
+	populated := filepath.Join(dir, "logs-cli-smoke-runner-cli.log")
+	if err := os.WriteFile(populated, []byte("level=INFO msg=request\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := emptyLogSuffix(populated); got != "" {
+		t.Errorf("suffix = %q, want none for a log with content", got)
+	}
+
+	if got := emptyLogSuffix(filepath.Join(dir, "missing.log")); got != "" {
+		t.Errorf("suffix = %q, want none for a file that does not exist", got)
+	}
+}
+
+// Every e2e server service must NAME its log level rather than inherit one. The
+// level used to be borrowed from --verbose, which once meant "log at all" and later
+// came to mean "debug"; the harness's diagnostic level moved when that definition
+// moved, which is the drift this pins. --verbose is still expected alongside for the
+// startup banner and the four category=security WARN lines, both gated on
+// cfg.VerboseBanner and absent from the artifact without it; the netguard allowlist
+// is printed by neither, at any level. Both flags are required together: --verbose
+// contributes only the banner WHILE --log-level is set, and would govern the level again if
+// --log-level were dropped.
+//
+// Bridge services carry --log-level debug and NOT --verbose, and the asymmetry is the
+// rule rather than an omission: the bridge holds the CDP session, so it logs what a
+// failing browser scenario most needs, while --verbose contributes only a startup
+// banner the bridge does not have.
+func TestComposeServerServicesNameTheirLogLevel(t *testing.T) {
+	const (
+		wantFlags = "pinchtab server --log-level debug --verbose"
+		wantLevel = "--log-level debug"
+	)
+
+	for _, tc := range []struct {
+		file    string
+		servers int
+		bridges int
+	}{
+		{file: "docker-compose.yml", servers: 1, bridges: 0},
+		{file: "docker-compose-multi.yml", servers: 6, bridges: 2},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			servers, bridges := 0, 0
+
+			for _, svc := range pinchtabComposeServices(t, tc.file) {
+				switch {
+				case strings.Contains(svc.command, "pinchtab server"):
+					servers++
+					if !strings.Contains(svc.command, wantFlags) {
+						t.Errorf("service %s does not run %q, so its level is inherited rather than named: %s", svc.name, wantFlags, svc.command)
+					}
+				case strings.Contains(svc.command, "pinchtab bridge"):
+					bridges++
+					if !strings.Contains(svc.command, wantLevel) {
+						t.Errorf("bridge service %s does not run %q, so the process holding the CDP session is the quiet one — target crashes, instance lifecycle and selector resolution are logged there, and a failing scenario needs them explained: %s", svc.name, wantLevel, svc.command)
+					}
+					if strings.Contains(svc.command, "--verbose") {
+						t.Errorf("bridge service %s carries --verbose, whose only contribution is the startup banner — the bridge has none to print, so it adds nothing and makes the bridge rule look identical to the server rule when it is not: %s", svc.name, svc.command)
+					}
+				default:
+					t.Errorf("service %s uses the pinchtab image but runs neither server nor bridge, so no flag rule covers it: %s", svc.name, svc.command)
+				}
+			}
+
+			if servers != tc.servers {
+				t.Errorf("%d server services, want %d — a new or removed variant changes which services this guard checks", servers, tc.servers)
+			}
+			if bridges != tc.bridges {
+				t.Errorf("%d bridge services, want %d — a new or removed variant changes which services this guard checks", bridges, tc.bridges)
+			}
+		})
+	}
+}
+
+type composeService struct {
+	name    string
+	command string
+}
+
+// A pinchtab service with no `command:` inherits the image's own CMD, which runs
+// `pinchtab server` with no flags — invisible to a census that reads command lines.
+// Every such service is surfaced here with the inherited command so the flag rules
+// above still apply to it.
+func pinchtabComposeServices(t *testing.T, file string) []composeService {
+	t.Helper()
+
+	path := filepath.Join("..", "..", "..", "..", "e2e", file)
+	content, err := os.ReadFile(path) // #nosec G304 -- fixed test fixture path.
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+
+	var doc struct {
+		Services map[string]struct {
+			Image string `yaml:"image"`
+			Build struct {
+				Dockerfile string `yaml:"dockerfile"`
+			} `yaml:"build"`
+			Command []string `yaml:"command"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+
+	inherited := dockerfileDefaultCommand(t)
+
+	services := make([]composeService, 0, len(doc.Services))
+	for name, svc := range doc.Services {
+		if svc.Image != "e2e-pinchtab:latest" && svc.Build.Dockerfile != "Dockerfile" {
+			continue
+		}
+		command := strings.Join(svc.Command, " ")
+		if len(svc.Command) == 0 {
+			command = inherited
+		}
+		services = append(services, composeService{name: name, command: command})
+	}
+	if len(services) == 0 {
+		t.Fatalf("%s: found no pinchtab services to check", file)
+	}
+	return services
+}
+
+func dockerfileDefaultCommand(t *testing.T) string {
+	t.Helper()
+
+	content, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		after, found := strings.CutPrefix(line, "CMD ")
+		if !found {
+			continue
+		}
+		var argv []string
+		if err := json.Unmarshal([]byte(after), &argv); err != nil {
+			return after
+		}
+		return strings.Join(argv, " ")
+	}
+	t.Fatal("Dockerfile declares no CMD, so a service without `command:` cannot be classified")
+	return ""
+}
+
+func syntheticLaneSuite(extended, smoke bool) suiteDef {
+	group := suiteGroup{label: "Synthetic", dir: "synthetic", helper: "api", commands: apiCommands(), runner: "runner-api"}
+	return suiteDescriptor{
+		Name:     "synthetic-suite",
+		Group:    &group,
+		Compose:  "compose.yml",
+		Extended: extended,
+		Smoke:    smoke,
+		Ready:    primaryReady(),
+	}.build()
+}
+
+func newSyntheticLaneRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	dir := filepath.Join(repo, "tests/e2e/scenarios/synthetic")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{"probe-basic.sh", "probe-smoke.sh"} {
+		if err := os.WriteFile(filepath.Join(dir, file), []byte("#!/bin/bash\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repo
+}
+
+func newSyntheticLaneRunner(t *testing.T, repo string, exitCode int, stdout, stderr *bytes.Buffer) *Runner {
+	t.Helper()
+	stealth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"provider":"chrome"}`))
+	}))
+	t.Cleanup(stealth.Close)
+
+	script := filepath.Join(t.TempDir(), "compose.sh")
+	body := fmt.Sprintf(`#!/bin/sh
+case "$*" in
+  *"port pinchtab 9999"*) echo "%s"; exit 0 ;;
+  *"E2E_SCENARIO_DIR=scenarios/synthetic"*) exit %d ;;
+esac
+exit 0
+`, strings.TrimPrefix(stealth.URL, "http://"), exitCode)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	return &Runner{
+		args:     Args{Filter: "synthetic"},
+		stdout:   stdout,
+		stderr:   stderr,
+		repoRoot: repo,
+		compose:  []string{script},
+		logsMode: "hide",
+	}
+}
+
+func TestLaneFailsOnSuiteRegisteredOnlyInDefs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("synthetic lane runner uses POSIX shell stubs")
+	}
+	cases := []struct {
+		lane     lane
+		extended bool
+		smoke    bool
+		run      func(*Runner, lane) int
+	}{
+		{lane: basicLane(), run: (*Runner).runStackLane},
+		{lane: extendedLane(), extended: true, run: (*Runner).runStackLane},
+		{lane: smokeLane(), smoke: true, run: (*Runner).runSmokeLane},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.lane.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			r := newSyntheticLaneRunner(t, newSyntheticLaneRepo(t), 7, &stdout, &stderr)
+
+			l := tc.lane
+			l.stack = "compose.yml"
+			l.defs = append(l.defs, syntheticLaneSuite(tc.extended, tc.smoke))
+
+			if code := tc.run(r, l); code != 1 {
+				t.Fatalf("lane returned %d, want 1; stderr: %s", code, stderr.String())
+			}
+			for _, want := range []string{
+				"e2e: " + tc.lane.name + " suites failed",
+				"e2e: exit codes: synthetic-suite=7",
+			} {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("stderr missing %q:\n%s", want, stderr.String())
+				}
+			}
+			if strings.Contains(stdout.String(), "suites passed") {
+				t.Fatalf("lane should not report success:\n%s", stdout.String())
+			}
+		})
+	}
+}
+
+func TestLanePassesWhenEverySuiteSucceeds(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("synthetic lane runner uses POSIX shell stubs")
+	}
+	var stdout, stderr bytes.Buffer
+	r := newSyntheticLaneRunner(t, newSyntheticLaneRepo(t), 0, &stdout, &stderr)
+
+	l := basicLane()
+	l.stack = "compose.yml"
+	l.defs = append(l.defs, syntheticLaneSuite(false, false))
+
+	if code := r.runStackLane(l); code != 0 {
+		t.Fatalf("lane returned %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "E2E basic suites passed") {
+		t.Fatalf("stdout should report success:\n%s", stdout.String())
 	}
 }

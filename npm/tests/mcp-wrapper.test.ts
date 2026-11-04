@@ -11,22 +11,12 @@ import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-
-/**
- * Extracted firstSubcommand logic from bin/pinchtab for isolated testing.
- */
-function firstSubcommand(argv: string[]): string | null {
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === '--server') {
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith('--server=')) continue;
-    if (!arg.startsWith('-')) return arg;
-  }
-  return null;
-}
+import {
+  detectPlatform,
+  firstSubcommand,
+  getBinaryName,
+  readPackageVersion,
+} from '../src/platform';
 
 describe('firstSubcommand', () => {
   test('simple mcp', () => {
@@ -64,27 +54,8 @@ describe('MCP wrapper integration', () => {
 
   function stageManagedBinary(binaryPath: string): { homeDir: string; binaryPath: string } {
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pinchtab-home-'));
-    const pkgPath = path.join(__dirname, '..', '..', 'package.json');
-    const version = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version;
-    let arch: 'amd64' | 'arm64';
-    if (process.arch === 'x64') {
-      arch = 'amd64';
-    } else if (process.arch === 'arm64') {
-      arch = 'arm64';
-    } else {
-      throw new Error(`Unsupported architecture: ${process.arch}`);
-    }
-
-    let binaryName: string;
-    if (process.platform === 'darwin') {
-      binaryName = `pinchtab-darwin-${arch}`;
-    } else if (process.platform === 'linux') {
-      binaryName = `pinchtab-linux-${arch}`;
-    } else if (process.platform === 'win32') {
-      binaryName = `pinchtab-windows-${arch}.exe`;
-    } else {
-      throw new Error(`Unsupported platform: ${process.platform}`);
-    }
+    const version = readPackageVersion(__dirname);
+    const binaryName = getBinaryName(detectPlatform());
 
     const managedBinaryPath = path.join(homeDir, '.pinchtab', 'bin', version, binaryName);
     fs.mkdirSync(path.dirname(managedBinaryPath), { recursive: true });
@@ -166,5 +137,23 @@ describe('MCP wrapper integration', () => {
     const response = JSON.parse(stdout.split('\n')[0]);
     assert.strictEqual(response.id, 1);
     assert.ok(response.result?.serverInfo, 'expected serverInfo in response');
+  });
+});
+
+describe('readPackageVersion', () => {
+  test('finds the package root version from a dist/src-style compiled directory', () => {
+    const packageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pinchtab-pkg-layout-'));
+    try {
+      const compiledDir = path.join(packageRoot, 'dist', 'src');
+      fs.mkdirSync(compiledDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(packageRoot, 'package.json'),
+        JSON.stringify({ name: 'pinchtab', version: '0.14.0-test' })
+      );
+
+      assert.strictEqual(readPackageVersion(compiledDir), '0.14.0-test');
+    } finally {
+      fs.rmSync(packageRoot, { recursive: true, force: true });
+    }
   });
 });

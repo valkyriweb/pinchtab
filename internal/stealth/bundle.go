@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/pinchtab/pinchtab/internal/assets"
+	"github.com/pinchtab/pinchtab/internal/browsers"
 	"github.com/pinchtab/pinchtab/internal/config"
 )
 
@@ -25,6 +26,7 @@ const (
 	LaunchModeAllocator      LaunchMode = "allocator"
 	LaunchModeDirectFallback LaunchMode = "direct_fallback"
 	LaunchModeAttached       LaunchMode = "attached"
+	LaunchModeRemoteCDP      LaunchMode = "remote-cdp"
 )
 
 type WebdriverMode string
@@ -34,58 +36,91 @@ const (
 )
 
 type Bundle struct {
-	Level        Level           `json:"level"`
-	Seed         int64           `json:"seed"`
-	Script       string          `json:"-"`
-	ScriptHash   string          `json:"scriptHash"`
-	Launch       LaunchContract  `json:"-"`
-	PatchIDs     []string        `json:"patchIds"`
-	Capabilities map[string]bool `json:"capabilities"`
-	Tradeoffs    []string        `json:"tradeoffs,omitempty"`
-	Webdriver    WebdriverMode   `json:"webdriverMode"`
+	Level                    Level           `json:"level"`
+	Provider                 string          `json:"provider"`
+	Native                   bool            `json:"native"`
+	PinchTabOverlaysDisabled bool            `json:"pinchtabOverlaysDisabled"`
+	Seed                     int64           `json:"seed"`
+	Script                   string          `json:"-"`
+	ScriptHash               string          `json:"scriptHash"`
+	Launch                   LaunchContract  `json:"-"`
+	PatchIDs                 []string        `json:"patchIds"`
+	Capabilities             map[string]bool `json:"capabilities"`
+	Tradeoffs                []string        `json:"tradeoffs,omitempty"`
+	Webdriver                WebdriverMode   `json:"webdriverMode"`
 }
 
 type Status struct {
-	Level         Level           `json:"level"`
-	Headless      bool            `json:"headless"`
-	LaunchMode    LaunchMode      `json:"launchMode"`
-	ScriptHash    string          `json:"scriptHash"`
-	UserAgent     string          `json:"userAgent,omitempty"`
-	WebdriverMode WebdriverMode   `json:"webdriverMode"`
-	PatchIDs      []string        `json:"patchIds"`
-	Flags         map[string]bool `json:"flags"`
-	Capabilities  map[string]bool `json:"capabilities"`
-	Tradeoffs     []string        `json:"tradeoffs,omitempty"`
-	TabOverrides  map[string]bool `json:"tabOverrides"`
+	Level                    Level           `json:"level"`
+	Provider                 string          `json:"provider"`
+	Native                   bool            `json:"native"`
+	Headless                 bool            `json:"headless"`
+	LaunchMode               LaunchMode      `json:"launchMode"`
+	ScriptHash               string          `json:"scriptHash"`
+	UserAgent                string          `json:"userAgent,omitempty"`
+	FingerprintSeed          string          `json:"fingerprintSeed,omitempty"`
+	WebdriverMode            WebdriverMode   `json:"webdriverMode"`
+	PinchTabOverlaysDisabled bool            `json:"pinchtabOverlaysDisabled"`
+	PatchIDs                 []string        `json:"patchIds"`
+	Flags                    map[string]bool `json:"flags"`
+	Capabilities             map[string]bool `json:"capabilities"`
+	// ProviderCapabilities is advisory; omitted for empty/unknown providers to preserve legacy JSON shape.
+	ProviderCapabilities   []string        `json:"providerCapabilities,omitempty"`
+	Tradeoffs              []string        `json:"tradeoffs,omitempty"`
+	TabOverrides           map[string]bool `json:"tabOverrides"`
+	AttachMutationsSkipped bool            `json:"attachMutationsSkipped,omitempty"`
+	// AdvertisedBrowserVersion is the version the persona presents to pages.
+	// BrowserBinaryVersion is what the launched binary reports for itself; the
+	// two disagreeing is the defect a caller can now observe rather than infer.
+	AdvertisedBrowserVersion string `json:"advertisedBrowserVersion,omitempty"`
+	BrowserBinaryVersion     string `json:"browserBinaryVersion,omitempty"`
 }
 
 func NewBundle(cfg *config.RuntimeConfig, seed int64) *Bundle {
 	levelName := ""
 	headless := false
+	provider := config.BrowserChrome
 	if cfg != nil {
 		levelName = cfg.StealthLevel
 		headless = cfg.Headless
+		provider = config.NormalizeBrowser(cfg.DefaultBrowser)
 	}
 	level := NormalizeLevel(levelName)
+	nativeCloak := config.CloakBrowserActive(cfg)
+	disablePinchTabStealth := config.PinchTabStealthDefaultsDisabled(cfg)
 	personaJSON := "{}"
 	if cfg != nil {
-		if encoded, err := json.Marshal(BuildPersona(cfg.UserAgent, cfg.ChromeVersion)); err == nil {
+		if encoded, err := json.Marshal(BuildPersona(cfg.UserAgent, ResolveBrowserVersion(cfg))); err == nil {
 			personaJSON = string(encoded)
 		}
 	}
 	script := renderBundleScript(level, personaJSON, seed, headless)
+	hashSource := renderBundleScript(level, personaJSON, 0, headless)
+	patchIDs := patchIDsForLevel(level, headless)
+	capabilities := capabilityMap(level, headless)
+	tradeoffIDs := tradeoffs(level)
+	if disablePinchTabStealth {
+		script = renderNativeCloakScript()
+		hashSource = script
+		patchIDs = nativeCloakPatchIDs()
+		capabilities = nativeCloakCapabilityMap()
+		tradeoffIDs = nil
+	}
 
 	return &Bundle{
-		Level:  level,
-		Seed:   seed,
-		Script: script,
+		Level:                    level,
+		Provider:                 provider,
+		Native:                   nativeCloak,
+		PinchTabOverlaysDisabled: disablePinchTabStealth,
+		Seed:                     seed,
+		Script:                   script,
 		// Keep the status hash stable across identical configs even when the
 		// per-process seed changes. The seed is runtime entropy, not contract.
-		ScriptHash:   hashScript(renderBundleScript(level, personaJSON, 0, headless)),
+		ScriptHash:   hashScript(hashSource),
 		Launch:       BuildLaunchContract(cfg, level),
-		PatchIDs:     patchIDsForLevel(level, headless),
-		Capabilities: capabilityMap(level, headless),
-		Tradeoffs:    tradeoffs(level),
+		PatchIDs:     patchIDs,
+		Capabilities: capabilities,
+		Tradeoffs:    tradeoffIDs,
 		Webdriver:    WebdriverModeNativeBaseline,
 	}
 }
@@ -100,6 +135,10 @@ func renderBundleScript(level Level, personaJSON string, seed int64, headless bo
 		assets.StealthScript,
 		PopupGuardInitScript,
 	)
+}
+
+func renderNativeCloakScript() string {
+	return PopupGuardInitScript
 }
 
 func NormalizeLevel(level string) Level {
@@ -119,16 +158,21 @@ func StatusFromBundle(bundle *Bundle, cfg *config.RuntimeConfig, launchMode Laun
 	}
 
 	status := &Status{
-		Level:         bundle.Level,
-		Headless:      cfg != nil && cfg.Headless,
-		LaunchMode:    launchMode,
-		ScriptHash:    bundle.ScriptHash,
-		UserAgent:     bundle.LaunchUserAgent(),
-		WebdriverMode: bundle.Webdriver,
-		PatchIDs:      append([]string(nil), bundle.PatchIDs...),
-		Flags:         statusFlags(bundle, cfg),
-		Capabilities:  cloneBoolMap(bundle.Capabilities),
-		Tradeoffs:     append([]string(nil), bundle.Tradeoffs...),
+		Level:                    bundle.Level,
+		Provider:                 bundle.Provider,
+		Native:                   bundle.Native,
+		Headless:                 cfg != nil && cfg.Headless,
+		LaunchMode:               launchMode,
+		ScriptHash:               bundle.ScriptHash,
+		UserAgent:                bundle.LaunchUserAgent(),
+		FingerprintSeed:          statusFingerprintSeed(cfg),
+		WebdriverMode:            bundle.Webdriver,
+		PinchTabOverlaysDisabled: bundle.PinchTabOverlaysDisabled,
+		PatchIDs:                 append([]string(nil), bundle.PatchIDs...),
+		Flags:                    statusFlags(bundle, cfg),
+		Capabilities:             cloneBoolMap(bundle.Capabilities),
+		ProviderCapabilities:     providerCapabilityStrings(bundle.Provider),
+		Tradeoffs:                append([]string(nil), bundle.Tradeoffs...),
 		TabOverrides: map[string]bool{
 			"fingerprintRotateActive": false,
 		},
@@ -136,7 +180,35 @@ func StatusFromBundle(bundle *Bundle, cfg *config.RuntimeConfig, launchMode Laun
 	if status.LaunchMode == "" {
 		status.LaunchMode = LaunchModeUninitialized
 	}
+	if status.LaunchMode == LaunchModeAttached || status.LaunchMode == LaunchModeRemoteCDP {
+		status.AttachMutationsSkipped = true
+		status.Tradeoffs = append(status.Tradeoffs,
+			"external attach: PinchTab skips launch-only stealth, locale, animation, and Runtime-domain mutations")
+	}
 	return status
+}
+
+func providerCapabilityStrings(provider string) []string {
+	b, ok := browsers.Get(provider)
+	if !ok {
+		return nil
+	}
+	caps := b.Capabilities().List()
+	if len(caps) == 0 {
+		return nil
+	}
+	out := make([]string, len(caps))
+	for i, c := range caps {
+		out[i] = string(c)
+	}
+	return out
+}
+
+func statusFingerprintSeed(cfg *config.RuntimeConfig) string {
+	if cfg == nil || !config.IsCloakBrowser(cfg.DefaultBrowser) {
+		return ""
+	}
+	return cfg.Cloak.FingerprintSeed
 }
 
 func hashScript(script string) string {
@@ -148,7 +220,7 @@ func statusFlags(bundle *Bundle, cfg *config.RuntimeConfig) map[string]bool {
 	var extraFlags []string
 	headless := false
 	if cfg != nil {
-		extraFlags = config.AllowedChromeExtraFlags(cfg.ChromeExtraFlags)
+		extraFlags = config.AllowedBrowserExtraFlags(cfg.BrowserExtraFlags)
 		headless = cfg.Headless
 	}
 
@@ -217,8 +289,12 @@ func capabilityMap(level Level, headless bool) map[string]bool {
 		caps["chromeRuntimeConnect"] = true
 		caps["chromeRuntimeSendMessage"] = true
 	}
-	if level == LevelFull && headless {
-		caps["webglSpoofing"] = true
+	if level == LevelFull {
+		caps["functionToStringMasked"] = true
+		caps["errorStackSanitized"] = true
+		if headless {
+			caps["webglSpoofing"] = true
+		}
 	}
 
 	return caps
@@ -258,6 +334,32 @@ func patchIDsForLevel(level Level, headless bool) []string {
 	}
 
 	return patches
+}
+
+func nativeCloakPatchIDs() []string {
+	return []string{
+		"native-cloakbrowser",
+		"popup-guard",
+	}
+}
+
+func nativeCloakCapabilityMap() map[string]bool {
+	caps := capabilityMap(LevelLight, false)
+	caps["nativeCloakBrowser"] = true
+	caps["sourceLevelFingerprinting"] = true
+	caps["pinchtabJSOverlays"] = false
+	caps["canvasNoise"] = true
+	caps["audioNoise"] = true
+	caps["webglSpoofing"] = true
+	caps["webrtcMitigation"] = true
+	// The PinchTab worker-UA-parity script is replaced by the popup-guard-only
+	// native cloak script, so don't advertise PinchTab-provided worker UA
+	// parity. (workerHardwareConsistency/serviceWorkerHardwareConsistency also
+	// inherit true and warrant the same native-vs-advertised confirmation —
+	// follow-up, not flipped here.)
+	caps["workerUserAgentConsistency"] = false
+	caps["serviceWorkerUserAgentConsistency"] = false
+	return caps
 }
 
 func tradeoffs(level Level) []string {

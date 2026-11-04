@@ -22,8 +22,17 @@ func HandleConfigShow(cfg *config.RuntimeConfig) {
 	fmt.Printf("  Download:       %v\n", cfg.AllowDownload)
 	fmt.Printf("  Cookies:        %v\n", cfg.AllowCookies)
 	fmt.Printf("  Upload:         %v\n", cfg.AllowUpload)
+	fmt.Printf("  Trust Loopback Proxy: %v\n", cfg.TrustLoopbackProxy)
+	fmt.Printf("  IDPI:           %v\n", cfg.IDPI.Enabled)
+	fmt.Printf("  Allowed Domains: %v\n", cfg.AllowedDomains)
 	fmt.Println()
 	fmt.Println(styleStdout(headingStyle, "Browser / Instance Defaults"))
+	fmt.Printf("  Provider:       %s\n", cfg.DefaultBrowser)
+	binary := cfg.BrowserBinary
+	if binary == "" {
+		binary = "(auto-discovered)"
+	}
+	fmt.Printf("  Binary:         %s\n", binary)
 	fmt.Printf("  Headless:       %v\n", cfg.Headless)
 	fmt.Printf("  No Restore:     %v\n", cfg.NoRestore)
 	fmt.Printf("  Profile Dir:    %s\n", cfg.ProfileDir)
@@ -32,7 +41,7 @@ func HandleConfigShow(cfg *config.RuntimeConfig) {
 	fmt.Printf("  Max Tabs:       %d\n", cfg.MaxTabs)
 	fmt.Printf("  Stealth:        %s\n", cfg.StealthLevel)
 	fmt.Printf("  Tab Eviction:   %s\n", cfg.TabEvictionPolicy)
-	if cfg.TabLifecyclePolicy == "close_idle" {
+	if config.IdleTabLifecycle(cfg.TabLifecyclePolicy) {
 		fmt.Printf("  Tab Lifecycle:  %s (%s)\n", cfg.TabLifecyclePolicy, cfg.TabCloseDelay)
 	} else {
 		fmt.Printf("  Tab Lifecycle:  %s\n", cfg.TabLifecyclePolicy)

@@ -2,11 +2,20 @@
 
 This page summarizes the live HTTP surface exposed by PinchTab. Some routes are only available in bridge mode, some only in full server mode, and some are gated by security settings.
 
+Most browser routes also answer at a tab-scoped `/tabs/{id}/...` form (for example
+`GET /tabs/{id}/html`), and the blocks below list only the common ones. The routes with no
+tab form are `POST /tab`, console and errors, clipboard, `/stealth/status`,
+`/fingerprint/rotate`, `/solvers`, `/config/autosolver`, cache, the `/state` family, `/macro`,
+screencast and record, memory summary and compare, `/audit`, `/audit/page`, `/scrape` and
+`POST /network/clear`. Handoff and resume exist only in their tab form. The route catalog
+lives in `internal/routes/routes.go`.
+
 ## Health And Server Metadata
 
 ```text
 GET  /health
-POST /ensure-chrome
+POST /ensure-browser
+POST /ensure-chrome (legacy alias for /ensure-browser)
 POST /browser/restart
 GET  /openapi.json
 GET  /help          (alias for /openapi.json)
@@ -20,7 +29,27 @@ Notes:
 
 - in bridge mode, `/health` reports bridge health and tab count
 - in full server mode, `/health` reports dashboard health, auth state, and instance count
-- `/metrics` proxies to the bridge instance (per-instance runtime metrics)
+- server-mode `/health` counts profiles in three disjoint buckets: `profiles` is the
+  persistent, non-quarantined profiles an operator manages; `temporaryProfiles` the
+  `instance-*` profiles minted by instance starts that named none, including temporary
+  profiles later quarantined; `quarantinedProfiles` the quarantined non-temporary
+  profiles. Temporary classification takes precedence when both flags apply. The default
+  `GET /profiles` list is `profiles + quarantinedProfiles` (it hides temporaries;
+  `?all=true` shows every bucket)
+- a browser crash is reported the same way in both modes: `/health` carries a `crashes`
+  block (`total`, `recent`) whenever the browser behind it has crashed. In bridge mode the
+  bridge records its own; in full server mode the front door merges every instance's
+  record and each event names its `instanceId`. `status` stays `ok` — a crashed instance is
+  relaunched and is serving again — so watch `crashes`, not `status`, for lost client
+  state. The same block appears on each entry of `GET /instances`. After a crash every
+  tab the browser held is gone, and a call to one answers `404` with code
+  `browser_crashed`, `browserCrashed: true`, `browserCrashReason` and a `hint`, rather
+  than a bare `tab <id> not found`
+- `/metrics` reports the counters of the process answering it: in full server mode the front
+  door's own request counters (auth rejections and unrouted paths included), in bridge mode
+  the bridge's. Every response names its `layer`, and the layers are never summed — read one
+  instance's counters at `/instances/{id}/metrics`. See
+  [reference/metrics.md](reference/metrics.md) for the layer table.
 - `/api/metrics` in full server mode is a server-level metrics snapshot (aggregated)
 
 ## Dashboard Auth And Config
@@ -31,11 +60,13 @@ POST /api/auth/elevate
 POST /api/auth/logout
 GET  /api/config
 PUT  /api/config
+GET  /dashboard     (dashboard UI; also served at / and /login)
 ```
 
 Notes:
 
 - `server.token` is treated as write-only by `PUT /api/config`
+- `PUT /api/config` expects the inner config object, not the envelope `GET /api/config` returns; a body carrying an unrecognized top-level key (such as the envelope's own `config`) is refused with a `400 unrecognized_config_keys` rather than silently applying nothing
 - auth routes are for the dashboard session flow
 
 ## Dashboard Events And Agents
@@ -74,6 +105,8 @@ POST /tab
 POST /close
 POST /tabs/{id}/close
 GET  /tabs/{id}/metrics
+GET  /tabs/{id}/memory
+POST /tabs/{id}/memory/snapshot
 POST /tabs/{id}/handoff
 GET  /tabs/{id}/handoff
 POST /tabs/{id}/resume
@@ -87,6 +120,7 @@ Navigation request fields:
 - `timeout` optional
 - `blockImages`, `blockMedia`, `blockAds` optional
 - `waitFor`, `waitSelector`, `waitTitle` optional
+- `dismissBanners`, `dispatchOnly` optional
 
 Important behavior:
 
@@ -110,7 +144,14 @@ Notes:
 - `POST /tabs/{id}/handoff` marks the tab as `paused_handoff` and records a reason
 - `GET /tabs/{id}/handoff` returns the current handoff state, or `active` when no handoff is set
 - `POST /tabs/{id}/resume` clears the handoff state and can carry resume metadata for the caller
-- a paused-handoff tab is a hard block on the action-execution routes (`/action`, `/actions`, `/macro`): they return `409 tab_paused_handoff` until `/resume` clears the state
+- a paused-handoff tab blocks the action-execution routes, but the two envelopes differ.
+  `POST /action` returns `409` with code `tab_paused_handoff` and a `details.hint` naming
+  `/resume`. `POST /actions` and `POST /macro` return **200** — they answer with a result
+  list — and carry the same refusal per item: the entry for each step against the paused tab
+  has `success: false`, `code: "tab_paused_handoff"` and the same `details`. Match on the
+  code, not on the message. With `stopOnError` false (the default) the remaining steps still
+  run, so each step aimed at the paused tab is refused the same way while steps naming another
+  tab execute normally. `/resume` clears the state for all of them.
 - treat the handoff record as coordination state, not as a security boundary — non-action endpoints (snapshots, screenshots, network logs, evals subject to their own gates) remain reachable
 - CLI wrappers exist: `pinchtab handoff`, `pinchtab resume`, `pinchtab handoff-status`, plus the `pinchtab tab handoff|resume|handoff-status` aliases
 
@@ -142,13 +183,104 @@ GET  /snapshot
 GET  /tabs/{id}/snapshot
 GET  /text
 GET  /tabs/{id}/text
+GET  /title
+GET  /url
+GET  /html
+GET  /styles
+GET  /value
+GET  /attr
+GET  /count
+GET  /box
+GET  /visible
+GET  /tabs/{id}/visible
+GET  /enabled
+GET  /checked
+GET  /timing
+GET  /a11y/audit
 POST /find
 POST /tabs/{id}/find
+POST /extract
+POST /tabs/{id}/extract
 POST /evaluate
 POST /tabs/{id}/evaluate
+GET  /memory
+POST /memory/snapshot
+GET  /memory/snapshot/{snapshotId}/summary
+GET  /memory/compare?base=<id>&head=<id>
+POST /emulation/viewport
+POST /emulation/geolocation
+POST /emulation/offline
+POST /emulation/headers
+POST /emulation/credentials
+POST /emulation/media
+GET  /stealth/status
+POST /fingerprint/rotate
 ```
 
+The `/emulation/*` routes back the CLI's `pinchtab set` subcommands. `/a11y/audit` is
+described in [reference/a11y.md](reference/a11y.md).
+
+`/memory` reads the tab's JavaScript heap and DOM counters; the snapshot, summary and
+compare routes need `security.allowMemory` — see [reference/memory.md](reference/memory.md).
+
+`POST /actions` and `POST /macro` answer **200 whatever their steps did**: the envelope
+reports the run, and each step's outcome is its own entry — `{"index", "success", "code",
+"error"}` — beside the top-level `total`, `successful` and `failed` counts. Read `failed`
+and the per-item entries; a 2xx does not mean the steps worked. A 4xx from these endpoints
+is about the request itself (an empty array, a bad body, a refused capability), never about
+a step.
+
+That is a deliberate contract and it does not make a failed run invisible: a run with any
+failed step publishes a failure reason on the server side, so it moves `requestsFailed`,
+appears in `failures.recent` with the failed count and the first step's code and message,
+logs at `WARN`, and carries `steps: {total, successful, failed}` plus the code and message
+on its activity record — see [reference/metrics.md](reference/metrics.md).
+
+**A selector that matches nothing is a `404` on every read verb**, with code
+`element_not_found`: `/html`, `/styles`, `/title`, `/url`, `/screenshot`, `/capture`,
+`/annotate`, `/box`, `/visible`, `/enabled`, `/checked`, `/value`, `/text`, `/snapshot`
+and the action path all answer the same way. The request was well formed and the page
+simply lacks the element, so it is neither a `400` nor a `5xx` — a caller probing for an
+element it is not sure is there does not file a server fault or invite a proxy retry.
+`GET /count` is the one exception and answers `200` with `count: 0`: it is asked a
+cardinality, and zero is the honest answer to "how many".
+
 `/evaluate` is intentionally separate from selector frame scope. `GET/POST /frame` only affects selector-based `/snapshot` and `/action` calls, not arbitrary JavaScript evaluation.
+
+`GET /action` decodes a subset of the action fields and refuses, with `400` naming the field, any parameter it cannot express rather than silently dropping it — so a modifier chord, a drag, `waitNav` or `humanize` must be sent as `POST /action` with a JSON body. A parameter the action request does not declare at all is refused the same way, with a `did you mean` hint for a near miss, so `?modifers=8` or `?Modifiers=8` no longer dispatches a plain click and answers `200`. The accepted set is the action request's own fields plus the parameters only the GET form carries, which today is `timeout`.
+`timeout` is a per-request action timeout in seconds, honoured when it is above 0 and at most
+60 (any other value falls back to the configured action timeout). The POST body has no
+equivalent field, so a POST action always uses the configured action timeout. Cache-busters and stray parameters must be dropped from the URL.
+
+`GET /snapshot` validates its cost controls the same way but resolves the unknown-parameter
+question differently, and the difference is deliberate. A bad VALUE is refused with a `400`
+naming the accepted set: `format` is `json`, `compact`, `text` or `yaml`; `filter` is `all`
+or `interactive`; `maxTokens` is a positive whole number; `depth` is a whole number `>= -1`.
+`format` and `filter` are compared case- and whitespace-insensitively, so `INTERACTIVE` and
+`" interactive "` select the interactive subset — each previously fell through to the whole
+tree, because the comparison was an exact string match, and every one of these controls used
+to fail toward the *more expensive* answer without telling the caller.
+
+`interactive` is the documented boolean alias for `filter`: `interactive=true` is
+`filter=interactive`, `interactive=false` is `filter=all`. It takes the values Go's
+`ParseBool` accepts (`true`/`false`, `1`/`0`, `t`/`f`), and anything else is a `400` rather
+than a fall-through to the whole tree. Sending both is fine while they agree; `filter=all`
+next to `interactive=true` is refused, because resolving that by a precedence rule the
+caller cannot see would mean one of the two parameters it sent did nothing. The alias was
+advertised on this endpoint for a long time without ever being read, so a raw HTTP caller
+that followed the docs bought the full tree and was told nothing.
+
+An unknown parameter NAME is reported rather than refused: `ignoredParams` on JSON and YAML
+responses, an `# ignored params: ...` line on `compact` and `text` ones. `/action` can
+refuse because its parameter set is the action request's own fields, and a caller sending
+something else has genuinely asked for a behaviour that will not happen. `/snapshot` is a
+read that newer clients call with parameters older servers have not learned yet, so
+refusing would break version skew in the direction it normally occurs, while the disclosure
+still ends the silence — which is what mattered, since the `quick` CLI command sent
+`compact=true` for a long time, a parameter `/snapshot` has never read, and received the
+JSON snapshot instead of the compact one it was written to request.
+
+`GET /visible` (and `pinchtab visible <ref>`) answers CSS rendered-ness — `display`, `visibility`, `opacity`, and a laid-out box with non-zero size. Scroll position is not an input: an element far below the fold, or scrolled past, still reports `visible: true`. On-screen-ness is the response's `onScreen` field, which shares the capture snapshot's viewport-intersection predicate (see [reference/capture.md](reference/capture.md)); `onScreen` is omitted when the element could not be measured — absent means unknown, never "no".
 
 Action kinds currently include:
 
@@ -185,6 +317,26 @@ Action targeting fields:
 - `waitNav`
 - `dialogAction` and `dialogText`
 - `humanize`
+- `toSelector`, `toX`/`toY` and `dragX`/`dragY` (drag)
+- `submit`, `mode` and `modifiers` (click)
+
+`fill` and `type` write the string in `text`; `fill` also accepts it as `value`, which is the
+field `select` reads. A `fill` carrying neither is rejected — send `"text": ""` to clear a
+field, so clearing stays distinct from a request whose text never arrived.
+
+`select` matches the `<option value="...">` attribute first and the option's visible text
+second, so either spelling works. It draws the same absent-versus-supplied distinction as
+`fill`: send `"value": ""` to select an `<option value="">` placeholder and reset the
+dropdown, and a `select` carrying neither key is rejected. Every surface expresses it —
+`POST /action` with `"value": ""`, `pinchtab select <ref> ""`, and the `pinchtab_select` MCP
+tool with `value: ""`.
+
+`button` accepts `left`, `right`, and `middle` — the same vocabulary the CLI's `--button`
+help lists, tolerating case and surrounding whitespace, so `RIGHT` and ` middle ` are the
+buttons they name. Any other value is refused with `400` `invalid_mouse_button` naming the
+three, on any action body carrying the field: `primary`, `secondary` and `0` used to be
+reinterpreted as `left` and reported as success. Omitting `button` means `left`, which is a
+default rather than forgiveness for a name the server does not know.
 
 `humanize` is a per-action override for input style. When omitted, actions use `instanceDefaults.humanize`, which defaults to `false`. Use `kind:"click"` or `kind:"type"` with `humanize:true` when a page needs the slower human-like pointer or typing path.
 
@@ -199,32 +351,101 @@ Selector lookup is limited to the current frame scope. The default scope is `mai
 
 Snapshot query parameters:
 
-- `interactive`
-- `compact`
+- `filter`
+- `interactive` (boolean alias for `filter`)
 - `diff`
 - `selector`
 - `maxTokens`
 - `depth`
 - `format`
 - `noAnimations`
-- `output`
+- `output` (with `path` when `output=file`)
+- `tabId`
 
 `selector` on `/snapshot` follows the same rule: it only searches the current frame scope. It does not automatically pierce into iframes, and cross-origin iframe descendants are not inlined.
 
 Text query parameters:
 
-- `mode=raw`
+- `mode=raw` (`mode=full` is an alias), `mode=markdown` (any other value is a 400 naming the accepted ones)
 - `format`
 - `maxChars`
 - `frameId`
+- `selector` or `ref` to read one element
+- `tabId`
 
 `/text` default mode picks the first **visible** `<article>` / `[role="main"]` /
 `<main>` (skips `display:none`) and strips nav/footer/ads. Use `mode=raw` for
 full `innerText`, or `/snapshot` for structured UI text like prices and button
 labels.
 
+`mode=markdown` returns the rendered page as Markdown through the seaportal
+converter — the same conversion the site scraper applies — with the JSON
+envelope carrying the converter's `title` and `description` alongside `text`.
+It reads the current frame scope's rendered HTML (the document `/html` returns),
+so a `/frame`-selected iframe converts that frame. `format=text` returns the raw
+Markdown body with `Content-Type: text/markdown; charset=utf-8`, and `maxChars`
+keeps whole lines and rune-cuts the final overrunning one, never splitting a
+table row (dropped whole) or a link (the cut pulls back to before the link). When
+the
+converter yields nothing the response falls back to the raw page text and echoes
+`extraction: "markdown_fallback"`.
+
+`mode=raw` and `mode=full` are the same extraction — the whole unfiltered page —
+and are what the CLI's `--raw` and `--full` send. The default extraction keeps
+block and table-cell boundaries: adjacent cells are separated by a tab and
+adjacent blocks by a newline, so a status code and a timestamp in neighbouring
+cells stay two fields rather than one number.
+
 `/text` is also frame-aware. `frameId` targets a specific iframe for a one-shot
 read; otherwise the endpoint inherits the tab's current `/frame` scope.
+
+### The `frame` Disclosure On Scoped Reads
+
+A `/frame` scope is per-tab server state, not a per-request argument: it survives every
+later command until something clears it, so the caller who reads a scoped tab is often not
+the one who scoped it. `/snapshot` and `/text` therefore publish the frame they were served
+from:
+
+```json
+"frame": {
+  "frameId": "886601397BFA0B332880152438BD0153",
+  "frameUrl": "http://127.0.0.1:18798/inner.html",
+  "frameName": "payment-frame",
+  "frameTitle": "Inner",
+  "ownerRef": "e3"
+}
+```
+
+- The key is **absent** on a whole-document read, so nothing changes for an unscoped caller.
+- It is published for a **one-shot `?frameId=` read too**, on a tab with no stored scope: the
+  disclosure names the frame the read was actually served from, not whatever the tab happens
+  to be scoped to. A one-shot read returns a fragment for the same reason a scoped one does,
+  so it says so the same way.
+- `frameUrl` and `frameTitle` are read from the frame at request time and are what the
+  returned content belongs to; a frame that navigated since the scope was set reports where
+  it is now.
+- Top-level `url` and `title` keep their meaning in every response, scoped or not: they are
+  the TAB's document. They are never re-pointed at the frame — a field that meant one thing
+  usually and another under invisible state is the defect this disclosure exists to remove.
+- `format=compact` and `format=text` carry the same fact in the header, as
+  `# Outer | http://127.0.0.1:18798/ | frame e3 | 3 nodes`. The marker names the owner ref
+  when one is known, because that is the handle `POST /frame` takes as a `target`; a raw
+  frame id is not. Without a known ref it names a shortened frame id.
+- The object is the one `GET /frame` returns under `frame`, plus `frameTitle`.
+
+`/capture` publishes the same `frame` object on a scoped read, for the same reason: its
+snapshot half is filtered to the scoped frame while top-level `url` and `title` name the tab
+document.
+
+`epoch.frameId` is **not** the scope and never was. It is the frame tree's ROOT id, taken
+before the capture to pair the image with the DOM epoch it was shot against, and it holds
+the same value whether or not a scope is set — so a scoped caller reading it is told the
+content came from the main document. Read `frame.frameId` for the scope and `epoch.frameId`
+for the epoch; they answer different questions and only agree when the tab is unscoped.
+
+`/html` and `/styles` already disclose their frame as a top-level `frameId`, and their `url`
+and `title` come from the frame's own document rather than the tab's, so a scoped read there
+was never attributed to the parent.
 
 Find body fields:
 
@@ -241,6 +462,10 @@ Find body fields:
 ```text
 GET  /screenshot
 GET  /tabs/{id}/screenshot
+GET  /annotate
+GET  /tabs/{id}/annotate
+GET  /capture
+GET  /tabs/{id}/capture
 GET  /pdf
 POST /pdf
 GET  /tabs/{id}/pdf
@@ -262,6 +487,113 @@ Screenshot query parameters:
 - `raw=true`
 - `output=file`
 - `noAnimations=true`
+- `selector` — capture one element
+- `annotate=true` — bake numbered ref boxes into the image
+- `beyondViewport=true` — capture the full document (ignored with `selector`)
+- `scale=<float>` — rescale the output bitmap (e.g. `0.5` = half size,
+  `0.25` = quarter). Default `1`.
+
+`/annotate` injects a persistent, clickable annotation overlay onto the live
+page — one labelled box per interactive element — and leaves it there (the
+`screenshot?annotate=true` overlay is transient and baked into the image
+instead). Intended for headed browsers: clicking a label copies a reference
+block (page, ref, role, accessible name, CSS selector, XPath) to the clipboard.
+`?clear=true` removes it; `?selector=` scopes it. See
+[Fix your website faster with an LLM](guides/annotate-for-llm-fixes.md).
+
+Annotate query parameters:
+
+- `tabId`
+- `selector` — scope the overlay to elements within this selector
+- `clear=true` — remove the overlay instead of injecting it
+
+`/capture` returns a screenshot and an accessibility snapshot from the same
+DOM epoch in a single call. It is the vision-grounded alternative to issuing
+`/screenshot` and `/snapshot` back-to-back — the two unpaired calls share no
+synchronization primitive, so the page can mutate between them and refs from
+the snapshot can point at nodes that did not exist when the image was taken.
+
+Capture query parameters:
+
+- `tabId`
+- `selector` — clips screenshot and filters snapshot subtree to the same element
+- `filter=interactive|all`
+- `depth` — snapshot max depth (default `-1` for full)
+- `format=jpeg|png`
+- `quality`
+- `output=file|inline|raw` — default `file`
+- `requirePair=true` — return `409 Conflict` when navigation is observed during the capture window
+- `noAnimations=true`
+- `scale=<float>` — rescale the output image via CDP's `clip.scale`.
+  Default `1` (native pixels). `scale=0.5` halves each axis (quarter of
+  the pixels). `image.devicePixelRatio` in the response tells you what
+  your native DPR was, so you can compute CSS-pixel equivalence if you
+  need to.
+- `wait=stable|load|none` — default `stable`. `stable` waits for
+  `Page.lifecycleEvent` quiescence (250ms of silence, 750ms ceiling) before
+  opening the capture window so the screenshot and the AX-tree describe a
+  settled page. `none` skips the wait. `load` is currently an alias for
+  `none`; reserved for a future `document.readyState` gate.
+- `withBounds=true|false` — default `true`. When on, every snapshot node
+  with a non-zero backend node id gets a `boundingBox` field and a
+  `visible` flag. `boundingBox` is the element's **border box** — the
+  painted edge, the same rectangle `GET /box`, `screenshot?annotate=true`
+  and `getBoundingClientRect` report, so a box can be cross-checked against
+  any of them. It is not the content box: an element with a border or
+  padding would otherwise report a rectangle inset from the edge a viewer
+  identifies the control by. Each bounded node costs one `DOM.getBoxModel`
+  round trip (~5ms); for the typical interactive-filter snapshot the budget
+  is under 250ms. Pass `withBounds=false` to skip the per-node work.
+- `beyondViewport=true|false` — default `false`. When on, the image spans
+  the full document instead of just the visible viewport. The response
+  sets `image.coordinateSpace` to `"document"` and bounding boxes are
+  expressed in page (document) coordinates so they overlay the full image.
+  When a `selector` is also supplied, the selector clip wins and
+  `beyondViewport` is silently ignored — the same rule `/screenshot`
+  enforces. Beyond-viewport captures force a layout pass that can resolve
+  lazy images and fire `IntersectionObserver`; the AX-tree fetch and bounds
+  harvest run after the screenshot so they reflect the post-reflow state.
+
+The response carries `image.coordinateSpace`, `image.devicePixelRatio`,
+and `image.viewport` ( `w`, `h`, `scrollX`, `scrollY` in CSS pixels at
+capture time) so clients can translate between image pixels and
+`boundingBox` values without guessing. Two axes have to be pinned for that
+to hold: the coordinate ORIGIN, which `image.coordinateSpace` names
+(`viewport` or `document`), and the box-model EDGE, which is always the
+border box.
+
+Stated as the guarantee: **scaling a `boundingBox` by `image.devicePixelRatio`,
+from the origin `image.coordinateSpace` names, lands on that image's own
+pixels — in every mode, with or without an emulated viewport.** The image
+measures exactly the reported space times the reported ratio, so a client
+never branches on configuration and never has to detect whether a linear
+mapping happens to exist. The default (viewport) capture composites the page
+to keep that promise, which costs it the faster read-the-view path
+`/screenshot` still takes: on an idle headed browser a `/capture` can
+therefore block until its deadline where a `/screenshot` returns at once.
+
+The response carries an `epoch.domEpoch` token cached on the tab's ref-cache.
+Future client work can pass `expectedEpoch` to action endpoints to detect
+stale refs at the use site; in P1 it is informational. `pairing.navigated`
+is `true` when the main frame's `loaderId` changed mid-capture — that is the
+only drift mode P1 detects. In-document churn (re-renders, observer
+mutations) is the residual risk that later phases address.
+
+Response shape:
+
+```json
+{
+  "status": "ok",
+  "tabId": "tab_abc",
+  "url": "https://example.com",
+  "title": "Example",
+  "capturedAt": "2026-05-29T10:11:12.345Z",
+  "epoch": { "frameId": "...", "loaderId": "...", "domEpoch": "ep_..." },
+  "pairing": { "navigated": false, "captureDurationMs": 312 },
+  "image": { "format": "jpeg", "path": "/.../captures/cap-...jpg", "bytes": 184223 },
+  "snapshot": { "filter": "interactive", "nodeCount": 14, "nodes": [...] }
+}
+```
 
 PDF query parameters:
 
@@ -300,6 +632,19 @@ Notes:
 - `.gif` format uses pure Go encoding (always available).
 - Only one recording per bridge instance.
 
+## Site Audit And Scrape
+
+```text
+POST /audit/page
+POST /audit
+POST /scrape
+```
+
+`POST /audit/page` audits one `url`; `POST /audit` takes `urls`, a `sitemapUrl` or SeaPortal
+results; `POST /scrape` takes the crawl root `url`. These back `pinchtab audit` and
+`pinchtab scrape` — see [audit.md](audit.md) and [scrape.md](scrape.md) for the bodies and
+report shapes.
+
 ## Downloads, Uploads, Cookies, And Clipboard
 
 ```text
@@ -326,9 +671,10 @@ Notes:
 - download and upload endpoints are gated by `security.allowDownload` and `security.allowUpload`
 - cookie endpoints (`GET/POST/DELETE /cookies`, plus tab-scoped variants) are gated by `security.allowCookies`
 - download automatically decompresses `.gz` files and returns the decompressed content
-- `security.downloadAllowedDomains` can whitelist specific domains (bypasses SSRF checks for those domains). Setting `["*"]` matches every host and disables all private-IP protection on the download endpoint.
+- `security.downloadAllowedDomains` can whitelist specific domains (bypasses SSRF checks for matching domains). Setting `["*"]` matches every host and disables private-IP protection for this endpoint, including loopback. Naming a loopback host (`127.0.0.1`, `localhost`) or using `"*"` lets the download endpoint reach services on the server's own machine, including PinchTab's own local endpoints. A host that is neither matched nor public is refused with code `download_host_blocked`, and the response carries the `config set` line that names it.
 - clipboard endpoints are gated by `security.allowClipboard`
-- upload uses a JSON body with `selector` and `files`
+- upload uses a JSON body with `selector` (default `input[type=file]`), `files` (base64) and/or `paths` (files already inside `<stateDir>/uploads`), and optional `fileNames`
+- `fileNames` is index-aligned with `files` and sets the name the page sees in `file.name` — send it, or every upload arrives as `upload-<i>.bin` and forms gating on `accept=".csv"` or `file.name.endsWith(...)` reject it. Without a name the extension is sniffed from content, which cannot identify text formats (`.csv`, `.json`, `.txt`, `.md`, `.html`) because they have no magic bytes. A supplied name wins over the sniffed type even when the two disagree, matching what a browser sends. Only the basename is used: any directory part is dropped.
 
 ## Storage
 
@@ -358,10 +704,10 @@ POST body fields:
 - `type` — `local` or `session` (required)
 - `tabId` — optional
 
-DELETE body fields:
+DELETE body fields (the body itself is optional):
 
-- `type` — `local` or `session` (required)
-- `key` — optional (if omitted, clears entire storage)
+- `type` — `local`, `session` or `all` (default `all`, both stores)
+- `key` — optional (if omitted, clears the whole store); refused together with `type: all`
 - `tabId` — optional
 
 ## State
@@ -385,6 +731,10 @@ This is different from `GET /tabs/{id}/state`, which returns live tab/page runti
 Notes:
 
 - All state and storage endpoints are gated by `security.allowStateExport`: `/storage`, `/tabs/{id}/storage`, `GET /state`, `GET /state/list`, `GET /state/show`, `POST /state/save`, `POST /state/load`, `DELETE /state`, and `POST /state/clean`
+- Cookie values in `GET /state` and `GET /state/show` additionally require
+  `security.allowCookies`; with only `allowStateExport`, those responses return the cookie
+  count while withholding values. Save/load remain available because they move cookie
+  values server-side and return counts only.
 - state files are stored in `{stateDir}/sessions/` with `0600` permissions
 - optional AES-256-GCM encryption via `security.stateEncryptionKey` config setting
 - storage is captured only for the current origin (active tab)
@@ -439,6 +789,12 @@ GET  /tabs/{id}/network/stream
 GET  /tabs/{id}/network/export
 GET  /tabs/{id}/network/export/stream
 GET  /tabs/{id}/network/{requestId}
+GET  /network/route
+POST /network/route
+DELETE /network/route
+GET  /tabs/{id}/network/route
+POST /tabs/{id}/network/route
+DELETE /tabs/{id}/network/route
 POST /dialog
 POST /tabs/{id}/dialog
 GET  /console
@@ -474,14 +830,30 @@ Network query parameters:
 - `type`
 - `limit`
 - `bufferSize`
+- `broken=true` — answer with the broken-asset list (`broken`, `count`) instead of entries
 - `body=true` on detail requests
+- `bodyMode=auto|retained-preferred|retained-only|live-only` on detail requests to choose how response bodies are resolved
+- `timeoutMs` on detail requests to bound the retained-body wait window (default 2000, max 30000)
 
 Response body behavior for network detail/export:
 
 - by default, response bodies are fetched on demand from live CDP state and may no longer be available for older requests
 - when `server.retainNetworkBodies=true`, PinchTab opportunistically retains bounded response bodies in the in-memory network buffer and returns the retained body first
-- retained bodies are capped by `server.retainNetworkBodyMaxBytes`; oversized retained bodies are truncated and marked with `bodyTruncated=true`
+- `bodyMode=retained-preferred` waits briefly for pending retained-body capture before falling back to live CDP
+- `bodyMode=retained-only` never falls back to live CDP and returns explicit pending/skipped/error state instead
+- detail responses may expose `bodySource=retained|live` to distinguish which path produced the returned body
+- retained-body detail responses may expose `bodyPending=true` while capture is still in flight, or `bodySkipped=true` with `bodySkipReason` when retention was not completed — either skipped up front (retention disabled, the tab's retention budget exhausted, concurrency limit reached) or because an over-budget base64 body was dropped rather than cut
+- retained bodies are capped twice: per body by `server.retainNetworkBodyMaxBytes` (`bodySkipReason` says "retention limit") and by the tab's remaining retention buffer ("retention budget"). An oversized text body is truncated to a byte-exact prefix and marked `bodyTruncated=true`; an oversized base64 body is dropped entirely with `bodySkipped=true` and the reason, because a base64 fragment is undecodable
+- `base64Encoded=true` marks the returned body (retained or live) as base64 — decode it before use. The field is omitted, never `false`, for a text body, so its presence is what to branch on. Both caps measure the encoded length, so a binary response has an effective raw budget of roughly three quarters of the configured bytes
 - retained responses may include `bodyRetained=true`
+
+Request body (`postData`) behavior:
+
+- `postData` holds the request body as the page sent it, decoded. Chrome delivers it base64-encoded and split into chunks; PinchTab decodes and joins it, so no base64 decoding is needed by the caller
+- it is capped at 64 KiB of decoded body, cut on a character boundary, and a cut body is marked `postDataTruncated=true` — without it a clipped request body reads as the body the client sent
+- it is omitted when the body is not text — a binary part in a multipart upload, for example — because the field carries no encoding marker. An omitted body says why: `postDataSkipped=true` with `postDataSkipReason` ("request body entry is not base64", "request body is not valid UTF-8"), so an absent `postData` is never mistaken for a request sent without one
+- `postDataTruncated` and `postDataSkipped` are different answers and never both set: truncated means cut but usable, skipped means there is no body to read. A request that simply had no body carries neither flag
+- HAR export puts the same decoded value in `request.postData.text`, and omits the block entirely when there is no publishable body
 
 Network export query parameters:
 
@@ -493,6 +865,12 @@ Network export query parameters:
 - all standard network filters (`filter`, `method`, `status`, `type`, `limit`)
 
 The `/export` endpoint returns the full capture as a single response. The `/export/stream` endpoint writes entries to a file as they arrive (SSE progress events sent to the caller). The streamed file is atomically renamed on completion.
+
+Interception rules (`/network/route`, gated by `security.allowNetworkIntercept`): `POST` takes
+`pattern` (substring or `*`/`?` glob), `action` (`continue`, `abort` or `fulfill`), and for a
+fulfill `body`, `contentType` and `status`, plus optional `resourceType` and `method`. `DELETE`
+takes `pattern` in the query or body and removes every rule when it is omitted; `GET` lists the
+tab's rules.
 
 Dialog body fields:
 
@@ -524,6 +902,21 @@ Solve body fields:
 - `tabId` optional
 - `maxAttempts` optional (defaults to `autoSolver.maxAttempts`, default `8`)
 - `timeout` optional in ms (auto-estimated when omitted, minimum `30000`)
+
+A named `solver` that cannot run is rejected with `400` before anything is
+solved, and the two reasons carry different codes:
+
+| Code | Meaning | Example message |
+| --- | --- | --- |
+| `unknown_solver` | No solver answers to that name — normally a misspelling. Lists what is available. | `unknown solver "cloudlfare" (available: [cloudflare semantic jschallenge])` |
+| `solver_key_missing` | A known key-gated solver whose API key is unset. Names the config key to set. | `solver "capsolver" is configured but its API key is not set; set autoSolver.external.capsolverKey to use it` |
+
+The API is deliberately stricter here than config validation, which accepts
+`capsolver` or `twocaptcha` in `autoSolver.solvers` with no key set — configuring
+a paid solver before its key is legitimate ordering, and the run falls back to
+the solvers that can run. A request naming one solver has no such fallback: it
+must not silently run a different solver, so it is rejected and told which key
+would enable it.
 
 `GET /config/autosolver` returns effective autosolver runtime settings and the
 currently available solver list.
@@ -566,11 +959,13 @@ POST /profiles/{id}/reset
 GET  /profiles/{id}/logs
 GET  /profiles/{id}/analytics
 POST /profiles/import
+POST /profiles/prune
 PATCH /profiles/meta
 GET  /instances
 GET  /instances/{id}
 GET  /instances/tabs
 GET  /instances/metrics
+GET  /instances/{id}/metrics
 POST /instances/start
 POST /instances/launch
 POST /instances/attach
@@ -583,17 +978,27 @@ GET  /instances/{id}/logs/stream
 GET  /instances/{id}/tabs
 POST /instances/{id}/tabs/open
 POST /instances/{id}/tab
+POST /instances/{id}/close
+POST /instances/{id}/cookies
+POST /instances/{id}/audit
+POST /instances/{id}/scrape
+POST /instances/{id}/cache/clear
+GET  /instances/{id}/cache/status
 ```
 
 Notes:
 
-- `/instances/start` and `/instances/launch` use `mode`, not `headless`
+- `/instances/start` and `/instances/launch` use `profileId` for either an existing
+  profile ID or name, and `mode`, not `headless`. Request bodies reject unrecognised
+  fields with a 400 that names the offending key and the accepted shape.
 - `/instances/launch` is a sibling endpoint of `/instances/start` (separate handler `handleLaunchByName`), kept for the launch-by-profile workflow; `name` on the body is no longer supported, profiles must already exist
 - instance responses include both `mode` and `headless`
 - instance start surfaces accept `securityPolicy.allowedDomains` for additive instance-scoped IDPI/domain allowlist overrides
 - create profiles explicitly with `POST /profiles`; `name` is no longer supported on `/instances/launch`
 - `/profiles/{id}/start` uses `headless`
 - attach routes are gated by `security.attach`
+- `POST /profiles/prune` removes quarantined profile directories; see the `pinchtab profiles prune` section of [commands.md](commands.md)
+- `/instances/{id}/close|cookies|audit|scrape|cache/*` proxy the same route to that instance
 
 ## Activity And Scheduler
 
@@ -622,7 +1027,6 @@ Activity query parameters include:
 - `profileName`
 - `tabId`
 - `action`
-- `engine`
 - `pathPrefix`
 
 Activity attribution and source behavior:
@@ -637,7 +1041,7 @@ Scheduler routes are only present when `scheduler.enabled` is true.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/sessions` | Create a new agent session (body: `{agentId, label?}`) |
+| `POST` | `/sessions` | Create a new agent session (body: `{agentId, label?, grants?, browser?}`) |
 | `GET` | `/sessions` | List all agent sessions |
 | `GET` | `/sessions/me` | Get current session (requires `Authorization: Session` auth) |
 | `GET` | `/sessions/{id}` | Get session details by ID |
@@ -646,6 +1050,12 @@ Scheduler routes are only present when `scheduler.enabled` is true.
 `POST /sessions`, `GET /sessions`, and `GET /sessions/{id}` require dashboard auth (bearer or cookie). The `/me` endpoint requires session auth. `POST /sessions/{id}/revoke` allows dashboard auth or the owning session.
 
 Create returns `sessionToken` — the plaintext token shown only once.
+
+Agent session routes are only present in full server mode with agent sessions on — `sessions.agent.enabled` true and `sessions.agent.mode` not `off`. The family always answers, so the state is readable from the error code rather than from a bare 404: a bridge returns `sessions_unavailable_bridge_mode`, whose remedy is to run `pinchtab server`, and a full server with them switched off returns `sessions_disabled`. No config value mounts the family in bridge mode.
+
+`sessions_disabled` covers two states, and its `details.hint` says which one. A server that BOOTED with agent sessions off never mounted the family, so switching them on needs a config edit *and* a restart, and the refusal carries no `details.remedy` because that is not one command. A server that booted with them on and was switched off by a config save already mounted the family: the edit applies live, needs no restart, and is carried as the refusal's `details.remedy`.
+
+Two settings switch agent sessions off, so the guidance names the one that actually is off — `sessions.agent.enabled` false, `sessions.agent.mode` `off`, or both, in which case the remedy sets both. Following the prescribed command restores the service on a save-disabled server; there is no state in which running it leaves you on the same refusal.
 
 Session-authenticated callers cannot reach dashboard/admin endpoint families such as config, dashboard agent listings, dashboard event streams, session management, profile management, instance management, or cache controls. They are intended for trusted automation in controlled environments, not for untrusted multi-tenant isolation.
 
@@ -656,13 +1066,17 @@ Some endpoints are intentionally disabled unless the matching config allows them
 These gates are not ordinary feature toggles. Enabling them is a documented, non-default, security-reducing choice that widens the control surface available to callers.
 
 - `/evaluate` and `/tabs/{id}/evaluate` -> `security.allowEvaluate`
+- `/macro` -> `security.allowMacro`
+- `GET /network/{requestId}`, `POST /network/clear` and the `/network/route` family (plus tab-scoped variants) -> `security.allowNetworkIntercept`
+- `/memory/snapshot`, `/memory/snapshot/{snapshotId}/summary` and `/memory/compare` -> `security.allowMemory`
 - `/download` and `/tabs/{id}/download` -> `security.allowDownload`
 - `GET/POST/DELETE /cookies` and `GET/POST/DELETE /tabs/{id}/cookies` -> `security.allowCookies`
 - `/upload` and `/tabs/{id}/upload` -> `security.allowUpload`
 - clipboard routes -> `security.allowClipboard`
 - attach routes -> `security.attach`
 - screencast routes -> `security.allowScreencast`
-- storage routes (`/storage`, `/tabs/{id}/storage`) and the full state-management family (`/state/list`, `/state/show`, `/state/save`, `/state/load`, `DELETE /state`, `POST /state/clean`) -> `security.allowStateExport`
+- storage routes (`/storage`, `/tabs/{id}/storage`) and the full state-management family
+  (`GET /state`, `/state/list`, `/state/show`, `/state/save`, `/state/load`, `DELETE /state`, `POST /state/clean`) -> `security.allowStateExport`
 
 ## Error Response Format
 
@@ -677,6 +1091,52 @@ Problem Details is currently used for selected precondition and capability failu
 - network stream unsupported streaming capability
 - dashboard SSE unsupported streaming capability or deadline control
 - instance logs SSE unsupported streaming capability or deadline control
-- screencast tab-not-found precondition failure
 
 Additional endpoints may be migrated over time. Clients should tolerate both error content types and branch on `Content-Type` when parsing failures.
+
+### Refusal guidance: `details.hint` and `details.remedy`
+
+A refusal that a caller can act on carries a `details` object with two fields. They are
+different kinds of answer and neither substitutes for the other:
+
+- `hint` — prose for a human or a model to read. Explanations, alternatives, preconditions
+  and anything that is not a single command live here.
+- `remedy` — **one line a shell accepts**, so an agent can run it verbatim without parsing
+  English.
+
+`remedy` guarantees all of the following:
+
+- one line, one or more `pinchtab` invocations, joined with `&&` when more than one is needed.
+  `$(...)` command substitution is allowed and is used where a value has to be read back
+  first — widening the domain allowlist appends to the current one rather than replacing it
+- no prose connectives (`then:`, `or`, a parenthetical tail), no pipes, semicolons,
+  redirections, backquotes, comments or brace expansion. `pinchtab dialog accept|dismiss`
+  is not two suggestions to a shell — it is a pipeline into a command named `dismiss` — so a
+  line like that is not a remedy and never appears in the field
+- every command and flag in it exists in the CLI
+- a free slot is a `<name>` placeholder, the same angle-bracket convention the CLI's own
+  `--help` uses, and nothing else. Values known when the refusal is produced are already
+  interpolated, so a placeholder means the value genuinely is the caller's to supply
+- **the field is absent when no single command fixes the refusal.** Absence is the answer,
+  not an omission: it says truthfully that there is nothing to run, and the guidance for that
+  case is in `hint`. Do not treat a missing `remedy` as an error in the response
+
+```json
+{
+  "error": "this endpoint requires the evaluate capability; enable security.allowEvaluate in config to use it",
+  "code": "evaluate_disabled",
+  "details": {
+    "setting": "security.allowEvaluate",
+    "hint": "Enable security.allowEvaluate to use this feature, then restart PinchTab to apply the change.",
+    "remedy": "pinchtab config set security.allowEvaluate true"
+  }
+}
+```
+
+`details` may carry further machine-readable fields beside these two — the capability refusal
+above names the `setting`, an allowlist block names the blocked `url` and `domain` — so read
+the object by key rather than assuming it holds only guidance.
+
+`pinchtab` renders both fields when a request fails, printing `remedy` into a `Remedy:` line.
+Every value in that slot meets the contract above, whether it came from the server or from
+the CLI's own client-side refusals.

@@ -8,24 +8,45 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
-	"github.com/chromedp/cdproto/cdp"
-	"github.com/chromedp/cdproto/dom"
-	"github.com/chromedp/cdproto/runtime"
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/activity"
 	"github.com/pinchtab/pinchtab/internal/httpx"
+	"github.com/pinchtab/pinchtab/internal/routes"
 )
 
 type uploadRequest struct {
-	Selector string   `json:"selector"`
-	Files    []string `json:"files"`
-	Paths    []string `json:"paths"`
+	Selector  string   `json:"selector"`
+	Files     []string `json:"files"`
+	FileNames []string `json:"fileNames"`
+	Paths     []string `json:"paths"`
 }
 
 const (
-	uploadSandboxDirName = "uploads"
+	uploadSandboxDirName  = "uploads"
+	uploadStagedDirPrefix = "pinchtab-upload-"
+
+	// CDP keeps only the file path on the input, so decoded files need to remain
+	// available after /upload returns. Bound the lifetime so persistent StateDir
+	// installs do not retain successful base64 uploads forever.
+	uploadStagedRetention = 24 * time.Hour
+)
+
+var (
+	cleanupStagedUploadDirAfter = func(dir string, after time.Duration) {
+		if dir == "" {
+			return
+		}
+		if after <= 0 {
+			_ = os.RemoveAll(dir)
+			return
+		}
+		time.AfterFunc(after, func() {
+			_ = os.RemoveAll(dir)
+		})
+	}
 )
 
 // HandleUpload sets files on an <input type="file"> element via CDP.
@@ -35,17 +56,24 @@ const (
 //	{
 //	  "selector": "input[type=file]",   // unified selector: CSS, XPath, text, ref, or semantic
 //	  "files": ["data:image/png;base64,...", "base64:..."],
+//	  "fileNames": ["chart.png", "data.csv"],
 //	  "paths": ["uploads/photo.jpg"]
 //	}
 //
 // Either "files" (base64 data) or "paths" (relative sandbox paths) must be
 // provided. Both can be combined. Files are written to a temp dir and passed to
-// CDP. Path-based uploads are limited to StateDir/uploads/.
+// CDP. Path-based uploads are limited to StateDir/uploads/. Successful base64
+// staging dirs are retained briefly for lazy browser reads, then cleaned.
+//
+// "fileNames" is index-aligned with "files" and decides the name the page sees.
+// A supplied name wins over the content sniff even when the two disagree,
+// because that is what a browser does: it sends the user's filename and leaves
+// the receiving page to decide whether to trust it. Without a name the extension
+// is sniffed from content, which is all a bare blob can support — and sniffing is
+// blind to exactly the text formats forms validate by extension.
 func (h *Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	if !h.Config.AllowUpload {
-		httpx.ErrorCode(w, 403, "upload_disabled", httpx.DisabledEndpointMessage("upload", "security.allowUpload"), false, map[string]any{
-			"setting": "security.allowUpload",
-		})
+		h.writeCapabilityDisabled(w, routes.CapUpload)
 		return
 	}
 	tabID := r.URL.Query().Get("tabId")
@@ -91,15 +119,40 @@ func (h *Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		req.Paths[i] = safe
 	}
 
-	// Decode base64 files to temp dir.
+	// Decode base64 files into a staged dir that OUTLIVES this request. CDP
+	// SetFileInputFiles only records the path on the <input>; the browser reads the
+	// bytes LAZILY at form-submit time, which is typically a separate, later
+	// request. Deleting the decoded file when this handler returns (the previous
+	// `defer os.RemoveAll`) left the file gone by submit time, so multipart
+	// submissions failed with ERR_FILE_NOT_FOUND ("Your file couldn't be accessed.
+	// It may have been moved, edited, or deleted."). Keep the staged files on the
+	// success path long enough for lazy reads, and only remove them immediately if
+	// the upload fails before attaching to a tab.
 	var tempFiles []string
+	var stagedDir string
+	uploadSucceeded := false
+	defer func() {
+		if !uploadSucceeded && stagedDir != "" {
+			_ = os.RemoveAll(stagedDir)
+		}
+	}()
 	if len(req.Files) > 0 {
-		tmpDir, err := os.MkdirTemp("", "pinchtab-upload-*")
+		// Stage under StateDir/uploads when configured so paths survive this
+		// request, else the OS temp dir; never the process working directory.
+		stageBase := os.TempDir()
+		if strings.TrimSpace(h.Config.StateDir) != "" {
+			if err := os.MkdirAll(uploadBase, 0o755); err != nil {
+				httpx.Error(w, 500, fmt.Errorf("create upload dir: %w", err))
+				return
+			}
+			stageBase = uploadBase
+		}
+		dir, err := os.MkdirTemp(stageBase, uploadStagedDirPrefix+"*")
 		if err != nil {
-			httpx.Error(w, 500, fmt.Errorf("create temp dir: %w", err))
+			httpx.Error(w, 500, fmt.Errorf("create staged dir: %w", err))
 			return
 		}
-		defer func() { _ = os.RemoveAll(tmpDir) }()
+		stagedDir = dir
 
 		for i, f := range req.Files {
 			data, ext, err := decodeFileData(f)
@@ -116,9 +169,13 @@ func (h *Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 				httpx.Error(w, 400, fmt.Errorf("upload payload too large: max %d bytes total", maxTotalBytes))
 				return
 			}
-			path := fmt.Sprintf("%s/upload-%d%s", tmpDir, i, ext)
+			path, err := stageUploadPath(stagedDir, i, uploadFileName(req.FileNames, i), ext)
+			if err != nil {
+				httpx.Error(w, 400, fmt.Errorf("file[%d]: %w", i, err))
+				return
+			}
 			if err := os.WriteFile(path, data, 0600); err != nil {
-				httpx.Error(w, 500, fmt.Errorf("write temp file: %w", err))
+				httpx.Error(w, 500, fmt.Errorf("write staged file: %w", err))
 				return
 			}
 			tempFiles = append(tempFiles, path)
@@ -137,7 +194,7 @@ func (h *Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		httpx.ErrorCode(w, http.StatusLocked, "tab_locked", err.Error(), false, nil)
 		return
 	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	if _, ok := h.applyTabGuards(w, r, ctx, resolvedTabID, guardDialogBlocked|guardDomainPolicy|guardHandoffPause); !ok {
 		return
 	}
 
@@ -145,22 +202,25 @@ func (h *Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	defer tCancel()
 	go httpx.CancelOnClientDone(r.Context(), tCancel)
 
-	// Find the file input node and set files via CDP.
-	if err := chromedp.Run(tCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			// Evaluate selector to get the DOM node.
-			nodeID, err := resolveSelector(ctx, req.Selector)
-			if err != nil {
-				return fmt.Errorf("selector %q: %w", req.Selector, err)
-			}
-			return dom.SetFileInputFiles(allPaths).WithNodeID(nodeID).Do(ctx)
-		}),
-	); err != nil {
+	nodeID, err := h.Bridge.ResolveSelectorToNodeID(tCtx, req.Selector, h.Bridge.GetRefCache(resolvedTabID), h.selectorFrameID(resolvedTabID))
+	if err != nil {
+		respondSelectorFailure(w, fmt.Errorf("%w: upload selector %q: %v", ErrElementNotFound, req.Selector, err))
+		return
+	}
+
+	if err := h.Bridge.SetFileInputFiles(tCtx, nodeID, allPaths); err != nil {
 		httpx.Error(w, 500, fmt.Errorf("upload: %w", err))
 		return
 	}
 
 	h.recordActivity(r, activity.Update{Action: "upload", TabID: resolvedTabID})
+
+	// Files attached successfully; keep the staged copies so the browser can read
+	// them at form-submit time, but schedule bounded cleanup.
+	uploadSucceeded = true
+	if stagedDir != "" {
+		cleanupStagedUploadDirAfter(stagedDir, uploadStagedRetention)
+	}
 
 	httpx.JSON(w, 200, map[string]any{
 		"status": "ok",
@@ -168,61 +228,72 @@ func (h *Handlers) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleTabUpload uploads files for a tab identified by path ID.
-//
 // @Endpoint POST /tabs/{id}/upload
 func (h *Handlers) HandleTabUpload(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
-		return
-	}
-
-	q := r.URL.Query()
-	q.Set("tabId", tabID)
-
-	req := r.Clone(r.Context())
-	u := *r.URL
-	u.RawQuery = q.Encode()
-	req.URL = &u
-
-	h.HandleUpload(w, req)
+	h.withPathTabID(w, r, h.HandleUpload)
 }
 
-// resolveSelector finds a DOM node by a unified selector string and returns its NodeID.
-// Supports CSS (default), XPath (xpath: prefix or // auto-detect), and text (text: prefix).
-func resolveSelector(ctx context.Context, sel string) (cdp.NodeID, error) {
-	// Determine the JavaScript expression based on selector type.
-	var expr string
-	switch {
-	case strings.HasPrefix(sel, "xpath:"):
-		xpath := sel[len("xpath:"):]
-		expr = fmt.Sprintf(`(function(){var r=document.evaluate(%q,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return r.singleNodeValue})()`, xpath)
-	case strings.HasPrefix(sel, "//") || strings.HasPrefix(sel, "(//"):
-		expr = fmt.Sprintf(`(function(){var r=document.evaluate(%q,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return r.singleNodeValue})()`, sel)
-	case strings.HasPrefix(sel, "text:"):
-		text := sel[len("text:"):]
-		expr = fmt.Sprintf(`(function(){var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);while(w.nextNode()){if(w.currentNode.textContent.includes(%q))return w.currentNode.parentElement}return null})()`, text)
-	case strings.HasPrefix(sel, "css:"):
-		css := sel[len("css:"):]
-		expr = fmt.Sprintf(`document.querySelector(%q)`, css)
-	default:
-		// Bare selector — treat as CSS (backward compatible)
-		expr = fmt.Sprintf(`document.querySelector(%q)`, sel)
+// uploadFileName returns the caller-supplied name for file i, or "" when none
+// was sent. Names are index-aligned with files and the list may be shorter.
+func uploadFileName(names []string, i int) string {
+	if i < 0 || i >= len(names) {
+		return ""
 	}
+	return strings.TrimSpace(names[i])
+}
 
-	val, _, err := runtime.Evaluate(expr).Do(ctx)
+// stagedUploadName reduces a caller-supplied name to the single filesystem
+// element it will be staged as, falling back to the generated upload-<i><ext>
+// when the caller sent nothing usable.
+//
+// Containment is a property of the RETURN VALUE rather than a second check after
+// the fact: the result is always one path element — never empty, never "." or
+// "..", never carrying a separator — so joining it under a directory cannot
+// leave that directory. A re-resolution after this would be unreachable by
+// construction, and an unreachable guard is one no test can hold to account.
+//
+// Reducing rather than refusing is what a browser does: it sends the basename of
+// whatever the user picked and never the directory above it.
+func stagedUploadName(name string, i int, ext string) string {
+	generated := fmt.Sprintf("upload-%d%s", i, ext)
+
+	// Reduce on BOTH separators whatever the host is. filepath.Base cannot: on a
+	// Linux server its separator is "/", so a Windows caller's "C:\dir\data.csv"
+	// contains no separator at all and survives whole. The cost is that a literal
+	// backslash in a genuine POSIX filename is treated as a separator too, which is
+	// the same trade a browser makes — it sends the final component and nothing else.
+	trimmed := strings.ReplaceAll(strings.TrimSpace(name), `\`, "/")
+	if strings.HasSuffix(trimmed, "/") {
+		return generated
+	}
+	base := filepath.Base(trimmed)
+	switch {
+	case base == "", base == ".", base == "..", strings.ContainsRune(base, 0):
+		return generated
+	}
+	return base
+}
+
+// stageUploadPath returns the path to write file i to, under its own numbered
+// subdirectory of stagedDir.
+//
+// The subdirectory is what keeps the caller's real basename usable: a page reads
+// file.name from the basename of the path CDP was handed, so the presented name
+// and the on-disk name are the same string by construction, and two files sent in
+// one request under the same name (a/data.csv and b/data.csv) would otherwise
+// resolve to one path that os.WriteFile truncates — losing a file silently. The
+// index used to live in the filename and provided that uniqueness; moving it to
+// the directory keeps it while freeing the name.
+func stageUploadPath(stagedDir string, i int, name, ext string) (string, error) {
+	fileDir := filepath.Join(stagedDir, strconv.Itoa(i))
+	if err := os.MkdirAll(fileDir, 0o700); err != nil {
+		return "", fmt.Errorf("create staged dir: %w", err)
+	}
+	path, err := httpx.SafeCreatePath(fileDir, stagedUploadName(name, i, ext))
 	if err != nil {
-		return 0, fmt.Errorf("evaluate: %w", err)
+		return "", fmt.Errorf("resolve staged file path: %w", err)
 	}
-	if val.ObjectID == "" {
-		return 0, fmt.Errorf("no element matches selector")
-	}
-	node, err := dom.RequestNode(val.ObjectID).Do(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("request node: %w", err)
-	}
-	return node, nil
+	return path, nil
 }
 
 func validateUploadSandboxPath(baseDir, rawPath string, maxFileBytes int) (string, int64, error) {
@@ -253,6 +324,31 @@ func normalizeUploadSandboxPath(rawPath string) string {
 	return filepath.FromSlash(trimmed)
 }
 
+// CleanupStaleUploads removes old decoded-upload staging dirs left in StateDir.
+// It is intentionally scoped to dirs created by HandleUpload and leaves
+// user-managed files in StateDir/uploads untouched.
+func CleanupStaleUploads(stateDir string) {
+	if strings.TrimSpace(stateDir) == "" {
+		return
+	}
+	uploadBase := filepath.Join(stateDir, uploadSandboxDirName)
+	entries, err := os.ReadDir(uploadBase)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-uploadStagedRetention)
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), uploadStagedDirPrefix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(uploadBase, entry.Name()))
+	}
+}
+
 // decodeFileData handles "data:mime;base64,..." and raw base64 strings.
 // Returns decoded bytes and a file extension guess.
 func decodeFileData(input string) ([]byte, string, error) {
@@ -260,13 +356,11 @@ func decodeFileData(input string) ([]byte, string, error) {
 	var b64 string
 
 	if strings.HasPrefix(input, "data:") {
-		// data:image/png;base64,iVBOR...
 		parts := strings.SplitN(input, ",", 2)
 		if len(parts) != 2 {
 			return nil, "", fmt.Errorf("invalid data URL")
 		}
 		b64 = parts[1]
-		// Extract mime for extension.
 		meta := strings.TrimPrefix(parts[0], "data:")
 		mime := strings.SplitN(meta, ";", 2)[0]
 		ext = mimeToExt(mime)
@@ -276,7 +370,6 @@ func decodeFileData(input string) ([]byte, string, error) {
 
 	data, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
-		// Try URL-safe encoding.
 		data, err = base64.URLEncoding.DecodeString(b64)
 		if err != nil {
 			return nil, "", fmt.Errorf("base64 decode: %w", err)

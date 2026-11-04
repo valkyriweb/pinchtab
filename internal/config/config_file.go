@@ -1,7 +1,6 @@
 package config
 
 import (
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -112,22 +111,25 @@ func compareSemver(a, b [3]int) int {
 func DefaultFileConfig() FileConfig {
 	start := 9868
 	end := 9968
+	quarantineKeep := DefaultProfileQuarantineKeep
 	restartMaxRestarts := 20
 	restartInitBackoffSec := 2
 	restartMaxBackoffSec := 60
 	restartStableAfterSec := 300
 	maxTabs := 20
+	captureAllowActivation := true
 	allowEvaluate := false
 	allowMacro := false
 	allowScreencast := false
 	allowDownload := false
 	allowCookies := false
 	allowNetworkIntercept := false
+	allowMemory := false
 	downloadMaxBytes := DefaultDownloadMaxBytes
+	memorySnapshotMaxBytes := DefaultMemorySnapshotMaxBytes
 	allowUpload := false
 	allowClipboard := false
 	allowStateExport := false
-	enableActionGuards := true
 	uploadMaxRequestBytes := DefaultUploadMaxRequestBytes
 	uploadMaxFiles := DefaultUploadMaxFiles
 	uploadMaxFileBytes := DefaultUploadMaxFileBytes
@@ -135,6 +137,7 @@ func DefaultFileConfig() FileConfig {
 	maxRedirects := -1
 	trustLoopbackProxy := false
 	attachEnabled := false
+	attachForwardProxyAuth := false
 	activityEnabled := true
 	activitySessionIdleSec := 1800
 	activityRetentionDays := 30
@@ -151,15 +154,9 @@ func DefaultFileConfig() FileConfig {
 	dashboardSessionElevationWindowSec := 15 * 60
 	dashboardSessionPersistElevationAcrossRestart := false
 	dashboardSessionRequireElevation := false
-	autoSolverEnabled := false
-	autoSolverAutoTrigger := true
-	autoSolverTriggerOnNavigate := true
-	autoSolverTriggerOnAction := true
-	autoSolverMaxAttempts := 8
-	autoSolverSolverTimeoutSec := 30
-	autoSolverRetryBaseDelayMs := 500
-	autoSolverRetryMaxDelayMs := 10000
-	autoSolverLLMFallback := false
+	// Locals only so the shared defaults can be pointer-wrapped; the values come
+	// from defaultAutoSolverConfig, not from a second transcription of them.
+	autoSolver := defaultAutoSolverConfig()
 	return FileConfig{
 		Schema:        CurrentConfigSchemaURL(),
 		ConfigVersion: CurrentConfigVersion,
@@ -169,14 +166,20 @@ func DefaultFileConfig() FileConfig {
 			StateDir: userConfigDir(),
 		},
 		Browser: BrowserConfig{
-			ChromeVersion:  "144.0.7559.133",
+			// BrowserVersion is left unset so the persona probes the launched binary
+			// for its real version; a default here would pin it and the probe would
+			// never fire. TestTheConfigDefaultsLeaveBrowserVersionUnset guards this.
 			ExtensionPaths: []string{defaultExtensionsDir(userConfigDir())},
 		},
+		Browsers: BrowsersConfig{
+			Default: DefaultBrowserForSystem(),
+		},
 		InstanceDefaults: InstanceDefaultsConfig{
-			Mode:              "headless",
-			MaxTabs:           &maxTabs,
-			StealthLevel:      "light",
-			TabEvictionPolicy: "close_lru",
+			Mode:                   "headless",
+			MaxTabs:                &maxTabs,
+			CaptureAllowActivation: &captureAllowActivation,
+			StealthLevel:           "light",
+			TabEvictionPolicy:      "close_lru",
 		},
 		Security: SecurityConfig{
 			AllowEvaluate:          &allowEvaluate,
@@ -185,13 +188,13 @@ func DefaultFileConfig() FileConfig {
 			AllowDownload:          &allowDownload,
 			AllowCookies:           &allowCookies,
 			AllowNetworkIntercept:  &allowNetworkIntercept,
-			AllowedDomains:         append([]string(nil), defaultLocalAllowedDomains...),
+			AllowMemory:            &allowMemory,
 			DownloadAllowedDomains: []string{},
 			DownloadMaxBytes:       &downloadMaxBytes,
+			MemorySnapshotMaxBytes: &memorySnapshotMaxBytes,
 			AllowUpload:            &allowUpload,
 			AllowClipboard:         &allowClipboard,
 			AllowStateExport:       &allowStateExport,
-			EnableActionGuards:     &enableActionGuards,
 			UploadMaxRequestBytes:  &uploadMaxRequestBytes,
 			UploadMaxFiles:         &uploadMaxFiles,
 			UploadMaxFileBytes:     &uploadMaxFileBytes,
@@ -199,11 +202,12 @@ func DefaultFileConfig() FileConfig {
 			MaxRedirects:           &maxRedirects,
 			TrustLoopbackProxy:     &trustLoopbackProxy,
 			Attach: AttachConfig{
-				Enabled:      &attachEnabled,
-				AllowHosts:   []string{"127.0.0.1", "localhost", "::1"},
-				AllowSchemes: []string{"ws", "wss"},
+				Enabled:          &attachEnabled,
+				AllowHosts:       []string{"127.0.0.1", "localhost", "::1"},
+				AllowSchemes:     []string{"ws", "wss", "http", "https"},
+				ForwardProxyAuth: &attachForwardProxyAuth,
 			},
-			IDPI: IDPIConfig{
+			IDPI: &IDPIConfig{
 				Enabled:        true,
 				StrictMode:     true,
 				ScanContent:    true,
@@ -212,9 +216,16 @@ func DefaultFileConfig() FileConfig {
 			},
 			TransactionPolicy: TransactionPolicyConfig{Enabled: false, Hosts: []string{}, DenyRules: []TransactionPolicyRule{}, AllowRules: []TransactionPolicyRule{}},
 		},
+		// BaseDir is deliberately empty. Pre-filling it with an absolute
+		// userConfigDir() path did two things: it baked a host home directory into any
+		// config that got written, and it made finalizeProfileConfig's
+		// filepath.Join(StateDir, "profiles") fallback unreachable, so server.stateDir
+		// could never relocate profiles. Left empty, the fallback is the live path and
+		// resolves to the same place for a default install, because StateDir itself
+		// defaults to userConfigDir().
 		Profiles: ProfilesConfig{
-			BaseDir:        filepath.Join(userConfigDir(), "profiles"),
 			DefaultProfile: "default",
+			QuarantineKeep: &quarantineKeep,
 		},
 		MultiInstance: MultiInstanceConfig{
 			Strategy:          "always-on",
@@ -262,16 +273,16 @@ func DefaultFileConfig() FileConfig {
 			},
 		},
 		AutoSolver: AutoSolverFileConfig{
-			Enabled:           &autoSolverEnabled,
-			AutoTrigger:       &autoSolverAutoTrigger,
-			TriggerOnNavigate: &autoSolverTriggerOnNavigate,
-			TriggerOnAction:   &autoSolverTriggerOnAction,
-			MaxAttempts:       &autoSolverMaxAttempts,
-			SolverTimeoutSec:  &autoSolverSolverTimeoutSec,
-			RetryBaseDelayMs:  &autoSolverRetryBaseDelayMs,
-			RetryMaxDelayMs:   &autoSolverRetryMaxDelayMs,
-			Solvers:           []string{"cloudflare", "semantic", "capsolver", "twocaptcha"},
-			LLMFallback:       &autoSolverLLMFallback,
+			Enabled:           &autoSolver.Enabled,
+			AutoTrigger:       &autoSolver.AutoTrigger,
+			TriggerOnNavigate: &autoSolver.TriggerOnNavigate,
+			TriggerOnAction:   &autoSolver.TriggerOnAction,
+			MaxAttempts:       &autoSolver.MaxAttempts,
+			SolverTimeoutSec:  &autoSolver.SolverTimeoutSec,
+			RetryBaseDelayMs:  &autoSolver.RetryBaseDelayMs,
+			RetryMaxDelayMs:   &autoSolver.RetryMaxDelayMs,
+			Solvers:           autoSolver.Solvers,
+			LLMFallback:       &autoSolver.LLMFallback,
 		},
 	}
 }

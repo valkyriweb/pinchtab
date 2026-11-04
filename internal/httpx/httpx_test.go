@@ -21,7 +21,6 @@ func TestStatusWriter(t *testing.T) {
 		t.Errorf("expected recorded code 404, got %d", w.Code)
 	}
 
-	// Test default code
 	w2 := httptest.NewRecorder()
 	sw2 := &StatusWriter{ResponseWriter: w2, Code: 200}
 	_, _ = sw2.Write([]byte("ok"))
@@ -89,6 +88,23 @@ func TestStatusForJSONDecodeError(t *testing.T) {
 	err := &http.MaxBytesError{Limit: 1}
 	if got := StatusForJSONDecodeError(err); got != http.StatusRequestEntityTooLarge {
 		t.Fatalf("StatusForJSONDecodeError(max bytes) = %d, want %d", got, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestDecodeJSONBodyRejectsUnknownFieldsAndNamesTheExpectedShape(t *testing.T) {
+	var dst struct {
+		ProfileID string `json:"profileId"`
+		Mode      string `json:"mode"`
+	}
+	req := httptest.NewRequest(http.MethodPost, "/instances/start", strings.NewReader(`{"profile":"work"}`))
+	err := DecodeJSONBody(httptest.NewRecorder(), req, 0, &dst)
+	if err == nil {
+		t.Fatal("DecodeJSONBody accepted an unknown request field")
+	}
+	for _, want := range []string{`unknown field "profile"`, "expected one of: mode, profileId"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
 	}
 }
 

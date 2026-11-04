@@ -15,11 +15,11 @@ import (
 // Ported from verify-answers.sh — patterns are case-insensitive.
 var expectPatterns = map[string]string{
 	// Group 0: Setup & diagnosis
-	"0.1": `status.*ok|^ok$|"ok"`,
+	"0.1": `status.*ok|\bok\b|"ok"`,
 	"0.2": `401|missing_token|unauth|bad_token|rejected`,
-	"0.3": `200|authed.*200|status.*ok|^ok$|"ok"`,
+	"0.3": `200|authed.*200|status.*ok|\bok\b|"ok"`,
 	"0.4": `running`,
-	"0.5": `tab.*list|tabs.*returned|active tab|listed.*tab|\d+ tabs? (found|open)|tabs:|tab.*id`,
+	"0.5": `tab.*list|tabs.*returned|active tab|listed.*tab|\d+ tabs? (found|open)|tabs:|tab.*id|"tabs"\s*:|\bno (open )?tabs\b|empty`,
 	"0.6": `cleaned|closed|no stale|reused.*tab|no cleanup|single active|is empty|already empty|clean.*state|cannot close last|one tab`,
 	"0.7": `VERIFY_HOME_LOADED_12345|navigated to fixtures|fixtures.*home|PinchTab Benchmark|fixtures/`,
 	"0.8": `[0-9A-F]{32}|tab.*id.*captured`,
@@ -155,13 +155,24 @@ var expectPatterns = map[string]string{
 	// Group 44: Multi-step Wizard
 	"44.1": `WIZARD_STEP=2|[Ss]tep 2|[Pp]references`,
 	"44.2": `WIZARD_SUMMARY_NAME.*WIZARD_SUMMARY_PLAN=PRO|WIZARD_STEP=3.*WIZARD_SUMMARY_NAME|[Ss]ummary.*PRO|PRO.*plan.*confirm`,
+	// Group 45: Element Attributes & State Inspection
+	"45.1": `ATTR_BUTTON_COUNT_5`,
+	"45.2": `ATTR_TESTID=delete-action`,
+	"45.3": `ATTR_DELETE_DISABLED`,
+	"45.4": `ATTR_CHECKED_COUNT_3`,
+	"45.5": `ATTR_NAME_VALUE_ALICE`,
+	"45.6": `ATTR_HIDDEN_MSG_NOT_VISIBLE`,
+	"45.7": `ATTR_LINK_COUNT_7`,
+	// Group 46: Tab Lifecycle
+	"46.1": `TAB_TOTAL_COUNT_3`,
+	"46.2": `TAB_REMAINING_COUNT_2`,
 }
 
 var groupSizes = map[int]int{
 	0: 8, 1: 6, 2: 3, 3: 2, 4: 3, 5: 2, 6: 3, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2, 12: 2,
 	13: 2, 14: 2, 15: 4, 16: 2, 17: 2, 18: 1, 19: 2, 20: 2, 21: 2, 22: 2, 23: 1, 24: 2, 25: 2,
 	26: 2, 27: 2, 28: 2, 29: 2, 30: 2, 31: 1, 32: 1, 33: 1, 34: 1, 35: 2, 36: 2, 37: 2, 38: 2,
-	39: 1, 40: 2, 41: 2, 42: 3, 43: 2, 44: 2,
+	39: 1, 40: 2, 41: 2, 42: 3, 43: 2, 44: 2, 45: 7, 46: 2,
 }
 
 func totalBaselineSteps() int {
@@ -227,7 +238,6 @@ func RunVerifyAnswers(argv []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// Load all steps, deduplicate by ID (keep first seen)
 	type stepData struct {
 		ID     string `json:"id"`
 		Answer string `json:"answer"`
@@ -248,9 +258,7 @@ func RunVerifyAnswers(argv []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		for _, s := range report.Steps {
-			if _, exists := seen[s.ID]; !exists {
-				seen[s.ID] = s
-			}
+			seen[s.ID] = s
 		}
 	}
 

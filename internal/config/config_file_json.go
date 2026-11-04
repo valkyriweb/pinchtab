@@ -5,6 +5,7 @@ type fileConfigJSON struct {
 	ConfigVersion    string                      `json:"configVersion,omitempty"`
 	Server           serverConfigJSON            `json:"server"`
 	Browser          browserConfigJSON           `json:"browser"`
+	Browsers         *BrowsersConfig             `json:"browsers,omitempty"`
 	InstanceDefaults instanceDefaultsConfigJSON  `json:"instanceDefaults"`
 	Security         securityConfigJSON          `json:"security"`
 	Profiles         profilesConfigJSON          `json:"profiles"`
@@ -17,44 +18,67 @@ type fileConfigJSON struct {
 }
 
 type serverConfigJSON struct {
-	Port              string `json:"port"`
-	Bind              string `json:"bind"`
-	Token             string `json:"token"`
-	StateDir          string `json:"stateDir"`
-	Engine            string `json:"engine"`
-	NetworkBufferSize *int   `json:"networkBufferSize,omitempty"`
-	TrustProxyHeaders *bool  `json:"trustProxyHeaders,omitempty"`
-	CookieSecure      *bool  `json:"cookieSecure,omitempty"`
+	Port                      string `json:"port"`
+	Bind                      string `json:"bind"`
+	Token                     string `json:"token"`
+	StateDir                  string `json:"stateDir"`
+	LogLevel                  string `json:"logLevel,omitempty"`
+	NetworkBufferSize         *int   `json:"networkBufferSize,omitempty"`
+	RetainNetworkBodies       *bool  `json:"retainNetworkBodies,omitempty"`
+	RetainNetworkBodyMaxBytes *int   `json:"retainNetworkBodyMaxBytes,omitempty"`
+	TrustProxyHeaders         *bool  `json:"trustProxyHeaders,omitempty"`
+	CookieSecure              *bool  `json:"cookieSecure,omitempty"`
 }
 
 type browserConfigJSON struct {
-	ChromeVersion    string   `json:"version"`
-	ChromeBinary     string   `json:"binary"`
-	ChromeDebugPort  *int     `json:"remoteDebuggingPort,omitempty"`
-	ChromeExtraFlags string   `json:"extraFlags"`
-	ExtensionPaths   []string `json:"extensionPaths"`
+	Provider          string                  `json:"provider,omitempty"`
+	BrowserVersion    string                  `json:"version"`
+	BrowserBinary     string                  `json:"binary"`
+	BrowserDebugPort  *int                    `json:"remoteDebuggingPort,omitempty"`
+	BrowserExtraFlags string                  `json:"extraFlags"`
+	Cloak             *cloakBrowserConfigJSON `json:"cloak,omitempty"`
+	ExtensionPaths    []string                `json:"extensionPaths"`
+	// Pointer so omitempty drops the field for legacy configs (byte-identical round-trip).
+	Proxy         *BrowserProxyConfig  `json:"proxy,omitempty"`
+	DefaultTarget string               `json:"defaultTarget,omitempty"`
+	FallbackOrder []string             `json:"fallbackOrder,omitempty"`
+	Targets       BrowserTargetsConfig `json:"targets,omitempty"`
+}
+
+type cloakBrowserConfigJSON struct {
+	FingerprintSeed           string `json:"fingerprintSeed,omitempty"`
+	Platform                  string `json:"platform,omitempty"`
+	Locale                    string `json:"locale,omitempty"`
+	Timezone                  string `json:"timezone,omitempty"`
+	WebRTCIP                  string `json:"webrtcIP,omitempty"`
+	FontsDir                  string `json:"fontsDir,omitempty"`
+	StorageQuotaMB            *int   `json:"storageQuotaMB,omitempty"`
+	DisableDefaultStealthArgs *bool  `json:"disableDefaultStealthArgs,omitempty"`
 }
 
 type instanceDefaultsConfigJSON struct {
-	Mode              string             `json:"mode"`
-	NoRestore         *bool              `json:"noRestore"`
-	Timezone          string             `json:"timezone"`
-	BlockImages       *bool              `json:"blockImages"`
-	BlockMedia        *bool              `json:"blockMedia"`
-	BlockAds          *bool              `json:"blockAds"`
-	MaxTabs           *int               `json:"maxTabs"`
-	MaxParallelTabs   *int               `json:"maxParallelTabs"`
-	UserAgent         string             `json:"userAgent"`
-	NoAnimations      *bool              `json:"noAnimations"`
-	Humanize          *bool              `json:"humanize"`
-	StealthLevel      string             `json:"stealthLevel"`
-	TabEvictionPolicy string             `json:"tabEvictionPolicy"`
-	TabPolicy         *TabPolicyDefaults `json:"tabPolicy,omitempty"`
+	Mode                   string             `json:"mode"`
+	NoRestore              *bool              `json:"noRestore"`
+	Timezone               string             `json:"timezone"`
+	BlockImages            *bool              `json:"blockImages"`
+	BlockMedia             *bool              `json:"blockMedia"`
+	BlockAds               *bool              `json:"blockAds"`
+	MaxTabs                *int               `json:"maxTabs"`
+	MaxParallelTabs        *int               `json:"maxParallelTabs"`
+	UserAgent              string             `json:"userAgent"`
+	NoAnimations           *bool              `json:"noAnimations"`
+	CaptureAllowActivation *bool              `json:"captureAllowActivation"`
+	Humanize               *bool              `json:"humanize"`
+	StealthLevel           string             `json:"stealthLevel"`
+	TabEvictionPolicy      string             `json:"tabEvictionPolicy"`
+	TabPolicy              *TabPolicyDefaults `json:"tabPolicy,omitempty"`
+	DialogAutoAccept       *bool              `json:"dialogAutoAccept,omitempty"`
 }
 
 type profilesConfigJSON struct {
 	BaseDir        string `json:"baseDir"`
 	DefaultProfile string `json:"defaultProfile"`
+	QuarantineKeep *int   `json:"quarantineKeep,omitempty"`
 }
 
 type securityConfigJSON struct {
@@ -64,14 +88,16 @@ type securityConfigJSON struct {
 	AllowDownload          *bool                   `json:"allowDownload"`
 	AllowCookies           *bool                   `json:"allowCookies"`
 	AllowNetworkIntercept  *bool                   `json:"allowNetworkIntercept"`
+	AllowMemory            *bool                   `json:"allowMemory"`
+	AllowFileScheme        *bool                   `json:"allowFileScheme"`
 	AllowedDomains         []string                `json:"allowedDomains"`
 	DownloadAllowedDomains []string                `json:"downloadAllowedDomains"`
 	DownloadMaxBytes       *int                    `json:"downloadMaxBytes"`
+	MemorySnapshotMaxBytes *int                    `json:"memorySnapshotMaxBytes"`
 	AllowUpload            *bool                   `json:"allowUpload"`
 	AllowClipboard         *bool                   `json:"allowClipboard"`
 	AllowStateExport       *bool                   `json:"allowStateExport"`
 	StateEncryptionKey     *string                 `json:"stateEncryptionKey"`
-	EnableActionGuards     *bool                   `json:"enableActionGuards"`
 	UploadMaxRequestBytes  *int                    `json:"uploadMaxRequestBytes"`
 	UploadMaxFiles         *int                    `json:"uploadMaxFiles"`
 	UploadMaxFileBytes     *int                    `json:"uploadMaxFileBytes"`
@@ -86,9 +112,10 @@ type securityConfigJSON struct {
 }
 
 type attachJSON struct {
-	Enabled      *bool    `json:"enabled"`
-	AllowHosts   []string `json:"allowHosts"`
-	AllowSchemes []string `json:"allowSchemes"`
+	Enabled          *bool    `json:"enabled"`
+	AllowHosts       []string `json:"allowHosts"`
+	AllowSchemes     []string `json:"allowSchemes"`
+	ForwardProxyAuth *bool    `json:"forwardProxyAuth"`
 }
 
 type idpiConfigJSON struct {
@@ -132,6 +159,7 @@ type schedulerFileConfigJSON struct {
 	MaxPerAgentFlight *int   `json:"maxPerAgentInflight"`
 	ResultTTLSec      *int   `json:"resultTTLSec"`
 	WorkerCount       *int   `json:"workerCount"`
+	MaxBatchSize      *int   `json:"maxBatchSize"`
 }
 
 type observabilityFileConfigJSON struct {
@@ -158,6 +186,19 @@ type activityEventsConfigJSON struct {
 
 type sessionsFileConfigJSON struct {
 	Dashboard dashboardSessionConfigJSON `json:"dashboard"`
+	Agent     agentSessionConfigJSON     `json:"agent,omitempty"`
+}
+
+// agentSessionConfigJSON mirrors AgentSessionFileConfig. Its absence is why
+// `config patch {"sessions":{"agent":{"enabled":true}}}` answered success and wrote
+// nothing: the update path patches the existing file object with the marshalled map, so
+// a key in neither could not appear. TestTheWireTwinCarriesEveryDeclaredField is what
+// keeps this hand-maintained twin from falling behind again.
+type agentSessionConfigJSON struct {
+	Enabled        *bool  `json:"enabled,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	IdleTimeoutSec *int   `json:"idleTimeoutSec,omitempty"`
+	MaxLifetimeSec *int   `json:"maxLifetimeSec,omitempty"`
 }
 
 type dashboardSessionConfigJSON struct {

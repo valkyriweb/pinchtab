@@ -2,12 +2,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 
-	"github.com/chromedp/chromedp"
-	"github.com/pinchtab/pinchtab/internal/httpx"
+	"github.com/pinchtab/pinchtab/internal/bridge"
 )
 
 type boundingBox struct {
@@ -26,140 +24,56 @@ type boxResponse struct {
 	Box boundingBox `json:"box"`
 }
 
-// HandleGetBox returns the bounding box of an element identified by ref.
+// HandleGetBox returns the bounding box of an element identified by a unified
+// selector (ref/css/xpath/text/semantic).
 //
 // @Endpoint GET /box
 func (h *Handlers) HandleGetBox(w http.ResponseWriter, r *http.Request) {
-	tabID := r.URL.Query().Get("tabId")
-	h.recordReadRequest(r, "inspect.box", tabID)
-
-	ref := r.URL.Query().Get("ref")
-	if ref == "" {
-		httpx.Error(w, 400, fmt.Errorf("ref query parameter is required"))
-		return
-	}
-
-	if err := h.ensureChrome(); err != nil {
-		if h.writeBridgeUnavailable(w, err) {
-			return
+	h.serveElementInspection(w, r, "inspect.box", func(ctx context.Context, tabID, sel string) (any, error) {
+		box, err := h.getElementBox(ctx, tabID, sel)
+		if err != nil {
+			return nil, err
 		}
-		httpx.Error(w, 500, fmt.Errorf("chrome initialization: %w", err))
-		return
-	}
-
-	ctx, resolvedTabID, err := h.tabContextWithHeader(w, r, tabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
-		return
-	}
-	defer h.armAutoCloseIfEnabled(resolvedTabID)
-
-	tCtx, tCancel := context.WithTimeout(ctx, h.Config.ActionTimeout)
-	defer tCancel()
-	go httpx.CancelOnClientDone(r.Context(), tCancel)
-
-	box, err := h.getElementBox(tCtx, resolvedTabID, ref)
-	if err != nil {
-		httpx.Error(w, 500, err)
-		return
-	}
-
-	httpx.JSON(w, 200, boxResponse{Ref: ref, Box: *box})
+		return boxResponse{Ref: sel, Box: *box}, nil
+	})
 }
 
 // HandleTabGetBox returns the bounding box for a tab identified by path ID.
 //
 // @Endpoint GET /tabs/{id}/box
 func (h *Handlers) HandleTabGetBox(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
-		return
-	}
-
-	q := r.URL.Query()
-	q.Set("tabId", tabID)
-
-	req := r.Clone(r.Context())
-	u := *r.URL
-	u.RawQuery = q.Encode()
-	req.URL = &u
-
-	h.HandleGetBox(w, req)
+	h.withPathTabID(w, r, h.HandleGetBox)
 }
 
-// getElementBox resolves a ref to a DOM node and returns its bounding client rect.
-func (h *Handlers) getElementBox(ctx context.Context, tabID, ref string) (*boundingBox, error) {
-	cache := h.Bridge.GetRefCache(tabID)
-	if cache == nil {
-		return nil, fmt.Errorf("ref not found: %s (no snapshot cache — run /snapshot first)", ref)
-	}
-	target, ok := cache.Lookup(ref)
-	if !ok {
-		return nil, fmt.Errorf("ref not found: %s", ref)
-	}
-
-	nodeID := target.BackendNodeID
-	if nodeID == 0 {
-		return nil, fmt.Errorf("element not found in DOM (backendNodeId=%d)", nodeID)
-	}
-
-	var result boundingBox
-	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		// Step 1: Resolve backend node ID to a remote object
-		var resolveResult json.RawMessage
-		if err := chromedp.FromContext(ctx).Target.Execute(ctx, "DOM.resolveNode", map[string]any{
-			"backendNodeId": nodeID,
-		}, &resolveResult); err != nil {
-			return fmt.Errorf("resolve node: %w", err)
-		}
-
-		var resolved struct {
-			Object struct {
-				ObjectID string `json:"objectId"`
-			} `json:"object"`
-		}
-		if err := json.Unmarshal(resolveResult, &resolved); err != nil {
-			return fmt.Errorf("parse resolved node: %w", err)
-		}
-		if resolved.Object.ObjectID == "" {
-			return fmt.Errorf("element not found in DOM (backendNodeId=%d)", nodeID)
-		}
-
-		// Step 2: Call getBoundingClientRect() and extract into a plain object
-		var callResult json.RawMessage
-		if err := chromedp.FromContext(ctx).Target.Execute(ctx, "Runtime.callFunctionOn", map[string]any{
-			"functionDeclaration": `function() { var r = this.getBoundingClientRect(); return {x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left}; }`,
-			"objectId":            resolved.Object.ObjectID,
-			"returnByValue":       true,
-		}, &callResult); err != nil {
-			return fmt.Errorf("get bounding box: %w", err)
-		}
-
-		var callParsed struct {
-			Result struct {
-				Type  string      `json:"type"`
-				Value boundingBox `json:"value"`
-			} `json:"result"`
-			ExceptionDetails *struct {
-				Text string `json:"text"`
-			} `json:"exceptionDetails,omitempty"`
-		}
-		if err := json.Unmarshal(callResult, &callParsed); err != nil {
-			return fmt.Errorf("parse box result: %w", err)
-		}
-		if callParsed.ExceptionDetails != nil && callParsed.ExceptionDetails.Text != "" {
-			return fmt.Errorf("get bounding box: %s", callParsed.ExceptionDetails.Text)
-		}
-
-		result = callParsed.Result.Value
-		return nil
-	}))
+// getElementBox resolves a unified selector to a DOM node and returns its
+// border box in top-level viewport coordinates.
+//
+// It measures through the same DOM.getBoxModel path the capture path uses, which
+// reports every node in the top-level frame's coordinate space regardless of
+// which frame the node lives in (measured: identical to a top-level
+// getBoundingClientRect, scrolled or not). Evaluating getBoundingClientRect in
+// the element's own context — the obvious alternative — is relative to the
+// document the element lives in, so an element inside an iframe came back
+// frame-relative and its rectangle landed outside the iframe containing it.
+func (h *Handlers) getElementBox(ctx context.Context, tabID, sel string) (*boundingBox, error) {
+	nodeID, err := h.resolveElementNodeID(ctx, tabID, sel)
 	if err != nil {
 		return nil, err
 	}
-	return &result, nil
+
+	box, ok := bridge.ElementBorderBox(ctx, nodeID)
+	if !ok {
+		return nil, fmt.Errorf("element has no box model: %s", sel)
+	}
+
+	return &boundingBox{
+		X:      box.X,
+		Y:      box.Y,
+		Width:  box.W,
+		Height: box.H,
+		Top:    box.Y,
+		Right:  box.X + box.W,
+		Bottom: box.Y + box.H,
+		Left:   box.X,
+	}, nil
 }

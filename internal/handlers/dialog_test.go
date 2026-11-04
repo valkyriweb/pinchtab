@@ -57,7 +57,6 @@ func TestHandleDialog_NoPendingDialog(t *testing.T) {
 	req := httptest.NewRequest("POST", "/dialog", bytes.NewReader([]byte(`{"action":"accept"}`)))
 	w := httptest.NewRecorder()
 	h.HandleDialog(w, req)
-	// Should return 400 because no dialog is pending
 	if w.Code != 400 {
 		t.Errorf("expected 400 for no pending dialog, got %d: %s", w.Code, w.Body.String())
 	}
@@ -68,7 +67,6 @@ func TestHandleDialog_AcceptAction(t *testing.T) {
 	req := httptest.NewRequest("POST", "/dialog", bytes.NewReader([]byte(`{"action":"accept"}`)))
 	w := httptest.NewRecorder()
 	h.HandleDialog(w, req)
-	// With no pending dialog, should get 400
 	if w.Code != 400 {
 		t.Errorf("expected 400, got %d", w.Code)
 	}
@@ -128,7 +126,6 @@ func TestHandleDialog_AcceptWithText(t *testing.T) {
 	req := httptest.NewRequest("POST", "/dialog", bytes.NewReader([]byte(`{"action":"accept","text":"hello"}`)))
 	w := httptest.NewRecorder()
 	h.HandleDialog(w, req)
-	// No pending dialog, so 400
 	if w.Code != 400 {
 		t.Errorf("expected 400, got %d", w.Code)
 	}
@@ -141,7 +138,6 @@ func TestDialogManagerFromMockBridge(t *testing.T) {
 		t.Fatal("expected non-nil DialogManager from mockBridge")
 	}
 
-	// Verify it works
 	dm.SetPending("tab1", &bridge.DialogState{Type: "alert", Message: "test"})
 	got := dm.GetPending("tab1")
 	if got == nil || got.Type != "alert" {
@@ -149,14 +145,13 @@ func TestDialogManagerFromMockBridge(t *testing.T) {
 	}
 }
 
-func TestIsClickTimeoutWithPendingDialog(t *testing.T) {
+func TestIsTimeoutWithPendingDialog(t *testing.T) {
 	mb := &mockBridge{}
 	dm := mb.GetDialogManager()
 
 	tests := []struct {
 		name     string
 		err      error
-		kind     string
 		tabID    string
 		pending  *bridge.DialogState
 		expected bool
@@ -164,52 +159,31 @@ func TestIsClickTimeoutWithPendingDialog(t *testing.T) {
 		{
 			name:     "nil error",
 			err:      nil,
-			kind:     "click",
 			tabID:    "tab1",
 			expected: false,
 		},
 		{
 			name:     "non-timeout error",
 			err:      fmt.Errorf("some other error"),
-			kind:     "click",
 			tabID:    "tab1",
 			expected: false,
 		},
 		{
 			name:     "timeout but no pending dialog",
 			err:      context.DeadlineExceeded,
-			kind:     "click",
 			tabID:    "tab1",
 			expected: false,
 		},
 		{
-			name:     "timeout with pending dialog on click",
+			name:     "timeout with pending dialog",
 			err:      context.DeadlineExceeded,
-			kind:     "click",
 			tabID:    "tab1",
 			pending:  &bridge.DialogState{Type: "alert", Message: "Hello"},
 			expected: true,
-		},
-		{
-			name:     "timeout with pending dialog on doubleclick",
-			err:      context.DeadlineExceeded,
-			kind:     "dblclick",
-			tabID:    "tab1",
-			pending:  &bridge.DialogState{Type: "confirm", Message: "Are you sure?"},
-			expected: true,
-		},
-		{
-			name:     "timeout with pending dialog on type action",
-			err:      context.DeadlineExceeded,
-			kind:     "type",
-			tabID:    "tab1",
-			pending:  &bridge.DialogState{Type: "alert", Message: "Hello"},
-			expected: false,
 		},
 		{
 			name:     "timeout with empty tab ID",
 			err:      context.DeadlineExceeded,
-			kind:     "click",
 			tabID:    "",
 			pending:  &bridge.DialogState{Type: "alert", Message: "Hello"},
 			expected: false,
@@ -223,9 +197,9 @@ func TestIsClickTimeoutWithPendingDialog(t *testing.T) {
 				dm.SetPending(tc.tabID, tc.pending)
 			}
 
-			got := isClickTimeoutWithPendingDialog(tc.err, tc.kind, tc.tabID, mb)
+			got := isTimeoutWithPendingDialog(tc.err, tc.tabID, mb)
 			if got != tc.expected {
-				t.Errorf("isClickTimeoutWithPendingDialog() = %v, want %v", got, tc.expected)
+				t.Errorf("isTimeoutWithPendingDialog() = %v, want %v", got, tc.expected)
 			}
 		})
 	}

@@ -1,8 +1,8 @@
-# AutoSolver Architecture
+# AutoSolver
 
 ## Overview
 
-The AutoSolver system provides modular, semantic-first browser automation for PinchTab. It evolves the existing `internal/solver` framework (PR #395) into a general-purpose automation agent capable of handling CAPTCHAs, login flows, signup flows, multi-step navigation, and onboarding sequences.
+The AutoSolver system provides modular, semantic-first browser automation for PinchTab. It grew out of an earlier single-purpose challenge-solver framework into a general-purpose automation agent capable of handling CAPTCHAs, login flows, signup flows, multi-step navigation, and onboarding sequences.
 
 ### Design Principles
 
@@ -58,26 +58,27 @@ internal/autosolver/
 ├── autosolver.go          # Core orchestrator with fallback chain
 ├── challenge_detection.go # Shared challenge classification (title/URL/HTML)
 ├── heuristics.go          # Title-based intent detection fallback
+├── keygated.go            # Solvers that register only once their API key is set
 ├── registry.go            # Instance-level solver registry with priority ordering
-├── autosolver_test.go     # Core loop tests
-├── challenge_detection_test.go
-├── registry_test.go
 ├── adapters/
 │   └── pinchtab.go        # Bridge adapter (ONLY chromedp import)
+├── catalog/
+│   └── catalog.go         # Single owner of the names autoSolver.solvers accepts
 ├── semantic/
 │   └── adapter.go         # Wraps pinchtab/semantic ElementMatcher
 ├── external/
+│   ├── external.go        # Shared external-solver wrapper
 │   ├── capsolver.go       # Capsolver API skeleton
 │   └── twocaptcha.go      # 2Captcha API skeleton
 ├── llm/
-│   ├── llm.go             # LLM provider skeleton with structured prompts
-│   └── trim.go            # HTML trimming for token efficiency
+│   └── llm.go             # LLM provider skeleton with structured prompts
 └── solvers/
-    ├── cloudflare.go      # Cloudflare Turnstile (new interface, no chromedp)
-    ├── jschallenge.go     # Generic JavaScript challenge/interstitial solver
-    ├── jschallenge_test.go
-    └── legacy.go          # Compatibility shim for existing solver.Solver
+    ├── cloudflare.go      # Cloudflare Turnstile solver
+    └── jschallenge.go     # Generic JavaScript challenge/interstitial solver
 ```
+
+Tests sit next to each file (`*_test.go`). HTML trimming for the LLM prompt
+lives in the shared `internal/htmltrim` package.
 
 ## Core Interfaces
 
@@ -90,6 +91,7 @@ type Page interface {
     URL() string
     Title() string
     HTML() (string, error)
+    HTMLWithin(timeout time.Duration) (string, error)
     Screenshot() ([]byte, error)
 }
 ```
@@ -131,17 +133,18 @@ type Solver interface {
 
 ## Fallback Chain
 
-The core loop executes this chain per attempt:
+Intent is detected once, before the first attempt; the core loop then executes
+the rest of this chain per attempt:
 
 ```
-1. Detect intent (semantic engine → title heuristics)
+1. Detect intent (semantic engine, or title heuristics when none is configured)
 2. If intent = normal → return solved
 3. Try semantic-first action planning (`/find` + self-healing)
 4. If still unresolved, find matching solvers (CanHandle = true)
 5. Execute solvers in configured order (`autoSolver.solvers`), falling back to
     priority order when configuration does not match available solvers
 6. If all fail AND LLM enabled:
-   a. Trim HTML to ~4KB
+   a. Trim HTML to ~4KB (`htmltrim.TrimHTML`, 4000-byte cap)
    b. Build structured prompt with attempt history
    c. Execute LLM-suggested action
 7. Retry with exponential backoff (500ms → 10s cap)
@@ -163,7 +166,7 @@ The core loop executes this chain per attempt:
     "solverTimeoutSec": 30,
     "retryBaseDelayMs": 500,
     "retryMaxDelayMs": 10000,
-    "solvers": ["cloudflare", "semantic", "capsolver", "twocaptcha"],
+    "solvers": ["cloudflare", "semantic"],
     "llmProvider": "openai",
     "llmFallback": false,
     "external": {
@@ -240,4 +243,4 @@ if result.Solved {
 
 ## Backward Compatibility
 
-The existing `internal/solver` package (PR #395) is still present for compatibility, but challenge APIs are now backed by `internal/autosolver`. The `CloudflareSolver` in `bridge/cloudflare.go` remains available, and a `LegacyAdapter` shim (`solvers/legacy.go`) can wrap legacy `solver.Solver` implementations into the new `autosolver.Solver` interface.
+`internal/autosolver` is the only solver framework. The predecessor package, its duplicate Cloudflare solver in `bridge/cloudflare.go` and the `LegacyAdapter` shim that was to bridge them are all deleted: nothing ever wired the adapter up, so the second registry had no readers while every solver-wide refactor still had to edit its copy of each solver.

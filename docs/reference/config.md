@@ -8,22 +8,23 @@ For security posture, token usage, sensitive endpoint policy, and IDPI guidance,
 
 ### `pinchtab config`
 
-Opens the interactive config overview/editor.
+Prints a read-only config overview. It is not an editor; change values with
+`config set`, `config patch`, or by editing the file.
 
-It currently exposes these high-signal settings directly:
+It shows these high-signal effective settings:
 
 - `multiInstance.strategy`
 - `multiInstance.allocationPolicy`
 - `instanceDefaults.stealthLevel`
 - `instanceDefaults.tabEvictionPolicy`
-- `instanceDefaults.tabPolicy.lifecycle`
+- `instanceDefaults.tabPolicy.lifecycle` (with the close delay when an idle lifecycle is on)
 
 It also shows:
 
 - the active config file path
-- the dashboard URL when the server is running
 - the masked server token
-- a `Copy token` action
+- the dashboard URL when the server is running, otherwise `not running`
+- hints for `config get`, `config set`, `config show`, `config token` and `pinchtab security`
 
 ```bash
 pinchtab config
@@ -40,13 +41,16 @@ pinchtab config init
 `config init` respects `PINCHTAB_CONFIG`. If that environment variable is set, the file is created there.
 
 Generated config files include a `$schema` URL for IDE completion and validation.
+The new file gets a generated `server.token`, reported on stderr. If a file already
+exists at that path, `config init` asks before overwriting it.
 
 ### `pinchtab config schema`
 
 Prints the JSON Schema URL for this PinchTab build. Source builds, development
 builds, and versions without a published schema use the `main` schema URL.
-When a matching release schema is known, PinchTab uses that release tag; when a
-newer matching schema is known, PinchTab uses the closest newer tag.
+For a release build PinchTab uses the closest published schema tag at or below its
+own version, so a generated config never points at rules from a newer release; with
+no such tag it uses `main`.
 
 ```bash
 pinchtab config schema
@@ -67,18 +71,24 @@ pinchtab config show
 ```
 
 Secret values such as `server.token` remain masked in this output.
+The Security section also includes `security.trustLoopbackProxy` as `Trust Loopback Proxy` so proxy trust posture is explicit.
 
 ### `pinchtab config token`
 
-Copies the configured `server.token` to the system clipboard without printing it
-to stdout.
+Copies the configured `server.token` to the system clipboard. Nothing is written
+to stdout, so a shell capture returns empty rather than a message.
 
 ```bash
-pinchtab config token
+pinchtab config token             # copy to clipboard; status goes to stderr
+TOKEN=$(pinchtab config token --stdout)   # print the token and nothing else
 ```
 
-If clipboard access is unavailable, the command reports that safely and still
-does not print the token.
+`--stdout` is the supported way to read the token on a host with no clipboard
+tool. Without it the token is never printed.
+
+If clipboard access is unavailable the command exits non-zero and names both
+`--stdout` and the config file path on stderr, so a script sees the failure
+instead of a success that copied nothing.
 
 ### `pinchtab config path`
 
@@ -98,12 +108,18 @@ pinchtab config validate
 
 ### `pinchtab config get`
 
-Reads a single dotted-path value from the file config.
+Reads a single dotted-path value and reports the **value in effect**: what the file
+sets, and otherwise the value the runtime resolves — a shipped default, or a value
+derived from another key. `profiles.baseDir` is the clearest case: leave it out of the
+file and `config get` reports `<server.stateDir>/profiles`, the directory profiles are
+actually kept in, rather than nothing. A key that is genuinely unset — a secret nobody
+configured, an optional override such as `browser.binary` — still answers blank.
 
 ```bash
 pinchtab config get server.port
 pinchtab config get instanceDefaults.mode
 pinchtab config get security.attach.allowHosts
+pinchtab config get profiles.baseDir      # derived from server.stateDir when unset
 ```
 
 ### `pinchtab config set`
@@ -138,6 +154,12 @@ Supported environment variables:
 
 - `PINCHTAB_CONFIG`: choose the config file path
 - `PINCHTAB_TOKEN`: override the API token at runtime
+- `PINCHTAB_RATE_LIMIT_MAX`: per-client request cap per 10-second window
+  (default 3000, sized for agent-driven snapshot/action bursts). Lower it
+  (e.g. to 300) when exposing the port beyond localhost. Child instances
+  inherit it from the orchestrator's environment.
+- `PINCHTAB_STATE_KEY`: state-file encryption key; when set it wins over
+  `security.stateEncryptionKey`
 
 For remote CLI targeting, use the root `--server` flag instead of config.
 
@@ -172,7 +194,7 @@ Current nested file-config shape:
     "bind": "127.0.0.1",
     "token": "your-secret-token",
     "stateDir": "/path/to/state",
-    "engine": "chrome",
+    "logLevel": "info",
     "networkBufferSize": 100,
     "retainNetworkBodies": false,
     "retainNetworkBodyMaxBytes": 262144,
@@ -182,8 +204,22 @@ Current nested file-config shape:
   "browser": {
     "version": "144.0.7559.133",
     "binary": "/path/to/chrome",
+    "remoteDebuggingPort": null,
     "extraFlags": "--disable-gpu",
+    "cloak": {
+      "fingerprintSeed": "42069",
+      "platform": "windows",
+      "locale": "en-GB",
+      "timezone": "Europe/London",
+      "webrtcIP": "auto",
+      "fontsDir": "/path/to/fonts",
+      "storageQuotaMB": 2048,
+      "disableDefaultStealthArgs": true
+    },
     "extensionPaths": ["/path/to/pinchtab/extensions"]
+  },
+  "browsers": {
+    "default": "chrome"
   },
   "instanceDefaults": {
     "mode": "headless",
@@ -196,6 +232,7 @@ Current nested file-config shape:
     "maxParallelTabs": 0,
     "userAgent": "",
     "noAnimations": false,
+    "captureAllowActivation": true,
     "humanize": false,
     "stealthLevel": "light",
     "tabEvictionPolicy": "close_lru",
@@ -212,11 +249,17 @@ Current nested file-config shape:
     "allowScreencast": false,
     "allowDownload": false,
     "allowCookies": false,
+    "allowNetworkIntercept": false,
+    "allowMemory": false,
+    "allowFileScheme": false,
     "allowedDomains": ["127.0.0.1", "localhost", "::1"],
     "downloadAllowedDomains": [],
     "downloadMaxBytes": 20971520,
+    "memorySnapshotMaxBytes": 536870912,
     "allowUpload": false,
     "allowClipboard": false,
+    "allowStateExport": false,
+    "stateEncryptionKey": null,
     "uploadMaxRequestBytes": 10485760,
     "uploadMaxFiles": 8,
     "uploadMaxFileBytes": 5242880,
@@ -224,10 +267,12 @@ Current nested file-config shape:
     "maxRedirects": -1,
     "trustedProxyCIDRs": [],
     "trustedResolveCIDRs": [],
+    "trustLoopbackProxy": false,
     "attach": {
       "enabled": false,
       "allowHosts": ["127.0.0.1", "localhost", "::1"],
-      "allowSchemes": ["ws", "wss"]
+      "allowSchemes": ["ws", "wss", "http", "https"],
+      "forwardProxyAuth": false
     },
     "idpi": {
       "enabled": true,
@@ -241,7 +286,8 @@ Current nested file-config shape:
   },
   "profiles": {
     "baseDir": "/path/to/profiles",
-    "defaultProfile": "default"
+    "defaultProfile": "default",
+    "quarantineKeep": 1
   },
   "multiInstance": {
     "strategy": "always-on",
@@ -270,7 +316,7 @@ Current nested file-config shape:
     "solverTimeoutSec": 30,
     "retryBaseDelayMs": 500,
     "retryMaxDelayMs": 10000,
-    "solvers": ["cloudflare", "semantic", "capsolver", "twocaptcha"],
+    "solvers": ["cloudflare", "semantic"],
     "llmProvider": "",
     "llmFallback": false,
     "external": {
@@ -286,13 +332,14 @@ Current nested file-config shape:
     "maxInflight": 20,
     "maxPerAgentInflight": 10,
     "resultTTLSec": 300,
-    "workerCount": 4
+    "workerCount": 4,
+    "maxBatchSize": 50
   },
   "observability": {
     "activity": {
       "enabled": true,
       "sessionIdleSec": 1800,
-      "retentionDays": 1,
+      "retentionDays": 30,
       "events": {
         "dashboard": false,
         "server": false,
@@ -303,9 +350,30 @@ Current nested file-config shape:
         "other": false
       }
     }
+  },
+  "sessions": {
+    "dashboard": {
+      "persist": true,
+      "idleTimeoutSec": 604800,
+      "maxLifetimeSec": 604800,
+      "elevationWindowSec": 900,
+      "persistElevationAcrossRestart": false,
+      "requireElevation": false
+    },
+    "agent": {
+      "enabled": true,
+      "mode": "preferred",
+      "idleTimeoutSec": 1800,
+      "maxLifetimeSec": 86400
+    }
   }
 }
 ```
+
+`sessions.agent.*` is described in [Agent Identity](../guides/agent-identity.md);
+`sessions.agent.mode` accepts `off` or `preferred`. `browser.proxy`,
+`browser.targets`, `browser.defaultTarget` and `browser.fallbackOrder` are covered
+under Browser Selection below.
 
 `autoSolver.external` is config-file-only. Capsolver and 2Captcha credentials
 are stored there.
@@ -340,6 +408,97 @@ Notes:
 The dashboard Settings page exposes the non-secret AutoSolver settings and
 shows the active config file path. Provider keys remain managed directly in the
 config file.
+
+### Browser Selection
+
+The CLI uses `--browser <name>` to select a browser. In the config file the
+equivalent field is `browsers.default`:
+
+```json
+{
+  "browsers": { "default": "cloak" }
+}
+```
+
+`browsers.default` explicitly selects the local browser backend:
+
+- `chrome` uses the normal Chrome/Chromium launch path.
+- `ghost-chrome` serves static-friendly reads from a lightweight fetcher and
+  escalates to Chrome when a page needs rendering.
+- `cloak` uses a discovered or configured local CloakBrowser Chromium binary.
+
+When `browsers.default` is omitted, PinchTab prefers a discovered local
+CloakBrowser installation and otherwise falls back to Chrome. Newly generated
+config files make the same choice, while existing configs that explicitly set
+`browsers.default` to `chrome` continue to use Chrome.
+
+`browsers.available` optionally restricts which browsers requests may select.
+For multiple named configurations of the same provider (different binaries,
+proxies, or fingerprints), use `browser.targets` with `browser.defaultTarget`
+and `browser.fallbackOrder` — see [Terminology](../architecture/terminology.md).
+The legacy `browser.provider` field is no longer supported and is rejected at
+validation time.
+
+When the selected browser is `cloak`, PinchTab uses `browser.binary` when set
+or searches its normal local CloakBrowser paths. A named CloakBrowser target
+must set that target's `binary` explicitly. PinchTab does not download, bundle,
+or redistribute the CloakBrowser binary.
+
+On **macOS**, prefer a dedicated automation browser over your daily Google
+Chrome. Launching `/Applications/Google Chrome.app` headless makes macOS treat
+Chrome as already running, so opening your normal Chrome from the Dock just
+activates the windowless automation process and no window appears (issue #583).
+PinchTab's discovery now prefers Google Chrome for Testing, Chromium, then Chrome
+Canary, and only falls back to your primary Chrome as a last resort. If only your
+daily Chrome is installed, install [Google Chrome for
+Testing](https://developer.chrome.com/blog/chrome-for-testing) or set
+`browser.binary` to a separate Chrome/Chromium build. `pinchtab doctor browsers`
+warns when automation would use your primary Chrome.
+
+`browser.cloak` maps supported CloakBrowser fingerprint settings to native launch
+flags:
+
+- `fingerprintSeed` -> `--fingerprint`
+- `platform` -> `--fingerprint-platform`
+- `locale` -> `--fingerprint-locale`
+- `timezone` -> `--fingerprint-timezone`
+- `webrtcIP` -> `--fingerprint-webrtc-ip`
+- `fontsDir` -> `--fingerprint-fonts-dir`
+- `storageQuotaMB` -> `--fingerprint-storage-quota`
+
+`disableDefaultStealthArgs` defaults to true for CloakBrowser targets. When set,
+PinchTab keeps its process, profile, tab, extension, and action-control behavior,
+but does not add its own JS stealth overlays or automation-hiding launch flags.
+Set it to false only when you intentionally want PinchTab's legacy stealth layer
+on top of CloakBrowser's native patches.
+
+Advanced CloakBrowser flags can still go through `browser.extraFlags` when they
+are not PinchTab-owned lifecycle flags.
+
+`browser.proxy.server` is the prerequisite for the rest of the block:
+`browser.proxy.username`, `password`, `bypassList` and every `browser.proxy.geo.*`
+key do nothing without it, because there is no proxy to route through,
+authenticate to, or align geo with. The values are still kept — `config set`
+writes them, `config get` returns them, and setting the server afterwards makes
+them take effect — and PinchTab reports the incomplete block on each config read
+or write until a server is set. Clearing `browser.proxy.server` turns the proxy
+off and leaves the other values on disk for the next server.
+
+`browser.proxy.username` and `password` are the exception, and it is not about
+the server: each requires the other, so `config set` aborts on either one alone
+whichever order you try. Send the pair in one write instead:
+
+```bash
+pinchtab config patch '{"browser":{"proxy":{"username":"bob","password":"s3cret"}}}'
+```
+
+`browser.proxy.geo` is a CloakBrowser fingerprint-alignment hint. When a proxy
+server and geo block are configured for a CloakBrowser target, PinchTab maps the
+geo values into native CloakBrowser fingerprint flags unless the target already
+sets the corresponding `browser.cloak` field. The stock `chrome` browser does
+not derive `--lang`, `TZ`, or WebRTC launch settings from proxy geo data.
+
+### Browser Extra Flags
 
 `browser.extraFlags` is validated and sanitized. It is only for user-safe Chrome flags that do not weaken browser security and do not override PinchTab-owned launch behavior.
 
@@ -388,8 +547,8 @@ You can change or clear that default with `browser.extensionPaths`.
 ```
 
 - `eviction` controls what happens when `maxTabs` is reached: `close_lru`, `close_oldest`, or `reject`.
-- `lifecycle` controls idle lifecycle behavior: `keep` disables lifecycle auto-close and is the default; `close_idle` auto-closes a tab after it handles an authorized `/text`, `/snapshot`, or `/action` request.
-- `closeDelaySec` is the idle delay for `close_idle`. The default is `300` seconds when auto-close is enabled.
+- `lifecycle` controls idle lifecycle behavior: `keep` disables lifecycle auto-close and is the default; `close_idle` auto-closes a tab after it handles an authorized `/text`, `/snapshot`, or `/action` request; `freeze_idle` instead freezes a tab no request has touched for the idle delay (timers and JavaScript stop, the page and session stay); every request restarts that clock and unfreezes the tab first. If the renderer does not accept the unfreeze, the request answers `503` with code `tab_unfreeze_failed` and `retryable: true`; the tab and a session's current-tab pointer are kept, and the next request retries. A tab is never frozen while a request on it is running (including a screencast stream), while it is paused for handoff, or while it holds network interception rules.
+- `closeDelaySec` is the idle delay for `close_idle` and `freeze_idle`. The default is `300` seconds when either is enabled.
 - `restore` controls whether session tabs are restored on startup. The default is `false`.
 
 `instanceDefaults.tabEvictionPolicy` is still accepted for compatibility. New configs should use `instanceDefaults.tabPolicy.eviction`.
@@ -409,8 +568,9 @@ Rationale: humanized input is useful for compatibility with pages that react poo
 
 | Section | Purpose |
 | --- | --- |
-| `server` | HTTP server settings, engine selection, proxy trust, and network buffer defaults |
-| `browser` | Chrome executable, version pin, extra flags, and extension paths |
+| `server` | HTTP server settings, log level, proxy trust, cookie transport, and network buffer defaults |
+| `browser` | Chrome executable, version pin, extra flags, extension paths, CloakBrowser flags, proxy, and named targets |
+| `browsers` | Default browser selection and the optional `available` allowlist |
 | `instanceDefaults` | Default behavior for managed instances |
 | `security` | Sensitive feature gates, transfer limits, attach policy, and IDPI |
 | `profiles` | Profile storage defaults |
@@ -418,34 +578,36 @@ Rationale: humanized input is useful for compatibility with pages that react poo
 | `timeouts` | Action, navigation, shutdown, and navigation wait delays |
 | `scheduler` | Optional task queue |
 | `observability` | Activity logging, source selection, and retention |
+| `sessions` | Dashboard session cookies and agent sessions |
+| `autoSolver` | Challenge auto-solver behavior, provider keys, and credentials |
 
 ## `config get` And `config set` Support
 
-`pinchtab config get` and `pinchtab config set` only support these top-level sections:
+`pinchtab config get` and `pinchtab config set` accept a `section.field` dotted path in
+these top-level sections:
 
 - `server`
 - `browser`
+- `browsers`
 - `instanceDefaults`
 - `security`
 - `profiles`
 - `multiInstance`
 - `timeouts`
+- `scheduler`
 - `observability`
+- `sessions`
+- `autoSolver`
 
-They do not expose every field in those sections, and they do not support `scheduler.*`.
+Every leaf in those sections is reachable, with these exceptions:
 
-Use `pinchtab config patch` or edit `config.json` directly for fields such as:
+- `server.engine` and `browser.provider` are removed settings; setting them is refused
+- `instanceDefaults.headless` is superseded by `instanceDefaults.mode`
+- `browsers.config.*` is a retired block, superseded by `browser.targets`
+- `observability.activity.stateDir` can be read but not set (see Activity Retention)
 
-- `server.engine`
-- `server.networkBufferSize`
-- `browser.extensionPaths`
-- `instanceDefaults.dialogAutoAccept`
-- `instanceDefaults.tabPolicy.*`
-- `security.allowClipboard`
-- `security.idpi.scanTimeoutSec`
-- `security.idpi.shieldThreshold`
-- `scheduler.*`
-- `observability.activity.events.*`
+List values such as `security.allowedDomains` or `browser.extensionPaths` are set as a
+comma-separated string. `$schema` and `configVersion` are document metadata, not settings.
 
 ## Common Examples
 
@@ -457,6 +619,42 @@ Use `pinchtab config patch` or edit `config.json` directly for fields such as:
     "mode": "headed"
   }
 }
+```
+
+### Log Level For A Daemon Or Auto-Started Server
+
+`pinchtab server --log-level` only reaches a server you start by hand. A
+daemon-installed server (`pinchtab daemon install`) and the server a bare
+`pinchtab nav` auto-starts both launch `pinchtab server` with no flags, so
+`server.logLevel` is the only way to set their threshold — and it needs no change
+to the unit file.
+
+```bash
+pinchtab config set server.logLevel warn    # Warnings and errors only
+pinchtab config set server.logLevel debug   # Full debug detail while diagnosing
+pinchtab config get server.logLevel
+```
+
+Accepted values are `debug`, `info` (the default), `warn` and `error`; an
+unparseable value fails when the config loads, naming the accepted values.
+`--log-level` still wins over the configured value. `-v` keeps its startup banner
+either way, but it only raises the level when neither `--log-level` nor
+`server.logLevel` is set — so a persisted `warn` survives `pinchtab server -v`, and
+`--log-level debug` is how you override it for one run. `pinchtab bridge` reads the
+same key and accepts the same flag.
+
+### Memory Diagnostics
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `security.allowMemory` | `false` | Enables `POST /memory/snapshot`, `GET /memory/snapshot/{snapshotId}/summary` and `GET /memory/compare` (code `memory_disabled` when off). `GET /memory` needs no capability. |
+| `security.memorySnapshotMaxBytes` | `536870912` (512 MB) | Size cap for one heap snapshot, max 4 GB; a larger snapshot is aborted with `memory_snapshot_too_large` and no file is left behind |
+
+A heap snapshot contains every string on the page, tokens included, which is why
+it sits behind its own capability. See [memory.md](memory.md).
+
+```bash
+pinchtab config set security.allowMemory true
 ```
 
 ### Network Bind With Token
@@ -518,13 +716,39 @@ headers correctly.
     "attach": {
       "enabled": true,
       "allowHosts": ["127.0.0.1", "localhost", "chrome.internal"],
-      "allowSchemes": ["ws", "wss", "http", "https"]
+      "allowSchemes": ["ws", "wss", "http", "https"],
+      "forwardProxyAuth": false
     }
   }
 }
 ```
 
 `security.attach.allowHosts` is an allowlist. If you set it to `["*"]`, PinchTab accepts any reachable attach host with an allowed scheme. That is a documented, non-default, security-reducing override: it removes host allowlisting entirely and should only be used on isolated, operator-controlled networks.
+
+`security.attach.forwardProxyAuth` controls whether PinchTab may send configured proxy authentication credentials over remote CDP attach. It defaults to `false`; enable it only when the attached browser process and CDP transport are trusted.
+
+### Quarantined Profile Retention
+
+When a browser profile turns out to be unusable, PinchTab renames it aside as
+`<profile>.quarantine-<unix>` and starts fresh. PinchTab keeps the most recent
+quarantined copy of each profile and prunes the older ones at the moment a new quarantine
+is created — the newest is the copy most likely to relate to a problem being investigated
+now, and nothing in the product reads the older ones. Every removal is logged with the
+path and the bytes reclaimed.
+
+```json
+{
+  "profiles": {
+    "quarantineKeep": 1
+  }
+}
+```
+
+`profiles.quarantineKeep` defaults to `1`. Set it to `0` to keep every quarantined
+profile, which is exactly the behaviour before this setting existed. Pruning only ever
+runs when a new quarantine is created, never on startup or a timer, so quarantined copies
+of a profile that never fails again are left alone — clearing that backlog is a separate,
+explicit operation.
 
 ### Activity Retention
 
@@ -539,7 +763,18 @@ headers correctly.
 }
 ```
 
-`server.trustProxyHeaders` should stay `false` unless PinchTab is behind a trusted reverse proxy that overwrites `Forwarded` and `X-Forwarded-*` headers. Do not enable it on direct-exposure deployments or behind proxies that pass client-supplied forwarding headers through unchanged.
+Activity logs are always written to `<server.stateDir>/activity`, so two instances cannot
+end up sharing one log directory. `observability.activity.stateDir` is therefore not
+settable: `config set` refuses it, and `config get observability.activity.stateDir` reports
+the derived directory in effect. Move the logs with `server.stateDir`.
+
+A file that already carries the key keeps loading and keeps working. The key is **ignored**,
+and saying so is an *advisory*, not a validation error: PinchTab reports it — at load, and
+on stderr when you run `config set`, `config patch` or `config validate` — and it never
+blocks anything. There is nothing to fix and nothing to remove; the value simply has no
+effect. Validation errors, such as an out-of-range `server.port`, still block a save.
+
+`server.trustProxyHeaders` should stay `false` unless PinchTab is behind a trusted reverse proxy that overwrites `Forwarded` and `X-Forwarded-*` headers. Do not enable it on direct-exposure deployments or behind proxies that pass client-supplied forwarding headers through unchanged. When it is enabled, the client-most forwarded address is also the client identity: rate-limit buckets, the concurrent-stream cap and every audit line are keyed on it rather than on the proxy's address.
 
 ## Legacy Flat Format
 
@@ -577,9 +812,14 @@ Use `pinchtab config init` to create the current nested format.
 - `multiInstance.instancePortStart <= multiInstance.instancePortEnd`
 - `multiInstance.restart.initBackoffSec <= multiInstance.restart.maxBackoffSec`
 - non-negative timeout values
-- non-negative `server.networkBufferSize`
+- `server.networkBufferSize` between 1 and 10000
+- `server.retainNetworkBodyMaxBytes` between 0 and 10 MiB
+- `security.downloadMaxBytes`, `memorySnapshotMaxBytes` and the `upload*` limits between 1 and their caps,
+  with `uploadMaxFileBytes <= uploadMaxTotalBytes`
 - non-negative `security.idpi.scanTimeoutSec`
-- positive `observability.activity.sessionIdleSec` and `retentionDays`
+- non-negative `observability.activity.sessionIdleSec` and positive `retentionDays`
+- valid `sessions.agent.mode` and positive `sessions.dashboard.*Sec` values
+- `server.engine` and `browser.provider` are rejected as removed settings
 
 Valid enum values:
 
@@ -589,13 +829,15 @@ Valid enum values:
 | `instanceDefaults.stealthLevel` | `light`, `medium`, `full` |
 | `instanceDefaults.tabEvictionPolicy` | `reject`, `close_oldest`, `close_lru` |
 | `instanceDefaults.tabPolicy.eviction` | `reject`, `close_oldest`, `close_lru` |
-| `instanceDefaults.tabPolicy.lifecycle` | `keep`, `close_idle` |
+| `instanceDefaults.tabPolicy.lifecycle` | `keep`, `close_idle`, `freeze_idle` |
 | `multiInstance.strategy` | `simple`, `explicit`, `simple-autorestart`, `always-on`, `no-instance` |
 | `multiInstance.allocationPolicy` | `fcfs`, `round_robin`, `random` |
 | `security.attach.allowSchemes` | `ws`, `wss`, `http`, `https` |
+| `security.attach.forwardProxyAuth` | `true`, `false` |
+| `sessions.agent.mode` | `off`, `preferred` |
 
 ## Notes
 
 - `config show` reports effective runtime values, not just raw file contents.
-- `config get`, `set`, and `patch` operate on the file config model, not transient runtime overrides.
+- `config get` reports the value in effect, including shipped defaults and values derived from another key. `config set` and `patch` write the file config model and do not carry transient runtime overrides.
 - the dashboard config API treats `server.token` as write-only; use the CLI or file editing to manage it.

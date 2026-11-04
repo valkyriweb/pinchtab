@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
@@ -17,25 +16,54 @@ import (
 // Each method targets a specific bridge endpoint.
 type BridgeClient struct {
 	client *http.Client
+
+	// authorize stamps the credential a bridge instance requires. A spawned
+	// instance runs the same auth middleware as its parent, so an unauthenticated
+	// call to it is answered 401 — and the one caller of FetchTabs swallows that
+	// at debug level, so the tab→instance discovery it feeds simply found nothing
+	// and said so nowhere. Nil means "no credential", which is what a test stub
+	// and an unauthenticated bridge want.
+	authorize func(*http.Request)
 }
 
-// NewBridgeClient creates a BridgeClient.
+// NewBridgeClient creates a BridgeClient that sends no credential.
 func NewBridgeClient() *BridgeClient {
+	return NewBridgeClientWithAuth(nil)
+}
+
+// NewBridgeClientWithAuth creates a BridgeClient that runs authorize over every
+// request it builds. The orchestrator supplies one that resolves the target
+// instance and applies that instance's own token, since an attached external
+// bridge does not share the server's.
+func NewBridgeClientWithAuth(authorize func(*http.Request)) *BridgeClient {
 	return &BridgeClient{
-		client: &http.Client{Timeout: 60 * time.Second},
+		client:    &http.Client{Timeout: httpx.MaxNavigationHTTPDuration},
+		authorize: authorize,
 	}
+}
+
+// authorized applies the configured credential to a request the client built.
+func (bc *BridgeClient) authorized(req *http.Request) *http.Request {
+	if bc.authorize != nil {
+		bc.authorize(req)
+	}
+	return req
 }
 
 // FetchTabs implements TabFetcher by querying a bridge's /tabs endpoint.
 func (bc *BridgeClient) FetchTabs(instanceURL string) ([]bridge.InstanceTab, error) {
-	resp, err := bc.client.Get(instanceURL + "/tabs")
+	req, err := http.NewRequest(http.MethodGet, instanceURL+"/tabs", nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch tabs request: %w", err)
+	}
+	resp, err := bc.client.Do(bc.authorized(req))
 	if err != nil {
 		return nil, fmt.Errorf("fetch tabs: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch tabs: status %d", resp.StatusCode)
+	if err := statusError(resp, "fetch tabs"); err != nil {
+		return nil, err
 	}
 
 	// Bridge returns {"tabs": [...]}
@@ -58,15 +86,14 @@ func (bc *BridgeClient) CreateTab(ctx context.Context, port, url string) (string
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := bc.client.Do(req)
+	resp, err := bc.client.Do(bc.authorized(req))
 	if err != nil {
 		return "", fmt.Errorf("create tab: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("create tab: status %d: %s", resp.StatusCode, respBody)
+	if err := statusError(resp, "create tab"); err != nil {
+		return "", err
 	}
 
 	var result struct {
@@ -76,7 +103,6 @@ func (bc *BridgeClient) CreateTab(ctx context.Context, port, url string) (string
 		return "", fmt.Errorf("decode create tab response: %w", err)
 	}
 
-	// If URL provided and not about:blank, navigate to it
 	if url != "" && url != "about:blank" {
 		if err := bc.NavigateTab(ctx, port, result.TabID, url); err != nil {
 			return "", fmt.Errorf("navigate after create: %w", err)
@@ -95,15 +121,14 @@ func (bc *BridgeClient) NavigateTab(ctx context.Context, port, tabID, url string
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := bc.client.Do(req)
+	resp, err := bc.client.Do(bc.authorized(req))
 	if err != nil {
 		return fmt.Errorf("navigate: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("navigate: status %d: %s", resp.StatusCode, respBody)
+	if err := statusError(resp, "navigate"); err != nil {
+		return err
 	}
 
 	return nil
@@ -118,14 +143,14 @@ func (bc *BridgeClient) CloseTab(ctx context.Context, port, tabID string) error 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := bc.client.Do(req)
+	resp, err := bc.client.Do(bc.authorized(req))
 	if err != nil {
 		return fmt.Errorf("close tab: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("close tab: status %d", resp.StatusCode)
+	if err := statusError(resp, "close tab"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -138,7 +163,7 @@ func (bc *BridgeClient) SnapshotTab(ctx context.Context, port, tabID string) {
 	if err != nil {
 		return
 	}
-	resp, err := bc.client.Do(req)
+	resp, err := bc.client.Do(bc.authorized(req))
 	if err != nil {
 		return
 	}
@@ -149,7 +174,6 @@ func (bc *BridgeClient) SnapshotTab(ctx context.Context, port, tabID string) {
 // injecting the tabId into the JSON request body so the bridge knows which tab
 // to operate on. Used for endpoints that don't support /tabs/{id}/... paths.
 func (bc *BridgeClient) ProxyWithTabID(w http.ResponseWriter, r *http.Request, port, tabID, path string) {
-	// Read original body and inject tabId.
 	var body map[string]any
 	if r.Body != nil {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -173,6 +197,11 @@ func (bc *BridgeClient) ProxyWithTabID(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
+	// This hop re-encodes the body and so builds a fresh request rather than copying the
+	// caller's, which means it tells the instance nothing unless asked to. The request id
+	// is forwarded explicitly — and only the request id, so re-encoding does not become a
+	// back door around the headers the copying hops deliberately strip.
+	httpx.ForwardRequestID(proxyReq.Header, r.Header)
 
 	resp, err := bc.client.Do(proxyReq)
 	if err != nil {
@@ -181,11 +210,7 @@ func (bc *BridgeClient) ProxyWithTabID(w http.ResponseWriter, r *http.Request, p
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	for key, values := range resp.Header {
-		for _, v := range values {
-			w.Header().Add(key, v)
-		}
-	}
+	httpx.CopyProxiedResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
@@ -206,13 +231,11 @@ func (bc *BridgeClient) ProxyToTab(w http.ResponseWriter, r *http.Request, port,
 	}
 
 	for key, values := range r.Header {
-		switch key {
-		case "Host", "Connection", "Keep-Alive", "Proxy-Authenticate",
-			"Proxy-Authorization", "Te", "Trailers", "Transfer-Encoding", "Upgrade":
-		default:
-			for _, v := range values {
-				proxyReq.Header.Add(key, v)
-			}
+		if httpx.IsHopByHopHeader(key) {
+			continue
+		}
+		for _, v := range values {
+			proxyReq.Header.Add(key, v)
 		}
 	}
 
@@ -223,15 +246,23 @@ func (bc *BridgeClient) ProxyToTab(w http.ResponseWriter, r *http.Request, port,
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	for key, values := range resp.Header {
-		for _, v := range values {
-			w.Header().Add(key, v)
-		}
-	}
+	httpx.CopyProxiedResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
 
 func bridgeURL(port, path string) string {
 	return "http://localhost:" + port + path
+}
+
+// statusError returns a "<label>: status <code>: <body>" error when resp is not
+// 200, or nil otherwise. Centralizes the status-check + error-body read that the
+// typed bridge calls (fetch/create/navigate/close) each repeated. The caller
+// still owns closing resp.Body.
+func statusError(resp *http.Response, label string) error {
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("%s: status %d: %s", label, resp.StatusCode, body)
 }

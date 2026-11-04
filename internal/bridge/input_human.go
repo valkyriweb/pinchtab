@@ -42,12 +42,10 @@ func SetHumanRandSeed(seed int64) {
 	humanRand = rand.New(rand.NewSource(seed))
 }
 
-// Config allows injecting a custom random source for testing
 type Config struct {
 	Rand *rand.Rand
 }
 
-// getRand returns the configured random source or the global default
 func (c *Config) getRand() *rand.Rand {
 	if c != nil && c.Rand != nil {
 		return c.Rand
@@ -126,29 +124,41 @@ func MouseMove(ctx context.Context, fromX, fromY, toX, toY float64) error {
 	return nil
 }
 
-func Click(ctx context.Context, x, y float64) error {
+// approachTarget walks the pointer to (x, y) from a random nearby start along
+// the bezier trail. Best-effort: the trail is only there for human-trail
+// realism, so a stall is logged and swallowed and the caller proceeds — its own
+// dispatch at (x, y) is what has to land. Only a cancelled outer context is
+// reported back.
+func approachTarget(ctx context.Context, x, y float64) error {
 	startOffsetX := (humanRand.Float64()-0.5)*200 + 50
 	startOffsetY := (humanRand.Float64()-0.5)*200 + 50
 	startX := x + startOffsetX
 	startY := y + startOffsetY
 
 	distance := math.Sqrt(startOffsetX*startOffsetX + startOffsetY*startOffsetY)
-	if distance > 30 {
-		// Best-effort: the initial random-start move and bezier trail are
-		// only there for human-trail realism. If they stall, log and
-		// proceed — the subsequent MousePressed sets the cursor at (x,y)
-		// explicitly, so the click still lands.
-		if err := dispatchMouseMovedBounded(ctx, startX, startY); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			slog.Debug("humanized click initial-move stalled, skipping bezier", "err", err)
-		} else if err := MouseMove(ctx, startX, startY, x, y); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			slog.Debug("humanized click bezier trail failed, proceeding to click", "err", err)
+	if distance <= 30 {
+		return nil
+	}
+
+	if err := dispatchMouseMovedBounded(ctx, startX, startY); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		slog.Debug("humanized initial-move stalled, skipping bezier", "err", err)
+	} else if err := MouseMove(ctx, startX, startY, x, y); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		slog.Debug("humanized bezier trail failed, proceeding to action", "err", err)
+	}
+	return nil
+}
+
+var approachTargetAction = approachTarget
+
+func Click(ctx context.Context, x, y float64) error {
+	if err := approachTargetAction(ctx, x, y); err != nil {
+		return err
 	}
 
 	time.Sleep(time.Duration(50+humanRand.Intn(150)) * time.Millisecond)
@@ -179,22 +189,56 @@ func Click(ctx context.Context, x, y float64) error {
 	)
 }
 
-// ClickElement clicks on an element identified by its backend DOM node ID.
-// This uses the backendDOMNodeId from the accessibility tree, NOT a regular DOM nodeId.
-func ClickElement(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
+var scrollIntoViewIfNeededAction = func(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
+	return chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return dom.ScrollIntoViewIfNeeded().WithBackendNodeID(backendNodeID).Do(ctx)
+	}))
+}
+
+var boxModelForBackendNodeAction = func(ctx context.Context, backendNodeID cdp.BackendNodeID) (*dom.BoxModel, error) {
 	var box *dom.BoxModel
-	if err := chromedp.Run(ctx,
+	err := chromedp.Run(ctx,
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			var err error
 			box, err = dom.GetBoxModel().WithBackendNodeID(backendNodeID).Do(ctx)
 			return err
 		}),
-	); err != nil {
+	)
+	return box, err
+}
+
+var (
+	clickCoordinateHumanAction = Click
+	hoverCoordinateHumanAction = Hover
+	settleHoverAction          = HoverByCoordinate
+)
+
+// Hover is the humanized sibling of Click: the same random-start bezier
+// approach, then the plain hover dispatch instead of press/release.
+func Hover(ctx context.Context, x, y float64) error {
+	if err := approachTargetAction(ctx, x, y); err != nil {
 		return err
+	}
+	return settleHoverAction(ctx, x, y)
+}
+
+// humanPointerPoint resolves the coordinate a humanized pointer action aims at.
+// It scrolls the target into the visual viewport first: the humanized path is
+// coordinate-based (Input.dispatchMouseEvent at the box-model center), so an
+// element below the fold or freshly revealed (lazy-loaded list item,
+// modal-triggered button) would otherwise produce coordinates that land on
+// whatever is currently visible there — the dispatch "succeeds" but the
+// intended handler never fires. Best-effort: not every node scrolls.
+func humanPointerPoint(ctx context.Context, backendNodeID cdp.BackendNodeID) (float64, float64, error) {
+	_ = scrollIntoViewIfNeededAction(ctx, backendNodeID)
+
+	box, err := boxModelForBackendNodeAction(ctx, backendNodeID)
+	if err != nil {
+		return 0, 0, err
 	}
 
 	if len(box.Content) < 8 {
-		return fmt.Errorf("invalid box model")
+		return 0, 0, fmt.Errorf("invalid box model")
 	}
 
 	centerX := (box.Content[0] + box.Content[2]) / 2
@@ -203,14 +247,31 @@ func ClickElement(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
 	offsetX := (humanRand.Float64() - 0.5) * 10
 	offsetY := (humanRand.Float64() - 0.5) * 10
 
-	return Click(ctx, centerX+offsetX, centerY+offsetY)
+	return centerX + offsetX, centerY + offsetY, nil
+}
+
+// The ID is the backendDOMNodeId from the accessibility tree, NOT a regular DOM nodeId.
+func ClickElement(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
+	x, y, err := humanPointerPoint(ctx, backendNodeID)
+	if err != nil {
+		return err
+	}
+	return clickCoordinateHumanAction(ctx, x, y)
+}
+
+// The ID is the backendDOMNodeId from the accessibility tree, NOT a regular DOM nodeId.
+func HoverElement(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
+	x, y, err := humanPointerPoint(ctx, backendNodeID)
+	if err != nil {
+		return err
+	}
+	return hoverCoordinateHumanAction(ctx, x, y)
 }
 
 func Type(text string, fast bool) []chromedp.Action {
 	return TypeWithConfig(text, fast, nil)
 }
 
-// TypeWithConfig generates typing actions with optional custom random source
 func TypeWithConfig(text string, fast bool, cfg *Config) []chromedp.Action {
 	rng := cfg.getRand()
 	actions := []chromedp.Action{}

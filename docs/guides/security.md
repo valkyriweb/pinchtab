@@ -21,12 +21,18 @@ The default security posture is:
 - `security.allowDownload = false`
 - `security.allowCookies = false`
 - `security.allowUpload = false`
+- `security.allowStateExport = false`
+- `security.allowNetworkIntercept = false`
+- `security.allowMemory = false`
+- `security.allowClipboard = false`
+- `security.allowFileScheme = false`
 - `autoSolver.enabled = false`
 - `instanceDefaults.stealthLevel = "light"` (minimal fingerprint normalization only; anti-bot bypass requires explicit opt-in to `medium` or `full`)
 - `security.attach.enabled = false`
 - `security.attach.allowHosts = ["127.0.0.1", "localhost", "::1"]`
-- `security.attach.allowSchemes = ["ws", "wss"]`
-- `security.allowedDomains = ["127.0.0.1", "localhost", "::1"]`
+- `security.attach.allowSchemes = ["ws", "wss", "http", "https"]`
+- `security.attach.forwardProxyAuth = false`
+- `security.allowedDomains` unset (no domain restriction; the SSRF/private-IP guard still applies)
 - `security.trustedProxyCIDRs = []`
 - `security.trustedResolveCIDRs = []`
 - `security.idpi.enabled = true`
@@ -34,7 +40,7 @@ The default security posture is:
 - `security.idpi.scanContent = true`
 - `security.idpi.wrapContent = true`
 
-Use `pinchtab security` to review the current posture and restore the recommended defaults.
+Use `pinchtab security` to review the current posture and `pinchtab security up` to restore the recommended defaults (loopback bind, every capability off, local-only attach, IDPI on). `security up` resets the whole `security` block to the defaults above, so it also clears `security.allowedDomains`; set a local-only allowlist separately if you want one (see [IDPI](#idpi)).
 
 ## Security Philosophy
 
@@ -163,7 +169,7 @@ Recommended practice:
 pinchtab config init
 ```
 
-The dashboard Settings page does not expose or rotate `server.token`. Use `pinchtab config token` to copy the current token, or let `pinchtab security` restore or create one if `server.token` is empty.
+The dashboard Settings page does not expose or rotate `server.token`. Use `pinchtab config token` to copy the current token (or `pinchtab config token --stdout` to print it where there is no clipboard), or let `pinchtab security up` create one if `server.token` is empty.
 
 If you are calling the API manually:
 
@@ -178,8 +184,9 @@ CLI commands use the configured local server settings by default, and `PINCHTAB_
 Agent sessions are reduced-distribution credentials for trusted automation, not a sandbox for untrusted clients.
 
 - session-authenticated callers are blocked from dashboard/admin endpoint families such as config, session management, profile management, instance management, dashboard agent listings, and cache controls
-- session records can optionally carry explicit grants that narrow access further
+- session records can optionally carry explicit grants that narrow access further — set them at creation with `pinchtab session create --agent-id <id> --grant browse` or the `grants` field on `POST /sessions` (see [sessions](../reference/sessions.md#session-grants))
 - sessions without explicit grants can still use the normal non-admin automation API by default
+- a grant only narrows: every server-level capability gate still applies on top, so `--grant evaluate` does not re-enable `security.allowEvaluate` and no grant reaches an admin route
 
 That means agent sessions are appropriate for controlled environments where the caller is already trusted to drive browser automation but should not receive the full dashboard bearer token. They are not sufficient for hostile multi-tenant sharing or public internet exposure. For that kind of isolation, run separate PinchTab instances behind separate network and credential boundaries.
 
@@ -193,15 +200,25 @@ Some endpoint families expose much more power than normal navigation and inspect
 - `security.allowDownload`
 - `security.allowCookies`
 - `security.allowUpload`
+- `security.allowStateExport`
+- `security.allowNetworkIntercept`
+- `security.allowMemory`
+- `security.allowClipboard`
+- `security.allowFileScheme`
 
 Why they are considered dangerous:
 
 - `evaluate` can execute JavaScript in page context
 - `macro` can trigger higher-level automation flows
 - `screencast` can stream live page contents
-- `download` can fetch and persist remote content. When `security.downloadAllowedDomains` is set, listed domains bypass private-IP SSRF checks (intended for internal hosts such as Docker services). `["*"]` matches every host and disables all private-IP protection on the download endpoint.
+- `download` can fetch and persist remote content. When `security.downloadAllowedDomains` is set, matching domains bypass private-IP SSRF checks (intended for internal hosts such as Docker services). A bare `"*"` matches every host and therefore disables private-IP protection for this endpoint, including loopback. Naming a loopback host (`127.0.0.1`, `localhost`) or using `"*"` lets the download endpoint reach services on the server's own machine, including PinchTab's own local endpoints, so treat either configuration the way you treat `allowFileScheme`.
 - `cookies` can read, write, or clear browser session tokens for the current page
 - `upload` can push local files into browser flows
+- `stateExport` writes cookies and browser storage to disk and loads them back (`/state/*`, `/storage`)
+- `networkIntercept` can rewrite, block, or mock requests and read full request details (`/network/route`, `/network/{requestId}`)
+- `memory` writes V8 heap snapshots, which hold every string on the page, tokens included (`/memory/snapshot`, `/memory/compare`)
+- `clipboard` can read and write the browser clipboard (`/clipboard/*`)
+- `allowFileScheme` permits navigation to `file://` URLs. Because a `file://` URL has no host, it is **not** subject to `allowedDomains` or the SSRF/private-IP guard, so enabling it grants read access (via snapshot/screenshot/scrape) to any local file the server process can read. It stays blocked when a strict-mode `allowedDomains` allowlist is active. Enable only on trusted, single-tenant hosts. `javascript:`, `chrome://`, and `data:` remain rejected regardless.
 
 These are not the same as authentication.
 
@@ -210,7 +227,7 @@ These are not the same as authentication.
 
 For example, a token-protected server with `security.allowEvaluate = true` is still intentionally exposing JavaScript execution to any caller that has the token.
 
-When disabled, these routes are locked and return a `403` explaining that the endpoint family is disabled in config.
+When disabled, these routes are locked and return a `403` explaining that the endpoint family is disabled in config (codes such as `evaluate_disabled`, `upload_disabled`, `memory_disabled`).
 
 ## Attach Policy
 
@@ -222,7 +239,8 @@ Attach is an advanced feature for registering an externally managed Chrome insta
     "attach": {
       "enabled": false,
       "allowHosts": ["127.0.0.1", "localhost", "::1"],
-      "allowSchemes": ["ws", "wss"]
+      "allowSchemes": ["ws", "wss", "http", "https"],
+      "forwardProxyAuth": false
     }
   }
 }
@@ -234,12 +252,30 @@ If you enable attach:
 - prefer local-only hosts unless external Chrome targets or remote bridges are intentional
 - only attach to browsers and CDP endpoints you trust
 - `allowHosts: ["*"]` is a documented, non-default, security-reducing override. It disables host allowlisting entirely and allows any reachable attach host with an allowed scheme. Use it only on isolated, operator-controlled networks.
+- keep `forwardProxyAuth` disabled unless the attached browser process and CDP transport are trusted; enabling it permits PinchTab to send configured proxy credentials over the CDP WebSocket.
 
-If you use `POST /instances/attach-bridge`, `security.attach.allowSchemes` must also include `http` or `https`.
+There are two attach endpoints with different trust shapes:
+
+- `POST /instances/attach` — attach an existing **CDP browser** by `cdpUrl`.
+  PinchTab spawns a child `pinchtab bridge --cdp-attach ...` process that wraps
+  the external endpoint and registers the bridge's local HTTP URL (not the
+  raw `ws://` CDP URL) as the routable instance URL. The CDP URL is preserved
+  as metadata and **redacted in logs**.
+- `POST /instances/attach-bridge` — attach an already-running **PinchTab
+  bridge** by its HTTP `baseUrl`. The orchestrator runs a `/health` check
+  before registering it.
+
+Scheme allowlist rules:
+
+- `ws`, `wss` — required for CDP attach using a browser WebSocket URL
+- `http`, `https` — required for CDP attach using an HTTP DevTools origin
+  *and* for `POST /instances/attach-bridge`
 
 `security.attach.allowSchemes` and `security.attach.enabled` still apply when `allowHosts` contains `"*"`, but host allowlisting no longer provides protection in that configuration.
 
-For `attach-bridge`, `baseUrl` should be a bare bridge origin such as `http://bridge.internal:9868`. Do not include credentials, query strings, fragments, or a path.
+For `attach-bridge`, `baseUrl` should be a bare bridge origin such as `http://bridge.internal:9868`. Do not include credentials, query strings, fragments, or a path. For CDP attach via HTTP, only the bare origin or a `/json/version` path is accepted.
+
+Stopping a CDP-attached instance shuts down the child PinchTab bridge but never kills the external browser process — PinchTab does not own that process.
 
 ## IDPI
 
@@ -254,7 +290,7 @@ PinchTab's IDPI layer currently does four things:
 - scans extracted content for suspicious prompt-injection patterns
 - wraps text output so downstream systems can treat it as untrusted content
 
-The default local-only IDPI config is:
+IDPI is on by default, but `allowedDomains` is unset, so navigation is not domain-restricted until you set it. A local-only IDPI config looks like this:
 
 ```json
 {
@@ -275,13 +311,32 @@ The default local-only IDPI config is:
 
 Important notes:
 
-- if `allowedDomains` is empty, the main domain restriction is not doing useful work
-- if `allowedDomains` contains `"*"`, the whitelist effectively allows everything
+- an empty `allowedDomains` **lifts the domain restriction and grants nothing**. It is
+  not an allowance: no host counts as explicitly allowed, so the SSRF/private-IP guard
+  keeps refusing private and internal addresses exactly as it does with IDPI off.
+  (Enabling IDPI with an empty list used to *remove* that protection, because "the
+  scanner found nothing suspicious" was read as "the operator allowed this host".)
+- listing a private or internal host explicitly — `["10.0.0.5"]`, or the local-only
+  `["127.0.0.1", "localhost", "::1"]` — is what permits navigation to it. That is the
+  only way the private-IP guard is relaxed, and it is a positive match by an entry
+  that **denotes a host**, never the absence of a list and never a bare `"*"`.
+- if `allowedDomains` contains `"*"`, the whitelist effectively allows everything: the
+  domain restriction is lifted for every host. It grants **no** private-IP override —
+  `"*"` names no host, which is the same intent as an empty list — so with `["*"]` the
+  SSRF guard still refuses private and internal addresses. To reach one, name it:
+  `["*", "10.0.0.5"]` keeps unrestricted navigation and permits that host.
 - `security.allowedDomains` is the canonical config path. `security.idpi.allowedDomains` is still accepted when loading older config files, but new saves are normalized to `security.allowedDomains`
 - `strictMode = true` blocks disallowed domains and suspicious content
 - `strictMode = false` allows the request but emits warnings instead
-- `scanContent` protects `/text` and `/snapshot` style extraction paths
-- `wrapContent` adds explicit untrusted-content framing for downstream consumers
+- `scanContent` covers every endpoint that returns page-controlled content:
+  `/text`, `/snapshot`, `/capture`, `/find`, `/scrape`, `/pdf`, `/html` and `/styles`,
+  along with their `/tabs/{id}/...` forms. A page whose text `/text` refuses is
+  refused by all of them, so no single endpoint is a way around the scanner
+- `wrapContent` adds explicit untrusted-content framing for downstream consumers.
+  It applies to the text-shaped responses (`/text`, `/snapshot`, `/capture`), not to
+  `/html` or `/styles`: wrapping raw markup would leave it unparseable for callers
+  that hand it to an HTML parser. Those two are scanned and blocked or warned, and
+  carry the advisory on `X-IDPI-Warning` and in the response's `idpiWarning` field
 - widening navigation to non-local or non-trusted sites is still a security-reducing choice; IDPI lowers risk, but it does not make hostile pages safe or remove browser attack surface
 
 For navigation trust overrides:
@@ -289,6 +344,7 @@ For navigation trust overrides:
 - `security.trustedResolveCIDRs` lets a hostname resolve to a non-public IP during navigation preflight. This is intended for operator-controlled DNS or proxy setups such as internal proxies, lab networks, or benchmark ranges
 - `security.trustedProxyCIDRs` trusts browser-reported remote IPs from known internal proxies during runtime navigation checks
 - keep both lists narrow. Broad ranges such as `10.0.0.0/8` reduce SSRF protections and should only be used when the full network segment is intentionally trusted
+- known limitation: responses served from the browser cache or a service worker report no remote IP, so the runtime remote-IP check passes them through by design; the resolve-time checks remain the primary gate for those navigations
 
 Supported domain patterns are:
 
@@ -333,7 +389,8 @@ For a secure local setup:
     "attach": {
       "enabled": false,
       "allowHosts": ["127.0.0.1", "localhost", "::1"],
-      "allowSchemes": ["ws", "wss"]
+      "allowSchemes": ["ws", "wss", "http", "https"],
+      "forwardProxyAuth": false
     },
     "idpi": {
       "enabled": true,
@@ -371,7 +428,7 @@ For short-lived or one-off usage, prefer `pinchtab server` (foreground process, 
 
 Agent session credentials auto-expire after **30 minutes of idle** (`sessions.agent.idleTimeoutSec: 1800`) and have a **24-hour max lifetime** (`sessions.agent.maxLifetimeSec: 86400`) by default.
 
-## Agent Sessions
+## Agent Session Tokens
 
 For automated agents, use **agent sessions** instead of sharing the server bearer token. Each agent gets a dedicated session token (`PINCHTAB_SESSION`) that:
 
@@ -383,3 +440,14 @@ For automated agents, use **agent sessions** instead of sharing the server beare
 **Important:** Agent sessions are designed for trusted environments. The session management API (`/sessions`) has no per-agent authorization — any bearer-authenticated caller can manage all sessions. Do not expose these endpoints to untrusted networks.
 
 See [Reference: Agent Sessions](../reference/sessions.md) for configuration and API details.
+
+## Related guides
+
+- [cloakbrowser.md](cloakbrowser.md) — browser-specific fingerprint flags
+  and the licensing/distribution policy for CloakBrowser binaries
+- [attach-chrome.md](attach-chrome.md) — attach an externally managed Chrome
+  or CloakBrowser via CDP, and the attach policy fields summarized above
+- [docker.md](docker.md) — container deployment, the headless-only design,
+  and the local CloakBrowser smoke image
+- [headed-mode.md](headed-mode.md) — manual headed setup (not supported in
+  the bundled image or in CI)

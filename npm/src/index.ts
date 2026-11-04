@@ -3,7 +3,8 @@ import { randomBytes } from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { detectPlatform, getBinaryName, getBinaryPath, getCheckoutBinaryPath } from './platform';
+import { getCheckoutBinaryPath, resolveManagedBinaryPath } from './platform';
+import { withAuthedFetch } from './http';
 import {
   SnapshotParams,
   SnapshotResponse,
@@ -18,6 +19,16 @@ import {
 export * from './types';
 export * from './platform';
 
+const servingHealthStatuses: readonly unknown[] = ['ok', 'degraded'];
+
+export function isPinchtabHealthy(body: unknown): boolean {
+  return (
+    typeof body === 'object' &&
+    body !== null &&
+    servingHealthStatuses.includes((body as { status?: unknown }).status)
+  );
+}
+
 export class Pinchtab {
   private baseUrl: string;
   private timeout: number;
@@ -27,6 +38,7 @@ export class Pinchtab {
   private tempConfigDir: string | null = null;
   private token: string | null;
   private readonly configuredToken: string | null;
+  private readonly shutdownTimeout: number;
 
   constructor(options: PinchtabOptions = {}) {
     this.port = options.port || 9867;
@@ -34,6 +46,7 @@ export class Pinchtab {
     this.timeout = options.timeout || 30000;
     this.configuredToken = options.token?.trim() || null;
     this.token = this.configuredToken;
+    this.shutdownTimeout = options.shutdownTimeout ?? 10000;
   }
 
   /**
@@ -104,23 +117,59 @@ export class Pinchtab {
    * Stop the Pinchtab server process
    */
   async stop(): Promise<void> {
-    if (this.process) {
-      return new Promise((resolve) => {
-        const proc = this.process;
-        this.process = null;
-        if (!proc) {
-          this.cleanupTempConfig();
-          resolve();
+    const proc = this.process;
+    this.process = null;
+    if (!proc) {
+      this.cleanupTempConfig();
+      return;
+    }
+    try {
+      await this.terminateProcess(proc);
+    } finally {
+      // Always clean up, even if the child never exited — the previous
+      // implementation only cleaned the temp dir on the 'exit' event, leaking
+      // it when a wedged child ignored the signal.
+      this.cleanupTempConfig();
+    }
+  }
+
+  /**
+   * Terminate a child with SIGTERM, escalating to SIGKILL after shutdownTimeout
+   * so a wedged process can never hang stop() indefinitely.
+   */
+  private terminateProcess(proc: ChildProcess): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        resolve();
+        return;
+      }
+
+      let resolved = false;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const done = () => {
+        if (resolved) {
           return;
         }
-        proc.once('exit', () => {
-          this.cleanupTempConfig();
-          resolve();
-        });
-        proc.kill();
-      });
-    }
-    this.cleanupTempConfig();
+        resolved = true;
+        clearTimeout(forceTimer);
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+        }
+        resolve();
+      };
+
+      proc.once('exit', done);
+
+      const forceTimer = setTimeout(() => {
+        proc.kill('SIGKILL');
+        // Safety net: resolve even if 'exit' never fires after SIGKILL.
+        graceTimer = setTimeout(done, 2000);
+        graceTimer.unref?.();
+      }, this.shutdownTimeout);
+      forceTimer.unref?.();
+
+      proc.kill('SIGTERM');
+    });
   }
 
   /**
@@ -165,22 +214,11 @@ export class Pinchtab {
   private async request<T = any>(path: string, body?: any): Promise<T> {
     const url = `${this.baseUrl}${path}`;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-
-    try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (this.token) {
-        headers.Authorization = `Bearer ${this.token}`;
-      }
-
-      const response = await fetch(url, {
+    return withAuthedFetch(this.token, this.timeout, async (doFetch) => {
+      const response = await doFetch(url, {
         method: 'POST',
-        headers,
+        headers: { 'Content-Type': 'application/json' },
         body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal as AbortSignal,
       });
 
       if (!response.ok) {
@@ -189,9 +227,7 @@ export class Pinchtab {
       }
 
       return response.json() as Promise<T>;
-    } finally {
-      clearTimeout(timeoutId);
-    }
+    });
   }
 
   /**
@@ -209,20 +245,10 @@ export class Pinchtab {
       return checkoutBinaryPath;
     }
 
-    const platform = detectPlatform();
-    const binaryName = getBinaryName(platform);
-
-    // Try version-specific path first
-    let version: string | undefined;
-    try {
-      version = this.readPackageVersion();
-    } catch (err) {
-      console.warn(
-        `Could not read version from package.json, falling back to unversioned binary. (${(err as Error).message})`
-      );
-    }
-
-    const binaryPath = getBinaryPath(binaryName, version);
+    // Shared resolver: package-relative managed location first, then the legacy
+    // $HOME fallback (issue #628). Keeps the SDK, the CLI wrapper, and the
+    // installer agreeing on one binary location.
+    const binaryPath = resolveManagedBinaryPath(__dirname);
     if (!fs.existsSync(binaryPath)) {
       throw new Error(
         `Pinchtab binary not found at ${binaryPath}.\n` +
@@ -275,41 +301,34 @@ export class Pinchtab {
     const deadline = Date.now() + 10000;
 
     while (Date.now() < deadline) {
-      try {
-        const response = await fetch(this.baseUrl);
-        if (response.status > 0) {
-          return;
-        }
-      } catch {
-        // Server not ready yet.
+      if (await this.probeHealthy()) {
+        return;
       }
-
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
     throw new Error(`Pinchtab did not become ready at ${this.baseUrl} within 10s`);
   }
 
-  private readPackageVersion(): string {
-    let dir = path.resolve(__dirname);
-
-    while (dir) {
-      const pkgPath = path.join(dir, 'package.json');
-      if (fs.existsSync(pkgPath)) {
-        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
-        if (typeof pkg.version === 'string' && pkg.version.trim() !== '') {
-          return pkg.version;
+  /**
+   * Probe GET /health for an actual PinchTab-ready shape, so a foreign process
+   * on the port can't satisfy startup. Bounded per-probe so one hung fetch can't
+   * consume the whole readiness budget.
+   */
+  private async probeHealthy(): Promise<boolean> {
+    try {
+      return await withAuthedFetch(this.token, 2000, async (doFetch) => {
+        const response = await doFetch(`${this.baseUrl}/health`);
+        if (!response.ok) {
+          return false;
         }
-      }
-
-      const parent = path.dirname(dir);
-      if (parent === dir) {
-        break;
-      }
-      dir = parent;
+        const body = await response.json().catch(() => null);
+        return isPinchtabHealthy(body);
+      });
+    } catch {
+      // Server not ready yet (not listening, hung, or not PinchTab).
+      return false;
     }
-
-    throw new Error(`ENOENT: package.json not found above ${__dirname}`);
   }
 }
 

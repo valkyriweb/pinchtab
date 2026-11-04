@@ -5,6 +5,7 @@
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -20,22 +21,55 @@ import (
 
 // Session represents a durable, revocable authenticated session.
 type Session struct {
-	ID          string        `json:"id"`
-	AgentID     string        `json:"agentId"`
-	Label       string        `json:"label,omitempty"`
-	TokenHash   [32]byte      `json:"-"`
-	CreatedAt   time.Time     `json:"createdAt"`
-	LastSeenAt  time.Time     `json:"lastSeenAt"`
-	ExpiresAt   time.Time     `json:"expiresAt,omitempty"`
-	IdleTimeout time.Duration `json:"-"`
-	Status      string        `json:"status"`
-	Grants      []string      `json:"grants,omitempty"`
+	ID         string    `json:"id"`
+	AgentID    string    `json:"agentId"`
+	Label      string    `json:"label,omitempty"`
+	Browser    string    `json:"browser,omitempty"`
+	TokenHash  [32]byte  `json:"-"`
+	CreatedAt  time.Time `json:"createdAt"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
+	ExpiresAt  time.Time `json:"expiresAt,omitempty"`
+	Status     string    `json:"status"`
+	Grants     []string  `json:"grants,omitempty"`
+}
+
+// The auth modes sessions.agent.mode may name. ModeRequired is vocabulary, not
+// behaviour: it is refused by config validation, because accepting it would
+// promise session-only auth that the bearer token and the dashboard cookie still
+// bypass. This package owns the set so the validator and the predicate cannot
+// hold two copies of it.
+const (
+	ModeOff       = "off"
+	ModePreferred = "preferred"
+	ModeRequired  = "required"
+)
+
+// NormalizeMode is the canonical reading of a sessions.agent.mode value: case
+// folded and trimmed, the way this codebase reads every other config enum. The
+// validator and the predicate both go through it so the accepted set is spelled
+// once, and so "Off" means off rather than being a typo that leaves an auth
+// mechanism on.
+func NormalizeMode(mode string) string {
+	return strings.ToLower(strings.TrimSpace(mode))
+}
+
+// ModeServes reports whether a mode value leaves agent sessions serving. It is an
+// allowlist, not a denylist: an empty value is the default (ModePreferred) and
+// nothing else serves, so a value the validator refuses can never be read as
+// "preferred" by a process that started anyway.
+func ModeServes(mode string) bool {
+	switch NormalizeMode(mode) {
+	case "", ModePreferred:
+		return true
+	default:
+		return false
+	}
 }
 
 // Config controls store behavior.
 type Config struct {
 	Enabled     bool
-	Mode        string // "off", "preferred", "required"
+	Mode        string
 	IdleTimeout time.Duration
 	MaxLifetime time.Duration
 	PersistPath string
@@ -57,10 +91,21 @@ type LifecycleHook func(LifecycleEvent)
 
 // Store manages authenticated sessions with persistence.
 type Store struct {
-	mu       sync.Mutex
-	sessions map[string]*Session // keyed by session ID
-	cfg      Config
-	now      func() time.Time
+	mu            sync.Mutex
+	sessions      map[string]*Session   // keyed by session ID
+	byTokenHash   map[[32]byte]*Session // secondary index: token hash → session (mirrors `sessions`)
+	cfg           Config
+	now           func() time.Time
+	lastTouchSave time.Time // last time a LastSeen-only update was flushed (debounce gate)
+
+	// Persistence is split off the data lock: a snapshot is built under mu (with
+	// a monotonic saveSeq), then marshalled + written under saveMu so routine
+	// session traffic isn't serialized behind disk I/O. writtenSeq (guarded by
+	// saveMu) lets a writer skip a snapshot older than one already on disk, so a
+	// stale snapshot can never clobber a fresher one.
+	saveMu     sync.Mutex
+	saveSeq    uint64 // guarded by mu
+	writtenSeq uint64 // guarded by saveMu
 
 	// hooksMu protects lifecycleHooks. Held only for very short reads /
 	// writes so it never blocks anything else. Separate from `mu` so a
@@ -68,6 +113,11 @@ type Store struct {
 	hooksMu        sync.RWMutex
 	lifecycleHooks []LifecycleHook
 }
+
+// touchPersistInterval bounds how often a LastSeen-only update is flushed to
+// disk; in-memory LastSeenAt is always current, so this only delays durability
+// of the idle-timeout clock by < interval (negligible vs the multi-day idle timeout).
+const touchPersistInterval = 30 * time.Second
 
 const (
 	DefaultIdleTimeout = 7 * 24 * time.Hour
@@ -95,9 +145,9 @@ func (s *Store) OnLifecycle(fn LifecycleHook) {
 	s.hooksMu.Unlock()
 }
 
-// dispatchLifecycle fires the given events to every registered hook,
-// each in its own goroutine. Must be called after the store lock has
-// been released — never under s.mu.
+// dispatchLifecycle fires the given events to every registered hook, each hook
+// in its own goroutine. Must be called after the store lock has been released —
+// never under s.mu.
 func (s *Store) dispatchLifecycle(events []LifecycleEvent) {
 	if s == nil || len(events) == 0 {
 		return
@@ -109,20 +159,26 @@ func (s *Store) dispatchLifecycle(events []LifecycleEvent) {
 	if len(hooks) == 0 {
 		return
 	}
-	for _, evt := range events {
-		evt := evt
-		for _, fn := range hooks {
-			fn := fn
-			go fn(evt)
-		}
+	// One goroutine per hook (not per event × hook): bounds a revoke/prune burst
+	// to the small, fixed number of hooks and delivers events to each hook in
+	// order. Hooks still run concurrently with one another. events is built fresh
+	// per call and not mutated after dispatch, so the goroutines share it read-only.
+	for _, fn := range hooks {
+		fn := fn
+		go func() {
+			for _, evt := range events {
+				fn(evt)
+			}
+		}()
 	}
 }
 
 // NewStore creates a new session store.
 func NewStore(cfg Config) *Store {
 	s := &Store{
-		sessions: make(map[string]*Session),
-		now:      time.Now,
+		sessions:    make(map[string]*Session),
+		byTokenHash: make(map[[32]byte]*Session),
+		now:         time.Now,
 	}
 	s.applyConfig(cfg)
 	s.loadPersisted()
@@ -137,14 +193,14 @@ func (s *Store) applyConfig(cfg Config) {
 		cfg.MaxLifetime = DefaultMaxLifetime
 	}
 	if cfg.Mode == "" {
-		cfg.Mode = "preferred"
+		cfg.Mode = ModePreferred
 	}
 	s.cfg = cfg
 }
 
 // Create generates a new session and returns the session ID and
 // plaintext token. The token is returned exactly once and is never stored.
-func (s *Store) Create(agentID, label string) (sessionID, sessionToken string, err error) {
+func (s *Store) Create(agentID, label, browser string) (sessionID, sessionToken string, err error) {
 	if s == nil {
 		return "", "", fmt.Errorf("store is nil")
 	}
@@ -160,23 +216,36 @@ func (s *Store) Create(agentID, label string) (sessionID, sessionToken string, e
 
 	now := s.now()
 	session := &Session{
-		ID:          id,
-		AgentID:     strings.TrimSpace(agentID),
-		Label:       strings.TrimSpace(label),
-		TokenHash:   hashToken(token),
-		CreatedAt:   now,
-		LastSeenAt:  now,
-		ExpiresAt:   now.Add(s.cfg.MaxLifetime),
-		IdleTimeout: s.cfg.IdleTimeout,
-		Status:      StatusActive,
+		ID:         id,
+		AgentID:    strings.TrimSpace(agentID),
+		Label:      strings.TrimSpace(label),
+		Browser:    strings.TrimSpace(browser),
+		TokenHash:  hashToken(token),
+		CreatedAt:  now,
+		LastSeenAt: now,
+		Status:     StatusActive,
 	}
 
-	s.mu.Lock()
-	s.sessions[id] = session
-	s.saveLocked()
-	s.mu.Unlock()
+	job, persist := s.registerSession(session, now)
+	if persist {
+		s.writeSnapshot(job)
+	}
 
 	return id, token, nil
+}
+
+// registerSession stamps the lifetime from config and installs the session in both
+// indexes, all under s.mu. It exists so Create names neither s.cfg nor the maps:
+// the expiry used to be built from s.cfg.MaxLifetime BEFORE the lock was taken,
+// which is a race against UpdateConfig, and a rule about where a field may be read
+// is only enforceable when the reads have a named home.
+func (s *Store) registerSession(session *Session, now time.Time) (snapshotJob, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session.ExpiresAt = now.Add(s.cfg.MaxLifetime)
+	s.sessions[session.ID] = session
+	s.byTokenHash[session.TokenHash] = session
+	return s.snapshotLocked()
 }
 
 // Authenticate validates a token and returns the associated session.
@@ -206,35 +275,40 @@ func (s *Store) authenticate(token string, touch bool) (*Session, bool) {
 		match      *Session
 		ok         bool
 		expiredEvt *LifecycleEvent
+		job        snapshotJob
+		persist    bool
 	)
 
 	func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		for _, sess := range s.sessions {
-			if sess.Status != StatusActive {
-				continue
-			}
-			if subtle.ConstantTimeCompare(hash[:], sess.TokenHash[:]) != 1 {
-				continue
-			}
-			if s.isExpired(sess, now) {
-				sess.Status = StatusExpired
-				s.saveLocked()
-				expiredEvt = &LifecycleEvent{SessionID: sess.ID, AgentID: sess.AgentID, Reason: LifecycleReasonExpired}
-				return
-			}
-			if touch {
-				sess.LastSeenAt = now
-				s.saveLocked()
-			}
-			match = sess
-			ok = true
+		sess, found := s.byTokenHash[hash]
+		if !found || sess.Status != StatusActive {
 			return
 		}
+		// Defense-in-depth: the map key already matched, but keep a constant-time
+		// compare on the single candidate so the final match path is timing-safe.
+		if subtle.ConstantTimeCompare(hash[:], sess.TokenHash[:]) != 1 {
+			return
+		}
+		if s.isExpired(sess, now) {
+			sess.Status = StatusExpired
+			job, persist = s.snapshotLocked()
+			expiredEvt = &LifecycleEvent{SessionID: sess.ID, AgentID: sess.AgentID, Reason: LifecycleReasonExpired}
+			return
+		}
+		if touch {
+			sess.LastSeenAt = now
+			job, persist = s.maybeSnapshotTouchLocked(now)
+		}
+		match = cloneSessionLocked(sess)
+		ok = true
 	}()
 
+	if persist {
+		s.writeSnapshot(job)
+	}
 	if expiredEvt != nil {
 		s.dispatchLifecycle([]LifecycleEvent{*expiredEvt})
 	}
@@ -250,23 +324,40 @@ func (s *Store) Touch(sessionID string) bool {
 	now := s.now()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	sess, ok := s.sessions[strings.TrimSpace(sessionID)]
 	if !ok || sess.Status != StatusActive {
+		s.mu.Unlock()
 		return false
 	}
 	if s.isExpired(sess, now) {
 		sess.Status = StatusExpired
-		s.saveLocked()
+		job, persist := s.snapshotLocked()
+		s.mu.Unlock()
+		if persist {
+			s.writeSnapshot(job)
+		}
 		return false
 	}
 	sess.LastSeenAt = now
-	s.saveLocked()
+	job, persist := s.maybeSnapshotTouchLocked(now)
+	s.mu.Unlock()
+	if persist {
+		s.writeSnapshot(job)
+	}
 	return true
 }
 
-// Get returns a session by its public ID.
+// cloneSessionLocked returns a copy no caller can use to mutate store-owned
+// state outside the store lock: the Grants slice is cloned rather than aliased.
+// Caller must hold s.mu.
+func cloneSessionLocked(sess *Session) *Session {
+	cp := *sess
+	cp.Grants = append([]string(nil), sess.Grants...)
+	return &cp
+}
+
+// Get returns a defensive copy of a session by its public ID.
 func (s *Store) Get(sessionID string) (*Session, bool) {
 	if s == nil {
 		return nil, false
@@ -277,10 +368,10 @@ func (s *Store) Get(sessionID string) (*Session, bool) {
 	if !ok {
 		return nil, false
 	}
-	return sess, true
+	return cloneSessionLocked(sess), true
 }
 
-// List returns all sessions.
+// List returns defensive copies of all sessions.
 func (s *Store) List() []Session {
 	if s == nil {
 		return nil
@@ -290,9 +381,30 @@ func (s *Store) List() []Session {
 
 	out := make([]Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		out = append(out, *sess)
+		out = append(out, *cloneSessionLocked(sess))
 	}
 	return out
+}
+
+// SetGrants replaces a session's capability grants and persists the change. The
+// input is cloned so the store owns the slice. Returns false if no such session.
+func (s *Store) SetGrants(sessionID string, grants []string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	sess, ok := s.sessions[strings.TrimSpace(sessionID)]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	sess.Grants = append([]string(nil), grants...)
+	job, persist := s.snapshotLocked()
+	s.mu.Unlock()
+	if persist {
+		s.writeSnapshot(job)
+	}
+	return true
 }
 
 // Revoke marks a session as revoked.
@@ -301,7 +413,11 @@ func (s *Store) Revoke(sessionID string) bool {
 		return false
 	}
 
-	var event LifecycleEvent
+	var (
+		event   LifecycleEvent
+		job     snapshotJob
+		persist bool
+	)
 	revoked := func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -311,12 +427,15 @@ func (s *Store) Revoke(sessionID string) bool {
 			return false
 		}
 		sess.Status = StatusRevoked
-		s.saveLocked()
+		job, persist = s.snapshotLocked()
 		event = LifecycleEvent{SessionID: sess.ID, AgentID: sess.AgentID, Reason: LifecycleReasonRevoked}
 		return true
 	}()
 	if !revoked {
 		return false
+	}
+	if persist {
+		s.writeSnapshot(job)
 	}
 	s.dispatchLifecycle([]LifecycleEvent{event})
 	return true
@@ -330,25 +449,103 @@ func (s *Store) UpdateConfig(cfg Config) {
 	s.mu.Lock()
 	s.applyConfig(cfg)
 	events := s.pruneExpiredLocked()
-	s.saveLocked()
+	job, persist := s.snapshotLocked()
 	s.mu.Unlock()
+	if persist {
+		s.writeSnapshot(job)
+	}
 	s.dispatchLifecycle(events)
 }
 
-// Enabled reports whether session auth is enabled.
+// MaintenanceInterval is how often RunMaintenance sweeps expired sessions.
+const MaintenanceInterval = 5 * time.Minute
+
+// PruneExpired drops revoked and expired sessions, persists the result, and
+// dispatches the resulting lifecycle events so downstream bindings are cleared.
+func (s *Store) PruneExpired() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	events := s.pruneExpiredLocked()
+	var (
+		job     snapshotJob
+		persist bool
+	)
+	if len(events) > 0 {
+		job, persist = s.snapshotLocked()
+	}
+	s.mu.Unlock()
+	if persist {
+		s.writeSnapshot(job)
+	}
+	s.dispatchLifecycle(events)
+}
+
+// RunMaintenance sweeps expired sessions until ctx is done. Expiry is otherwise
+// only noticed when a session's own token is presented again, so a session that
+// is simply abandoned — the usual end of an agent run — is never detected, and
+// it plus any downstream binding keyed on its id survive for the life of the
+// process.
+func (s *Store) RunMaintenance(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	t := time.NewTicker(MaintenanceInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.PruneExpired()
+		}
+	}
+}
+
+// Enabled is the ONE predicate every consumer of agent sessions asks — the front
+// door's session branch, the session API's handlers and their registration. enabled
+// and mode were a two-field encoding of one question, and the halves drifted: mode
+// was documented as reducing the auth surface while nothing read it.
 func (s *Store) Enabled() bool {
 	if s == nil {
 		return false
 	}
-	return s.cfg.Enabled
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.Enabled && ModeServes(s.cfg.Mode)
 }
 
-// Mode returns the current auth mode.
-func (s *Store) Mode() string {
+// DisabledBy names the settings switching agent sessions off, so a refusal can
+// prescribe a command that works. Two fields reach the one predicate, and an
+// operator who disabled through one of them is not helped by being told to set
+// the other. Empty when the store serves.
+func (s *Store) DisabledBy() []string {
 	if s == nil {
-		return "off"
+		return []string{SettingEnabled}
 	}
-	return s.cfg.Mode
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var off []string
+	if !s.cfg.Enabled {
+		off = append(off, SettingEnabled)
+	}
+	if !ModeServes(s.cfg.Mode) {
+		off = append(off, SettingMode)
+	}
+	return off
+}
+
+// PersistPath returns the file the store persists to, so a caller rebuilding
+// the config from elsewhere can carry it over instead of recomputing it.
+func (s *Store) PersistPath() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.PersistPath
 }
 
 func (s *Store) isExpired(sess *Session, now time.Time) bool {
@@ -370,18 +567,18 @@ func (s *Store) pruneExpiredLocked() []LifecycleEvent {
 	for id, sess := range s.sessions {
 		if sess.Status == StatusRevoked {
 			delete(s.sessions, id)
+			delete(s.byTokenHash, sess.TokenHash)
 			events = append(events, LifecycleEvent{SessionID: sess.ID, AgentID: sess.AgentID, Reason: LifecycleReasonPruned})
 			continue
 		}
 		if s.isExpired(sess, now) {
 			delete(s.sessions, id)
+			delete(s.byTokenHash, sess.TokenHash)
 			events = append(events, LifecycleEvent{SessionID: sess.ID, AgentID: sess.AgentID, Reason: LifecycleReasonPruned})
 		}
 	}
 	return events
 }
-
-// persistence types
 
 type persistedStore struct {
 	SavedAt  time.Time          `json:"savedAt"`
@@ -392,12 +589,56 @@ type persistedSession struct {
 	ID         string    `json:"id"`
 	AgentID    string    `json:"agentId"`
 	Label      string    `json:"label,omitempty"`
+	Browser    string    `json:"browser,omitempty"`
 	TokenHash  string    `json:"tokenHash"`
 	CreatedAt  time.Time `json:"createdAt"`
 	LastSeenAt time.Time `json:"lastSeenAt"`
 	ExpiresAt  time.Time `json:"expiresAt,omitempty"`
 	Status     string    `json:"status"`
 	Grants     []string  `json:"grants,omitempty"`
+}
+
+// toPersisted maps an in-memory Session to its on-disk record.
+func (sess *Session) toPersisted() persistedSession {
+	return persistedSession{
+		ID:         sess.ID,
+		AgentID:    sess.AgentID,
+		Label:      sess.Label,
+		Browser:    sess.Browser,
+		TokenHash:  hex.EncodeToString(sess.TokenHash[:]),
+		CreatedAt:  sess.CreatedAt,
+		LastSeenAt: sess.LastSeenAt,
+		ExpiresAt:  sess.ExpiresAt,
+		Status:     sess.Status,
+		// Clone Grants: snapshots are marshalled outside s.mu, so the record must
+		// not alias store-owned slices that a concurrent SetGrants could mutate.
+		Grants: append([]string(nil), sess.Grants...),
+	}
+}
+
+// toSession maps an on-disk record back to an in-memory Session, decoding and
+// validating the token hash. ok=false means the record is malformed and should
+// be skipped.
+func (rec persistedSession) toSession() (*Session, bool) {
+	tokenHash, err := hex.DecodeString(strings.TrimSpace(rec.TokenHash))
+	if err != nil || len(tokenHash) != sha256.Size {
+		return nil, false
+	}
+	var hash [32]byte
+	copy(hash[:], tokenHash)
+
+	return &Session{
+		ID:         rec.ID,
+		AgentID:    rec.AgentID,
+		Label:      rec.Label,
+		Browser:    rec.Browser,
+		TokenHash:  hash,
+		CreatedAt:  rec.CreatedAt,
+		LastSeenAt: rec.LastSeenAt,
+		ExpiresAt:  rec.ExpiresAt,
+		Status:     rec.Status,
+		Grants:     append([]string(nil), rec.Grants...),
+	}, true
 }
 
 func (s *Store) loadPersisted() {
@@ -419,24 +660,9 @@ func (s *Store) loadPersisted() {
 
 	now := s.now()
 	for _, rec := range persisted.Sessions {
-		tokenHash, err := hex.DecodeString(strings.TrimSpace(rec.TokenHash))
-		if err != nil || len(tokenHash) != sha256.Size {
+		sess, ok := rec.toSession()
+		if !ok {
 			continue
-		}
-		var hash [32]byte
-		copy(hash[:], tokenHash)
-
-		sess := &Session{
-			ID:          rec.ID,
-			AgentID:     rec.AgentID,
-			Label:       rec.Label,
-			TokenHash:   hash,
-			CreatedAt:   rec.CreatedAt,
-			LastSeenAt:  rec.LastSeenAt,
-			ExpiresAt:   rec.ExpiresAt,
-			IdleTimeout: s.cfg.IdleTimeout,
-			Status:      rec.Status,
-			Grants:      rec.Grants,
 		}
 		if sess.Status != StatusActive {
 			continue
@@ -445,61 +671,90 @@ func (s *Store) loadPersisted() {
 			continue
 		}
 		s.sessions[sess.ID] = sess
+		s.byTokenHash[sess.TokenHash] = sess
 	}
 }
 
-func (s *Store) saveLocked() {
-	if s.cfg.PersistPath == "" {
-		return
-	}
+// snapshotJob is a self-contained persistence snapshot stamped with a sequence,
+// built under s.mu and written outside it.
+type snapshotJob struct {
+	snapshot persistedStore
+	seq      uint64
+	path     string
+}
 
+// snapshotLocked builds a self-contained value-copy snapshot of every session
+// and stamps it with a monotonic sequence. Caller must hold s.mu. ok=false when
+// persistence is disabled (no PersistPath), in which case there is nothing to write.
+func (s *Store) snapshotLocked() (snapshotJob, bool) {
+	if s.cfg.PersistPath == "" {
+		return snapshotJob{}, false
+	}
+	s.saveSeq++
 	snapshot := persistedStore{
 		SavedAt:  s.now().UTC(),
 		Sessions: make([]persistedSession, 0, len(s.sessions)),
 	}
 	for _, sess := range s.sessions {
-		snapshot.Sessions = append(snapshot.Sessions, persistedSession{
-			ID:         sess.ID,
-			AgentID:    sess.AgentID,
-			Label:      sess.Label,
-			TokenHash:  hex.EncodeToString(sess.TokenHash[:]),
-			CreatedAt:  sess.CreatedAt,
-			LastSeenAt: sess.LastSeenAt,
-			ExpiresAt:  sess.ExpiresAt,
-			Status:     sess.Status,
-			Grants:     sess.Grants,
-		})
+		snapshot.Sessions = append(snapshot.Sessions, sess.toPersisted())
 	}
+	return snapshotJob{snapshot: snapshot, seq: s.saveSeq, path: s.cfg.PersistPath}, true
+}
 
-	data, err := json.MarshalIndent(snapshot, "", "  ")
+// maybeSnapshotTouchLocked builds a snapshot for a LastSeen-only update at most
+// once per touchPersistInterval. Caller must hold s.mu; the resulting write
+// happens after the lock is released. The next real mutation's snapshot
+// opportunistically flushes any debounced LastSeen for all sessions.
+func (s *Store) maybeSnapshotTouchLocked(now time.Time) (snapshotJob, bool) {
+	if now.Sub(s.lastTouchSave) < touchPersistInterval {
+		return snapshotJob{}, false
+	}
+	s.lastTouchSave = now
+	return s.snapshotLocked()
+}
+
+// writeSnapshot marshals and atomically writes a snapshot outside s.mu. Writers
+// serialize on saveMu; a snapshot older than one already written is skipped so a
+// stale snapshot can never clobber a fresher one.
+func (s *Store) writeSnapshot(job snapshotJob) {
+	if job.path == "" {
+		return
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if job.seq <= s.writtenSeq {
+		return
+	}
+	s.writtenSeq = job.seq
+
+	data, err := json.MarshalIndent(job.snapshot, "", "  ")
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(s.cfg.PersistPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(job.path), 0755); err != nil {
 		return
 	}
-	// Atomic write: temp file + rename
-	tmpPath := s.cfg.PersistPath + ".tmp"
+	tmpPath := job.path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
 		return
 	}
-	_ = os.Rename(tmpPath, s.cfg.PersistPath)
+	_ = os.Rename(tmpPath, job.path)
 }
 
 func generateSessionID() (string, error) {
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return "ses_" + hex.EncodeToString(buf), nil
+	return generatePrefixedHex(idRandomBytes)
 }
 
 func generateToken() (string, error) {
-	buf := make([]byte, 24)
+	return generatePrefixedHex(tokenRandomBytes)
+}
+
+func generatePrefixedHex(size int) (string, error) {
+	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return "ses_" + hex.EncodeToString(buf), nil
+	return IDPrefix + hex.EncodeToString(buf), nil
 }
 
 func hashToken(token string) [32]byte {

@@ -20,9 +20,6 @@ curl -X POST http://localhost:9867/profiles/<ID>/start
 curl -X POST http://localhost:9867/profiles/<ID>/start \
   -H 'Content-Type: application/json' \
   -d '{"port": "9868", "headless": true}'
-
-# Short alias
-curl -X POST http://localhost:9867/start/<ID>
 ```
 
 Returns instance info including allocated `port`. Use that port for all subsequent API calls.
@@ -31,9 +28,6 @@ Returns instance info including allocated `port`. Use that port for all subseque
 
 ```bash
 curl -X POST http://localhost:9867/profiles/<ID>/stop
-
-# Short alias
-curl -X POST http://localhost:9867/stop/<ID>
 ```
 
 ## Check instance status
@@ -60,11 +54,24 @@ curl -X POST http://localhost:9867/instances/start \
 
 ## CLI usage with profiles
 
-The CLI doesn't have profile subcommands yet — use `curl` for profile management.
-Once a profile instance is running, point the CLI at it using the `--server` flag:
+CLI subcommands are available — use these instead of `curl` when possible:
 
 ```bash
-# Get the instance port, then use CLI
+pinchtab profiles                                   # list profiles
+pinchtab profiles create <name>                     # human setup: create before authentication
+pinchtab instance start --profile <name>            # start (auto-allocates port)
+pinchtab instance navigate <id> <url>               # open a tab already on <url> (one step)
+pinchtab instance stop <id>
+pinchtab instance restart <id>
+pinchtab instance logs <id>
+```
+
+Creating a profile only creates an empty browser state. A human must start it headed and
+authenticate before an agent can reuse that session.
+
+Once a profile instance is running, the server routes to the instance that owns the tab (or the first running one); you can also target it explicitly:
+
+```bash
 pinchtab --server http://localhost:9868 snap -i
 ```
 
@@ -89,23 +96,23 @@ curl -s -X POST http://localhost:9867/profiles/$PROFILE_ID/stop
 
 ## Profile IDs
 
-Each profile gets a stable 12-char hex ID (SHA-256 of name, truncated) stored in `profile.json`. IDs are URL-safe and never change — use them instead of names in automation.
+Each profile gets a stable ID of the form `prof_XXXXXXXX` (`prof_` + the first 8 hex chars of SHA-256 of the name) stored in `profile.json`. IDs are URL-safe and never change — use them instead of names in automation.
 
 ## Headed mode
 
 Headed mode = real visible Chrome window managed by Pinchtab.
 
-- Human can log in, pass 2FA/captcha, validate state
+- Human completes sign-in and any verification step, then validates state
 - Agent calls HTTP APIs against the same running instance
 - Session state persists in profile directory (cookies/storage carry over)
 
 Recommended human + agent flow:
 
 ```bash
-# Human starts PinchTab and sets up profile
-pinchtab
+# Human starts the PinchTab server and sets up the profile
+pinchtab server
 
-# Agent resolves the profile endpoint
-PINCHTAB_BASE_URL="$(pinchtab connect <profile-name>)"
-curl "$PINCHTAB_BASE_URL/health"
+# Agent resolves the profile's running instance
+PORT=$(curl -s http://localhost:9867/profiles/<profile-name>/instance | jq -r .port)
+curl "http://localhost:$PORT/health"
 ```

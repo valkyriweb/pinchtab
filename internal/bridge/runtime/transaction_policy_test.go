@@ -333,7 +333,7 @@ func TestPrepareTransactionPolicyExtensionIsPrivateAndGeneratedOnly(t *testing.T
 	if err := os.Chmod(stateDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.RuntimeConfig{StateDir: stateDir, ChromeBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
+	cfg := &config.RuntimeConfig{StateDir: stateDir, BrowserBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
 	launch, err := PrepareTransactionPolicyExtension(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -372,7 +372,7 @@ func TestPrepareTransactionPolicyExtensionIsPrivateAndGeneratedOnly(t *testing.T
 }
 
 func TestPrepareTransactionPolicyExtensionRejectsExtensionsAndUnsafeState(t *testing.T) {
-	cfg := &config.RuntimeConfig{StateDir: t.TempDir(), ChromeBinary: "/usr/bin/chromium", ExtensionPaths: []string{"/operator-extension"}, TransactionPolicy: testTransactionPolicy()}
+	cfg := &config.RuntimeConfig{StateDir: t.TempDir(), BrowserBinary: "/usr/bin/chromium", ExtensionPaths: []string{"/operator-extension"}, TransactionPolicy: testTransactionPolicy()}
 	if _, err := PrepareTransactionPolicyExtension(cfg); err == nil {
 		t.Fatal("operator extension accepted in policy mode")
 	}
@@ -381,7 +381,7 @@ func TestPrepareTransactionPolicyExtensionRejectsExtensionsAndUnsafeState(t *tes
 	if err := os.Symlink(state, link); err != nil {
 		t.Fatal(err)
 	}
-	cfg = &config.RuntimeConfig{StateDir: link, ChromeBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
+	cfg = &config.RuntimeConfig{StateDir: link, BrowserBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
 	if _, err := PrepareTransactionPolicyExtension(cfg); err == nil {
 		t.Fatal("symlink StateDir accepted")
 	}
@@ -389,7 +389,7 @@ func TestPrepareTransactionPolicyExtensionRejectsExtensionsAndUnsafeState(t *tes
 	if err := os.Symlink(t.TempDir(), filepath.Join(state, transactionPolicyStateRoot)); err != nil {
 		t.Fatal(err)
 	}
-	cfg = &config.RuntimeConfig{StateDir: state, ChromeBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
+	cfg = &config.RuntimeConfig{StateDir: state, BrowserBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
 	if _, err := PrepareTransactionPolicyExtension(cfg); err == nil {
 		t.Fatal("symlink policy root accepted")
 	}
@@ -397,7 +397,7 @@ func TestPrepareTransactionPolicyExtensionRejectsExtensionsAndUnsafeState(t *tes
 
 func TestTransactionPolicyGenerationsAreDeterministicAndBounded(t *testing.T) {
 	state := t.TempDir()
-	cfg := &config.RuntimeConfig{StateDir: state, ChromeBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
+	cfg := &config.RuntimeConfig{StateDir: state, BrowserBinary: "/usr/bin/chromium", TransactionPolicy: testTransactionPolicy()}
 	first, err := PrepareTransactionPolicyExtension(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -446,21 +446,21 @@ func TestValidateTransactionPolicyLaunchRejectsSpoofedPathAndFallback(t *testing
 	if err := validateTransactionPolicyLaunch(cfg); err == nil {
 		t.Fatal("missing binary accepted")
 	}
-	cfg.ChromeBinary = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+	cfg.BrowserBinary = "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
 	cfg.ExtensionPaths = []string{filepath.Join(cfg.StateDir, "transaction-policy-extension-spoof")}
 	if err := validateTransactionPolicyLaunch(cfg); err == nil || strings.Contains(err.Error(), "Google Chrome Stable") {
 		t.Fatalf("Chrome for Testing was classified as Stable: %v", err)
 	}
-	cfg.ChromeBinary = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+	cfg.BrowserBinary = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 	if err := validateTransactionPolicyLaunch(cfg); err == nil || !strings.Contains(err.Error(), "Google Chrome Stable") {
 		t.Fatalf("Google Chrome Stable was accepted or misclassified: %v", err)
 	}
-	cfg.ChromeBinary = "/usr/bin/chromium"
+	cfg.BrowserBinary = "/usr/bin/chromium"
 	cfg.ExtensionPaths = []string{filepath.Join(cfg.StateDir, "transaction-policy-extension-spoof")}
 	if err := validateTransactionPolicyLaunch(cfg); err == nil {
 		t.Fatal("spoofed generated path accepted")
 	}
-	if _, _, _, err := startChromeWithRemoteAllocator(t.Context(), cfg, nil, 9222, ""); err == nil {
+	if _, _, _, err := startBrowserWithRemoteAllocator(t.Context(), cfg, nil, 9222, "", launchGeoAlignment{}); err == nil {
 		t.Fatal("direct fallback bypassed validation")
 	}
 }

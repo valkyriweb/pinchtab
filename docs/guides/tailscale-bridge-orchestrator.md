@@ -1,4 +1,4 @@
-# A Tailscale Bridge Story: One Orchestrator, Remote Browsers
+# One Orchestrator, Remote Browsers
 
 There is a simple distributed PinchTab shape that turns out to be very practical:
 
@@ -9,8 +9,6 @@ There is a simple distributed PinchTab shape that turns out to be very practical
 - browser work actually happens on machine B
 
 That gives you one control plane and multiple places where browser execution can live.
-
-![Placeholder diagram for a Tailscale-connected orchestrator and remote bridge](../media/tailscale-bridge-topology-placeholder.svg)
 
 ```mermaid
 flowchart LR

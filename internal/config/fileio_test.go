@@ -24,6 +24,10 @@ func TestLoadAndSaveFileConfig(t *testing.T) {
 
 	// Modify
 	fc.Server.Port = "8080"
+	retainBodies := true
+	retainBytes := 262144
+	fc.Server.RetainNetworkBodies = &retainBodies
+	fc.Server.RetainNetworkBodyMaxBytes = &retainBytes
 	fc.InstanceDefaults.StealthLevel = "full"
 
 	// Save
@@ -39,6 +43,12 @@ func TestLoadAndSaveFileConfig(t *testing.T) {
 
 	if fc2.Server.Port != "8080" {
 		t.Errorf("loaded port = %v, want 8080", fc2.Server.Port)
+	}
+	if fc2.Server.RetainNetworkBodies == nil || !*fc2.Server.RetainNetworkBodies {
+		t.Errorf("loaded retainNetworkBodies = %v, want true", fc2.Server.RetainNetworkBodies)
+	}
+	if fc2.Server.RetainNetworkBodyMaxBytes == nil || *fc2.Server.RetainNetworkBodyMaxBytes != 262144 {
+		t.Errorf("loaded retainNetworkBodyMaxBytes = %v, want 262144", fc2.Server.RetainNetworkBodyMaxBytes)
 	}
 	if fc2.InstanceDefaults.StealthLevel != "full" {
 		t.Errorf("loaded stealthLevel = %v, want full", fc2.InstanceDefaults.StealthLevel)

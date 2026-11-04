@@ -1,41 +1,47 @@
 package config
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/pinchtab/pinchtab/internal/session"
+)
 
 const defaultPort = "9867"
 
 // RuntimeConfig holds all runtime settings used throughout the application.
 // This is the single source of truth for configuration at runtime.
 type RuntimeConfig struct {
-	// Server settings
 	Bind              string
 	Port              string
 	InstancePortStart int // Starting port for instances (default 9868)
 	InstancePortEnd   int // Ending port for instances (default 9968)
 	Token             string
 	StateDir          string
-	TrustProxyHeaders bool  // Only trust X-Forwarded-*/Forwarded headers when behind a trusted reverse proxy
-	CookieSecure      *bool // Nil = auto-detect based on request scheme/host for backward compatibility
-	VerboseStartup    bool  // Show full banner and slog output on server start
+	TrustProxyHeaders bool   // Only trust X-Forwarded-*/Forwarded headers when behind a trusted reverse proxy
+	CookieSecure      *bool  // Nil = auto-detect based on request scheme/host for backward compatibility
+	VerboseBanner     bool   // Show the full startup banner and security warnings
+	LogLevel          string // Minimum log level: debug, info (default), warn or error
 	BackgroundMarker  string
 
-	// Security settings
 	AllowEvaluate         bool
 	AllowMacro            bool
 	AllowScreencast       bool
 	AllowDownload         bool
 	AllowCookies          bool
 	AllowNetworkIntercept bool
+	AllowMemory           bool
+	AllowFileScheme       bool
 	// AllowedDomains is the unified per-instance allowlist sourced from
 	// security.allowedDomains in the file config.
 	AllowedDomains         []string
 	DownloadAllowedDomains []string
 	DownloadMaxBytes       int
+	MemorySnapshotMaxBytes int
 	AllowUpload            bool
 	AllowClipboard         bool
 	AllowStateExport       bool
 	StateEncryptionKey     string // Key for encrypting state files (AES-256-GCM)
-	EnableActionGuards     bool   // Enable bridge-level stale/navigation guard checks around actions
 	UploadMaxRequestBytes  int
 	UploadMaxFiles         int
 	UploadMaxFileBytes     int
@@ -46,24 +52,25 @@ type RuntimeConfig struct {
 	TrustLoopbackProxy     bool     // when true, navigation responses with a loopback RemoteIPAddress (e.g. system HTTP/SOCKS proxy on 127.0.0.1) are not blocked; default false
 	TransactionPolicy      TransactionPolicyConfig
 
-	// Browser/instance settings
 	Headless            bool
 	HeadlessSet         bool // true when explicitly set via config or flag
-	DisableInProcessGPU bool // runtime-only: set after a GPU crash to avoid repeating the failure
+	DisableInProcessGPU bool // runtime-only: kill switch for --in-process-gpu when a user opted in via browser.extraFlags and the browser then crashed
 	NoRestore           bool
 	ProfileDir          string
 	ProfilesBaseDir     string
 	DefaultProfile      string
-	ChromeVersion       string
-	Timezone            string
-	BlockImages         bool
-	BlockMedia          bool
-	BlockAds            bool
-	MaxTabs             int
-	MaxParallelTabs     int // 0 = auto-detect from runtime.NumCPU
-	ChromeBinary        string
-	ChromeDebugPort     int
-	ChromeExtraFlags    string
+	// ProfileQuarantineKeep bounds quarantined copies of one profile; 0 keeps all.
+	ProfileQuarantineKeep int
+	BrowserVersion        string
+	Timezone              string
+	BlockImages           bool
+	BlockMedia            bool
+	BlockAds              bool
+	MaxTabs               int
+	MaxParallelTabs       int // 0 = auto-detect from runtime.NumCPU
+	BrowserBinary         string
+	BrowserDebugPort      int
+	BrowserExtraFlags     string
 	// CDPAttachURL: when set, the bridge skips launching its own Chrome and
 	// connects to an already-running Chrome whose browser-level CDP
 	// WebSocket URL is provided here (e.g.
@@ -71,18 +78,37 @@ type RuntimeConfig struct {
 	// agent to drive the user's actual Chrome (extensions, profile, signed-in
 	// state) rather than a fresh isolated profile. Cleanup never kills the
 	// external Chrome — pinchtab only owns the CDP connection.
-	CDPAttachURL       string
+	CDPAttachURL      string
+	Cloak             CloakBrowserRuntimeConfig
+	Proxy             BrowserProxyConfig
+	DefaultBrowser    string
+	BrowsersAvailable []string
+	Targets           BrowserTargetsConfig
+	DefaultTarget     string
+	FallbackOrder     []string
+	// TargetsSynthesized marks Targets as auto-migrated from legacy
+	// browser.binary/cloak/proxy fields rather than user-authored; only
+	// synthesized targets may be rewritten by provider reconciliation on
+	// serialization. Load-time bookkeeping, never serialized.
+	TargetsSynthesized bool
 	ExtensionPaths     []string
 	UserAgent          string
 	NoAnimations       bool
-	Humanize           bool // when true, mouse moves and clicks use a humanized bezier path with per-step jitter and pre-press delays; default false (raw, fast input)
-	StealthLevel       string
-	TabEvictionPolicy  string        // "close_lru" (default), "reject", "close_oldest" — fires on MaxTabs pressure
-	TabLifecyclePolicy string        // "keep" (default), "close_idle" — fires on idle after read/action
-	TabCloseDelay      time.Duration // applies when TabLifecyclePolicy == "close_idle" (default 5m when enabled)
-	TabRestore         bool          // restore previously open tabs from sessions.json on startup (default false)
+	// CaptureAllowActivation controls whether GET /capture and GET/POST /screenshot
+	// may call Page.bringToFront to wake a backgrounded tab's compositor before
+	// capturing. Default true: capture is reliable but a background-tab capture
+	// visibly raises that tab in the operator's browser. Set false to keep
+	// background tabs from ever being activated during capture, accepting that
+	// a background tab's capture may then block until ActionTimeout — Chromium's
+	// focus emulation alone does not resume a backgrounded compositor.
+	CaptureAllowActivation bool
+	Humanize               bool // when true, mouse moves and clicks use a humanized bezier path with per-step jitter and pre-press delays; default false (raw, fast input)
+	StealthLevel           string
+	TabEvictionPolicy      string        // "close_lru" (default), "reject", "close_oldest" — fires on MaxTabs pressure
+	TabLifecyclePolicy     string        // "keep" (default), "close_idle", "freeze_idle" — fires on idle after read/action
+	TabCloseDelay          time.Duration // applies when TabLifecyclePolicy is close_idle or freeze_idle (default 5m when enabled)
+	TabRestore             bool          // restore previously open tabs from sessions.json on startup (default false)
 
-	// Timeout settings
 	ActionTimeout   time.Duration
 	NavigateTimeout time.Duration
 	ShutdownTimeout time.Duration
@@ -96,21 +122,19 @@ type RuntimeConfig struct {
 	RestartMaxBackoff  time.Duration // Maximum restart backoff cap (0 = strategy default)
 	RestartStableAfter time.Duration // Stable runtime window that resets the restart counter (0 = strategy default)
 
-	// Attach settings
-	AttachEnabled      bool
-	AttachAllowHosts   []string
-	AttachAllowSchemes []string
+	AttachEnabled          bool
+	AttachAllowHosts       []string
+	AttachAllowSchemes     []string
+	AttachForwardProxyAuth bool
 
-	// IDPI (Indirect Prompt Injection defense) settings
+	// RemoteCDPURL: when set, bridge attaches to an external browser via CDP instead of launching Chrome. Not persisted.
+	RemoteCDPURL      string
+	RemoteBrowserName string
+
 	IDPI IDPIConfig
 
-	// Dialog settings
 	DialogAutoAccept bool
 
-	// Engine mode: "chrome" (default), "lite", or "auto"
-	Engine string
-
-	// Network monitoring
 	NetworkBufferSize         int  // Per-tab network buffer size (default 100)
 	RetainNetworkBodies       bool // When true, opportunistically retain response bodies in the per-tab network buffer
 	RetainNetworkBodyMaxBytes int  // Max retained response-body bytes per entry when RetainNetworkBodies is enabled
@@ -118,13 +142,10 @@ type RuntimeConfig struct {
 	// Scheduler settings (dashboard mode only)
 	Scheduler SchedulerConfig
 
-	// Observability settings
 	Observability ObservabilityConfig
 
-	// Session settings
 	Sessions SessionsRuntimeConfig
 
-	// AutoSolver settings
 	AutoSolver AutoSolverConfig
 }
 
@@ -169,8 +190,6 @@ type TransactionPolicyRule struct {
 	QueryValue  string `json:"queryValue,omitempty"`
 }
 
-// IDPIConfig holds the configuration for the Indirect Prompt Injection (IDPI)
-// defense layer.
 type IDPIConfig struct {
 	Enabled        bool     `json:"enabled,omitempty"`
 	StrictMode     bool     `json:"strictMode,omitempty"`
@@ -194,6 +213,7 @@ type SchedulerConfig struct {
 	MaxPerAgentFlight int    `json:"maxPerAgentInflight,omitempty"`
 	ResultTTLSec      int    `json:"resultTTLSec,omitempty"`
 	WorkerCount       int    `json:"workerCount,omitempty"`
+	MaxBatchSize      int    `json:"maxBatchSize,omitempty"`
 }
 
 // AutoSolverConfig holds autosolver runtime settings.
@@ -277,13 +297,17 @@ type FileConfig struct {
 	Observability    ObservabilityFileConfig `json:"observability,omitempty"`
 	Sessions         SessionsFileConfig      `json:"sessions,omitempty"`
 	AutoSolver       AutoSolverFileConfig    `json:"autoSolver,omitempty"`
+	Browsers         BrowsersConfig          `json:"browsers,omitempty"`
 }
 
 type ServerConfig struct {
-	Port                      string `json:"port,omitempty"`
-	Bind                      string `json:"bind,omitempty"`
-	Token                     string `json:"token,omitempty"`
-	StateDir                  string `json:"stateDir,omitempty"`
+	Port     string `json:"port,omitempty"`
+	Bind     string `json:"bind,omitempty"`
+	Token    string `json:"token,omitempty"`
+	StateDir string `json:"stateDir,omitempty"`
+	LogLevel string `json:"logLevel,omitempty"`
+	// Engine is no longer supported. Kept for JSON parsing so old configs get a
+	// validation error instead of silently ignoring the field.
 	Engine                    string `json:"engine,omitempty"`
 	NetworkBufferSize         *int   `json:"networkBufferSize,omitempty"`
 	RetainNetworkBodies       *bool  `json:"retainNetworkBodies,omitempty"`
@@ -295,6 +319,26 @@ type ServerConfig struct {
 type SessionsFileConfig struct {
 	Dashboard DashboardSessionFileConfig `json:"dashboard,omitempty"`
 	Agent     AgentSessionFileConfig     `json:"agent,omitempty"`
+}
+
+// DefaultAgentSessionsEnabled is the effective value of sessions.agent.enabled
+// when the file leaves the key out.
+const DefaultAgentSessionsEnabled = true
+
+// AgentEnabled is the file-config twin of session.Store.Enabled: whether this
+// config leaves agent sessions serving. It resolves an absent enabled key against
+// the default, so a comparison of two file configs never reads absence as
+// disabled, and it honours mode — mode "off" disables the family exactly as
+// enabled false does, so a restart-reason comparison built on this cannot miss
+// the transition through the other field.
+func (s SessionsFileConfig) AgentEnabled() bool {
+	if !session.ModeServes(s.Agent.Mode) {
+		return false
+	}
+	if s.Agent.Enabled == nil {
+		return DefaultAgentSessionsEnabled
+	}
+	return *s.Agent.Enabled
 }
 
 type AgentSessionFileConfig struct {
@@ -314,44 +358,120 @@ type DashboardSessionFileConfig struct {
 }
 
 type BrowserConfig struct {
-	ChromeVersion    string   `json:"version,omitempty"`
-	ChromeBinary     string   `json:"binary,omitempty"`
-	ChromeDebugPort  *int     `json:"remoteDebuggingPort,omitempty"`
-	ChromeExtraFlags string   `json:"extraFlags,omitempty"`
-	ExtensionPaths   []string `json:"extensionPaths,omitempty"`
+	// Removed: presence triggers a validation error. Keep for JSON backward compat.
+	Provider          string             `json:"provider,omitempty"`
+	BrowserVersion    string             `json:"version,omitempty"`
+	BrowserBinary     string             `json:"binary,omitempty"`
+	BrowserDebugPort  *int               `json:"remoteDebuggingPort,omitempty"`
+	BrowserExtraFlags string             `json:"extraFlags,omitempty"`
+	Cloak             CloakBrowserConfig `json:"cloak,omitempty"`
+	ExtensionPaths    []string           `json:"extensionPaths,omitempty"`
+
+	Proxy BrowserProxyConfig `json:"proxy,omitempty"`
+
+	DefaultTarget string               `json:"defaultTarget,omitempty"`
+	FallbackOrder []string             `json:"fallbackOrder,omitempty"`
+	Targets       BrowserTargetsConfig `json:"targets,omitempty"`
+}
+
+// BrowserTargetsConfig maps target name -> target config. Names must match `^[a-z][a-z0-9-]{0,31}$`.
+type BrowserTargetsConfig map[string]BrowserTargetConfig
+
+// BrowserTargetConfig is a single named browser target. See docs/architecture/browser-abstraction.md.
+type BrowserTargetConfig struct {
+	Provider   string             `json:"provider,omitempty"`
+	Binary     string             `json:"binary,omitempty"`
+	ExtraFlags string             `json:"extraFlags,omitempty"`
+	Cloak      CloakBrowserConfig `json:"cloak,omitempty"`
+	// Proxy, when Server is non-empty, replaces the global BrowserConfig.Proxy entirely (no merge).
+	Proxy BrowserProxyConfig `json:"proxy,omitempty"`
+}
+
+type CloakBrowserConfig struct {
+	FingerprintSeed           string `json:"fingerprintSeed,omitempty"`
+	Platform                  string `json:"platform,omitempty"`
+	Locale                    string `json:"locale,omitempty"`
+	Timezone                  string `json:"timezone,omitempty"`
+	WebRTCIP                  string `json:"webrtcIP,omitempty"`
+	FontsDir                  string `json:"fontsDir,omitempty"`
+	StorageQuotaMB            *int   `json:"storageQuotaMB,omitempty"`
+	DisableDefaultStealthArgs *bool  `json:"disableDefaultStealthArgs,omitempty"`
+}
+
+type CloakBrowserRuntimeConfig struct {
+	FingerprintSeed           string
+	Platform                  string
+	Locale                    string
+	Timezone                  string
+	WebRTCIP                  string
+	FontsDir                  string
+	StorageQuotaMB            int
+	DisableDefaultStealthArgs bool
+}
+
+// BrowsersConfig is the Phase 1 top-level browsers block that declares
+// available browser providers and per-browser configuration overrides.
+type BrowsersConfig struct {
+	Default   string                       `json:"default,omitempty"`
+	Available []string                     `json:"available,omitempty"`
+	Config    map[string]BrowserItemConfig `json:"config,omitempty"`
+}
+
+// BrowserItemConfig holds the retired browsers.config per-browser overrides.
+// The block was never applied anywhere and is superseded by browser.targets;
+// it is parsed only so validation can reject it with guidance and so existing
+// files round-trip byte-for-byte.
+type BrowserItemConfig struct {
+	Binary     string             `json:"binary,omitempty"`
+	ExtraFlags string             `json:"extraFlags,omitempty"`
+	Cloak      CloakBrowserConfig `json:"cloak,omitempty"`
+	Proxy      BrowserProxyConfig `json:"proxy,omitempty"`
 }
 
 type InstanceDefaultsConfig struct {
-	Mode              string             `json:"mode,omitempty"`
-	Headless          *bool              `json:"headless,omitempty"`
-	NoRestore         *bool              `json:"noRestore,omitempty"`
-	Timezone          string             `json:"timezone,omitempty"`
-	BlockImages       *bool              `json:"blockImages,omitempty"`
-	BlockMedia        *bool              `json:"blockMedia,omitempty"`
-	BlockAds          *bool              `json:"blockAds,omitempty"`
-	MaxTabs           *int               `json:"maxTabs,omitempty"`
-	MaxParallelTabs   *int               `json:"maxParallelTabs,omitempty"`
-	UserAgent         string             `json:"userAgent,omitempty"`
-	NoAnimations      *bool              `json:"noAnimations,omitempty"`
-	Humanize          *bool              `json:"humanize,omitempty"`
-	StealthLevel      string             `json:"stealthLevel,omitempty"`
-	TabEvictionPolicy string             `json:"tabEvictionPolicy,omitempty"` // Deprecated: use TabPolicy.Eviction
-	TabPolicy         *TabPolicyDefaults `json:"tabPolicy,omitempty"`
-	DialogAutoAccept  *bool              `json:"dialogAutoAccept,omitempty"`
+	Mode                   string             `json:"mode,omitempty"`
+	Headless               *bool              `json:"headless,omitempty"`
+	NoRestore              *bool              `json:"noRestore,omitempty"`
+	Timezone               string             `json:"timezone,omitempty"`
+	BlockImages            *bool              `json:"blockImages,omitempty"`
+	BlockMedia             *bool              `json:"blockMedia,omitempty"`
+	BlockAds               *bool              `json:"blockAds,omitempty"`
+	MaxTabs                *int               `json:"maxTabs,omitempty"`
+	MaxParallelTabs        *int               `json:"maxParallelTabs,omitempty"`
+	UserAgent              string             `json:"userAgent,omitempty"`
+	NoAnimations           *bool              `json:"noAnimations,omitempty"`
+	CaptureAllowActivation *bool              `json:"captureAllowActivation,omitempty"`
+	Humanize               *bool              `json:"humanize,omitempty"`
+	StealthLevel           string             `json:"stealthLevel,omitempty"`
+	TabEvictionPolicy      string             `json:"tabEvictionPolicy,omitempty"` // Deprecated: use TabPolicy.Eviction
+	TabPolicy              *TabPolicyDefaults `json:"tabPolicy,omitempty"`
+	DialogAutoAccept       *bool              `json:"dialogAutoAccept,omitempty"`
 }
 
 // TabPolicyDefaults groups eviction (cap pressure) and lifecycle (idle) policies
 // in instance-defaults configs. Either sub-field may be omitted.
 type TabPolicyDefaults struct {
 	Eviction      string `json:"eviction,omitempty"`      // "close_lru" | "reject" | "close_oldest"
-	Lifecycle     string `json:"lifecycle,omitempty"`     // "keep" | "close_idle"
-	CloseDelaySec *int   `json:"closeDelaySec,omitempty"` // applies to close_idle; default 300 when enabled
+	Lifecycle     string `json:"lifecycle,omitempty"`     // "keep" | "close_idle" | "freeze_idle"
+	CloseDelaySec *int   `json:"closeDelaySec,omitempty"` // applies to close_idle and freeze_idle; default 300 when enabled
 	Restore       *bool  `json:"restore,omitempty"`       // restore tabs from sessions.json on startup; default false
 }
+
+// DefaultProfileQuarantineKeep is how many quarantined copies of one profile PinchTab
+// keeps when a new quarantine is created. One keeps the freshest forensic artefact —
+// the only reason to keep any, since nothing in the product reads them — while
+// bounding growth. Zero in the config means keep every one.
+const DefaultProfileQuarantineKeep = 1
 
 type ProfilesConfig struct {
 	BaseDir        string `json:"baseDir,omitempty"`
 	DefaultProfile string `json:"defaultProfile,omitempty"`
+
+	// QuarantineKeep is how many quarantined copies of one profile survive when a new
+	// quarantine is created, newest first. A pointer because 0 is a real value here —
+	// it means keep every one, the behaviour before this was bounded — so absent must
+	// not read as 0.
+	QuarantineKeep *int `json:"quarantineKeep,omitempty"`
 }
 
 type SecurityConfig struct {
@@ -361,14 +481,16 @@ type SecurityConfig struct {
 	AllowDownload          *bool                   `json:"allowDownload,omitempty"`
 	AllowCookies           *bool                   `json:"allowCookies,omitempty"`
 	AllowNetworkIntercept  *bool                   `json:"allowNetworkIntercept,omitempty"`
+	AllowMemory            *bool                   `json:"allowMemory,omitempty"`
+	AllowFileScheme        *bool                   `json:"allowFileScheme,omitempty"`
 	AllowedDomains         []string                `json:"allowedDomains,omitempty"`
 	DownloadAllowedDomains []string                `json:"downloadAllowedDomains,omitempty"`
 	DownloadMaxBytes       *int                    `json:"downloadMaxBytes,omitempty"`
+	MemorySnapshotMaxBytes *int                    `json:"memorySnapshotMaxBytes,omitempty"`
 	AllowUpload            *bool                   `json:"allowUpload,omitempty"`
 	AllowClipboard         *bool                   `json:"allowClipboard,omitempty"`
 	AllowStateExport       *bool                   `json:"allowStateExport,omitempty"`
 	StateEncryptionKey     *string                 `json:"stateEncryptionKey,omitempty"`
-	EnableActionGuards     *bool                   `json:"enableActionGuards,omitempty"`
 	UploadMaxRequestBytes  *int                    `json:"uploadMaxRequestBytes,omitempty"`
 	UploadMaxFiles         *int                    `json:"uploadMaxFiles,omitempty"`
 	UploadMaxFileBytes     *int                    `json:"uploadMaxFileBytes,omitempty"`
@@ -378,8 +500,30 @@ type SecurityConfig struct {
 	TrustedResolveCIDRs    []string                `json:"trustedResolveCIDRs,omitempty"`
 	TrustLoopbackProxy     *bool                   `json:"trustLoopbackProxy,omitempty"`
 	Attach                 AttachConfig            `json:"attach,omitempty"`
-	IDPI                   IDPIConfig              `json:"idpi,omitempty"`
+	IDPI                   *IDPIConfig             `json:"idpi,omitempty"`
 	TransactionPolicy      TransactionPolicyConfig `json:"transactionPolicy,omitempty"`
+}
+
+func (s *SecurityConfig) ensureIDPI() *IDPIConfig {
+	if s.IDPI == nil {
+		s.IDPI = &IDPIConfig{}
+	}
+	return s.IDPI
+}
+
+func (s SecurityConfig) EffectiveIDPI() IDPIConfig {
+	if s.IDPI == nil {
+		return IDPIConfig{}
+	}
+	return *s.IDPI
+}
+
+func (s SecurityConfig) MarshalJSON() ([]byte, error) {
+	type tagged SecurityConfig
+	return json.Marshal(struct {
+		tagged
+		IDPI IDPIConfig `json:"idpi"`
+	}{tagged(s), s.EffectiveIDPI()})
 }
 
 type MultiInstanceConfig struct {
@@ -399,9 +543,10 @@ type MultiInstanceRestartConfig struct {
 }
 
 type AttachConfig struct {
-	Enabled      *bool    `json:"enabled,omitempty"`
-	AllowHosts   []string `json:"allowHosts,omitempty"`
-	AllowSchemes []string `json:"allowSchemes,omitempty"`
+	Enabled          *bool    `json:"enabled,omitempty"`
+	AllowHosts       []string `json:"allowHosts,omitempty"`
+	AllowSchemes     []string `json:"allowSchemes,omitempty"`
+	ForwardProxyAuth *bool    `json:"forwardProxyAuth,omitempty"`
 }
 
 type TimeoutsConfig struct {
@@ -420,6 +565,7 @@ type SchedulerFileConfig struct {
 	MaxPerAgentFlight *int   `json:"maxPerAgentInflight,omitempty"`
 	ResultTTLSec      *int   `json:"resultTTLSec,omitempty"`
 	WorkerCount       *int   `json:"workerCount,omitempty"`
+	MaxBatchSize      *int   `json:"maxBatchSize,omitempty"`
 }
 
 type ObservabilityFileConfig struct {

@@ -5,6 +5,53 @@ import (
 	"testing"
 )
 
+func TestCaptureEndpointIsShorthandAndTabScoped(t *testing.T) {
+	wantShorthand := "GET /capture"
+	found := false
+	for _, route := range ShorthandRoutes() {
+		if route == wantShorthand {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("ShorthandRoutes() missing %s — proxy mux will 404 until the routes catalog entry is added next to the handlers.RegisterRoutes call", wantShorthand)
+	}
+
+	wantTab := "GET /tabs/{id}/capture"
+	found = false
+	for _, route := range TabScopedRoutes() {
+		if route == wantTab {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("TabScopedRoutes() missing %s — the catalog entry's TabScoped flag was likely flipped to false", wantTab)
+	}
+}
+
+func TestSensitiveNetworkEndpointsRequireInterceptCapability(t *testing.T) {
+	want := map[string]bool{
+		"GET /network/{requestId}": false,
+		"POST /network/clear":      false,
+	}
+	for _, ep := range Core() {
+		if _, ok := want[ep.Route()]; !ok {
+			continue
+		}
+		if ep.Capability != CapNetworkIntercept {
+			t.Errorf("%s capability = %q, want %q", ep.Route(), ep.Capability, CapNetworkIntercept)
+		}
+		want[ep.Route()] = true
+	}
+	for route, found := range want {
+		if !found {
+			t.Errorf("Core() missing %s", route)
+		}
+	}
+}
+
 func TestFrameEndpointsAreShorthandAndTabScoped(t *testing.T) {
 	found := map[string]bool{
 		"GET /frame":  false,
@@ -162,6 +209,48 @@ func TestCapabilityEndpointsGrouping(t *testing.T) {
 			if ep.Capability != cap {
 				t.Errorf("endpoint %s grouped under %s but has capability %s", ep.Route(), cap, ep.Capability)
 			}
+		}
+	}
+}
+
+// TestEveryGatedCapabilityHasMeta ensures no capability can appear in the
+// catalog without centralized gate metadata — the orchestrator and bridge
+// handlers both rely on Meta() to render the disabled response.
+func TestEveryGatedCapabilityHasMeta(t *testing.T) {
+	for cap := range CapabilityEndpoints() {
+		if _, ok := Meta(cap); !ok {
+			t.Errorf("capability %q is used in the catalog but has no Meta()", cap)
+		}
+	}
+	if _, ok := Meta(CapNone); ok {
+		t.Error("CapNone must not have gate metadata")
+	}
+}
+
+// TestCapabilityMetaContract locks the externally-observable gate strings: the
+// disabled error code and config setting are part of the API contract, so this
+// guards against an accidental rename that would break clients string-matching
+// them.
+func TestCapabilityMetaContract(t *testing.T) {
+	want := map[Capability]CapabilityMeta{
+		CapEvaluate:         {CapEvaluate, "evaluate", "security.allowEvaluate", "evaluate_disabled"},
+		CapMacro:            {CapMacro, "macro", "security.allowMacro", "macro_disabled"},
+		CapScreencast:       {CapScreencast, "screencast", "security.allowScreencast", "screencast_disabled"},
+		CapDownload:         {CapDownload, "download", "security.allowDownload", "download_disabled"},
+		CapCookies:          {CapCookies, "cookies", "security.allowCookies", "cookies_disabled"},
+		CapUpload:           {CapUpload, "upload", "security.allowUpload", "upload_disabled"},
+		CapStateExport:      {CapStateExport, "stateExport", "security.allowStateExport", "state_export_disabled"},
+		CapNetworkIntercept: {CapNetworkIntercept, "networkIntercept", "security.allowNetworkIntercept", "network_intercept_disabled"},
+		CapMemory:           {CapMemory, "memory", "security.allowMemory", "memory_disabled"},
+	}
+	for cap, expected := range want {
+		got, ok := Meta(cap)
+		if !ok {
+			t.Errorf("Meta(%q) missing", cap)
+			continue
+		}
+		if got != expected {
+			t.Errorf("Meta(%q) = %+v, want %+v", cap, got, expected)
 		}
 	}
 }

@@ -1,0 +1,259 @@
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pinchtab/pinchtab/internal/bridge"
+	"github.com/pinchtab/pinchtab/internal/config"
+	"github.com/pinchtab/pinchtab/internal/profiles"
+)
+
+// logLaunchBinaryFailure records what the exec actually tried, unredacted. The error
+// the caller gets back crosses the HTTP boundary, where the absolute path is rewritten
+// to [path] — leaving "fork/exec [path]: exec format error", which names no file. The
+// binary's size and mode go with it because the two failures an operator hits here, a
+// truncated install and a foreign-architecture build, are told apart by exactly those:
+// a 0-byte candidate is self-evident, a full-size one is not.
+func logLaunchBinaryFailure(instanceID, profile, binary string, cause error) {
+	attrs := []any{
+		"id", instanceID,
+		"profile", profile,
+		"binary", binary,
+		"err", cause,
+	}
+	if info, statErr := os.Stat(binary); statErr == nil {
+		attrs = append(attrs, "sizeBytes", info.Size(), "mode", info.Mode().String())
+	} else {
+		attrs = append(attrs, "statErr", statErr)
+	}
+	slog.Error("instance launch failed to exec the launch binary", attrs...)
+}
+
+func (o *Orchestrator) Launch(name, port string, headless bool, extensionPaths []string) (*bridge.Instance, error) {
+	opts := LaunchOptions{
+		ExtensionPaths: extensionPaths,
+	}
+	return o.LaunchWithTargetSelection(name, port, headless, "", nil, opts)
+}
+
+func (o *Orchestrator) LaunchWithOptions(name, port string, headless bool, opts LaunchOptions) (*bridge.Instance, error) {
+	if rc := o.cfg(); rc != nil && rc.TransactionPolicy.Enabled && len(opts.ExtensionPaths) > 0 {
+		return nil, fmt.Errorf("request-supplied extensionPaths are not allowed while transaction policy is enabled")
+	}
+	// Validate profile name to prevent path traversal attacks
+	if err := profiles.ValidateProfileName(name); err != nil {
+		return nil, err
+	}
+	reservedPorts := make([]int, 0, 2)
+	defer func() {
+		for _, reserved := range reservedPorts {
+			o.ports().ReleasePort(reserved)
+		}
+	}()
+
+	o.mu.Lock()
+
+	if port == "" || port == "0" {
+		o.mu.Unlock()
+		allocatedPort, err := o.ports().AllocatePort()
+		if err != nil {
+			return nil, fmt.Errorf("failed to allocate port: %w", err)
+		}
+		port = fmt.Sprintf("%d", allocatedPort)
+		reservedPorts = append(reservedPorts, allocatedPort)
+		o.mu.Lock()
+	} else {
+		o.mu.Unlock()
+		portInt, err := parsePortNumber(port)
+		if err != nil {
+			return nil, err
+		}
+		port = strconv.Itoa(portInt)
+		if err := o.ports().ReservePort(portInt); err != nil {
+			return nil, fmt.Errorf("failed to reserve port %s: %w", port, err)
+		}
+		if portInt >= o.ports().start && portInt <= o.ports().end {
+			reservedPorts = append(reservedPorts, portInt)
+		}
+		o.mu.Lock()
+	}
+
+	for _, inst := range o.instances {
+		if inst.Port == port && instanceIsActive(inst) {
+			o.mu.Unlock()
+			return nil, fmt.Errorf("port %s already in use by instance %q", port, inst.ProfileName)
+		}
+		if inst.ProfileName == name && instanceIsActive(inst) {
+			o.mu.Unlock()
+			return nil, fmt.Errorf("profile %q already has an active instance (%s)", name, inst.Status)
+		}
+	}
+	portInspection := o.runner.InspectPort(port)
+	if !portInspection.Available {
+		o.mu.Unlock()
+		err := portConflictError(port, portInspection)
+		slog.Error("instance launch blocked by port conflict", "profile", name, "port", port, "pid", portInspection.PID, "command", portInspection.Command, "error", err.Error())
+		return nil, err
+	}
+
+	profileID := o.idMgr.ProfileID(name)
+	instanceID := o.idMgr.InstanceID(profileID, name)
+
+	if inst, ok := o.instances[instanceID]; ok && inst.Status == "running" {
+		o.mu.Unlock()
+		return nil, fmt.Errorf("instance already running for profile %q", name)
+	}
+
+	o.mu.Unlock()
+
+	cdpPort, err := o.ports().AllocatePort()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate browser debug port: %w", err)
+	}
+	reservedPorts = append(reservedPorts, cdpPort)
+
+	profilePath := filepath.Join(o.baseDir, name)
+	if o.profiles != nil {
+		if resolvedPath, err := o.profiles.ProfilePath(name); err == nil {
+			profilePath = resolvedPath
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(profilePath, "Default"), 0755); err != nil {
+		return nil, fmt.Errorf("create profile dir: %w", err)
+	}
+	instanceStateDir := filepath.Join(profilePath, ".pinchtab-state")
+	if err := os.MkdirAll(instanceStateDir, 0700); err != nil {
+		return nil, fmt.Errorf("create state dir: %w", err)
+	}
+	if err := os.Chmod(instanceStateDir, 0700); err != nil {
+		return nil, fmt.Errorf("set state dir permissions: %w", err)
+	}
+
+	requestedPolicy := cloneSecurityPolicy(opts.SecurityPolicy)
+	// One read of the published config for the whole launch: a save landing
+	// mid-launch must not have the policy come from one value and the target
+	// from the next.
+	cfg := o.cfg()
+	effectivePolicy := effectiveSecurityPolicy(cfg, requestedPolicy)
+
+	effectiveCfg := cfg
+	hasTargets := cfg != nil && len(cfg.Targets) > 0
+	targetPromoted := false
+	// A resolved target name is authoritative: re-deriving from the provider
+	// picks the wrong target when several targets share one provider.
+	if targetName := strings.TrimSpace(opts.TargetName); targetName != "" && hasTargets {
+		resolved, err := config.ResolveExplicitBrowserTarget(cfg, targetName)
+		if err == nil {
+			effectiveCfg = resolved.Config
+			targetPromoted = true
+		} else {
+			slog.Warn("launch: resolved target name no longer resolves; falling back to provider-derived config", "target", targetName, "err", err)
+		}
+	}
+	if browser := strings.TrimSpace(opts.Browser); !targetPromoted && browser != "" && hasTargets {
+		// Lenient: only promote a target when the provider maps to an unambiguous
+		// winner (single match, or the configured default among several); an
+		// ambiguous/zero match leaves the provider-derived config in place.
+		if target, _ := config.MatchBrowserToTarget(cfg, browser); target != "" {
+			if resolved, err := config.ResolveExplicitBrowserTarget(cfg, target); err == nil {
+				effectiveCfg = resolved.Config
+			}
+		}
+	}
+
+	childConfigPath, err := o.writeChildConfig(effectiveCfg, port, cdpPort, profilePath, instanceStateDir, headless, opts.ExtensionPaths, effectivePolicy)
+	if err != nil {
+		return nil, fmt.Errorf("write child config: %w", err)
+	}
+
+	envOverrides := map[string]string{
+		"PINCHTAB_PORT":   port,
+		"PINCHTAB_CONFIG": childConfigPath,
+	}
+	if o.internalToken != "" {
+		envOverrides["PINCHTAB_INTERNAL_TOKEN"] = o.internalToken
+	}
+	// filterEnvWithPrefixes strips ALL PINCHTAB_-prefixed vars from the parent
+	// environment before spawning the per-instance child process, so runtime
+	// container-compatibility overrides must be explicitly re-forwarded here or
+	// every profile-managed instance silently loses them.
+	if v := os.Getenv(config.ChromeNoSandboxEnvVar()); v != "" {
+		envOverrides[config.ChromeNoSandboxEnvVar()] = v
+	}
+	env := mergeEnvWithOverrides(filterEnvWithPrefixes(os.Environ(), "PINCHTAB_"), envOverrides)
+
+	if opts.Browser != "" {
+		var configured []string
+		if cfg != nil {
+			configured = cfg.BrowsersAvailable
+		}
+		if _, err := config.ParseBrowser(opts.Browser, configured); err != nil {
+			return nil, fmt.Errorf("invalid browser %q: %w", opts.Browser, err)
+		}
+	}
+
+	logBuf := newRingBuffer(256 * 1024)
+	slog.Info("starting instance process", "id", instanceID, "profile", name, "port", port)
+
+	cmd, err := o.runner.Run(context.Background(), o.binary, []string{"bridge"}, env, logBuf, logBuf)
+	if err != nil {
+		logLaunchBinaryFailure(instanceID, name, o.binary, err)
+		return nil, fmt.Errorf("failed to start: %w", err)
+	}
+
+	browser := opts.Browser
+	if browser == "" && cfg != nil {
+		browser = config.NormalizeBrowser(cfg.DefaultBrowser)
+	}
+
+	inst := &InstanceInternal{
+		Instance: bridge.Instance{
+			ID:             instanceID,
+			ProfileID:      profileID,
+			ProfileName:    name,
+			Port:           port,
+			URL:            o.childInstanceBaseURL(port),
+			Mode:           bridge.ModeFromHeadless(headless),
+			Headless:       headless,
+			Status:         "starting",
+			StartTime:      time.Now(),
+			SecurityPolicy: effectivePolicy,
+			Browser:        browser,
+		},
+		URL:     o.childInstanceBaseURL(port),
+		cdpPort: cdpPort,
+		cmd:     cmd,
+		logBuf:  logBuf,
+
+		requestedSecurityPolicy: requestedPolicy,
+		requestedProvider:       opts.RequestedProvider,
+		browser:                 opts.Browser,
+		effectiveBinary:         effectiveBinaryFromCfg(effectiveCfg),
+	}
+
+	// Snapshot under the same lock that guards the monitor's writes, and before
+	// the monitor exists. monitor -> applyStartupOutcome writes Status, URL and
+	// Error on this very struct; returning &inst.Instance handed the caller a
+	// live pointer into it, and POST /instances/start serializes that pointer to
+	// the response with no lock held. The race detector reports it as
+	// applyStartupOutcome (health.go) against bridge.Instance.MarshalJSON.
+	//
+	// snapshotWithFallbackMetadata already returns a detached copy for the
+	// fallback path; this makes the plain path agree.
+	o.mu.Lock()
+	o.instances[instanceID] = inst
+	snapshot := inst.Instance
+	o.mu.Unlock()
+	reservedPorts = nil
+
+	o.startMonitor(inst)
+
+	return &snapshot, nil
+}

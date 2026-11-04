@@ -51,7 +51,6 @@ func Fatal(format string, args ...any) {
 }
 
 func SetupUsage(root *cobra.Command) {
-	// Custom template using the shared ANSI-ready styles.
 	headerStyle := HeadingStyle.Render
 	cmdStyle := CommandStyle.Render
 
@@ -61,14 +60,19 @@ func SetupUsage(root *cobra.Command) {
   {{.CommandPath}} server                # Starts the full server
 {{end}}
 
-%s:
+{{if .HasAvailableSubCommands}}%s:
 {{range .Groups}}{{$group := .ID}}
   {{.Title}}:
 {{range $.Commands}}{{if eq .GroupID $group}}{{if not .Hidden}}    %s  {{.Short}}
-{{end}}{{end}}{{end}}{{end}}
-{{if .HasAvailableLocalFlags}}
+{{end}}{{end}}{{end}}{{end}}{{range $.Commands}}{{if and (eq .GroupID "") .IsAvailableCommand}}    %s  {{.Short}}
+{{end}}{{end}}
+{{end}}{{if .HasAvailableLocalFlags}}
 %s:
 {{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}
+{{end}}
+{{if .HasAvailableInheritedFlags}}
+%s:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}
 {{end}}
 {{if .HasExample}}
 %s:
@@ -78,7 +82,9 @@ func SetupUsage(root *cobra.Command) {
 		headerStyle("Usage"),
 		headerStyle("Commands"),
 		cmdStyle("{{rpad .Name .NamePadding}}"),
+		cmdStyle("{{rpad .Name .NamePadding}}"),
 		headerStyle("Flags"),
+		headerStyle("Global Flags"),
 		headerStyle("Examples")))
 }
 

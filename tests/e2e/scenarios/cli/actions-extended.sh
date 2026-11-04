@@ -50,6 +50,38 @@ pt_ok click --css "button[type=submit]"
 end_test
 
 # ─────────────────────────────────────────────────────────────────
+start_test "pinchtab click --mode dom|dispatch"
+
+pt_ok nav "${FIXTURES_URL}/occluded-click.html"
+pt_ok snap --interactive --compact=false
+
+TARGET_REF=$(find_ref_by_role_and_name "button" "Proceed" "$PT_OUT")
+if assert_ref_found "$TARGET_REF" "occluded target ref"; then
+  pt click "$TARGET_REF"
+  assert_exit_code 1 "plain cli click fails on occlusion"
+  if printf '%s\n%s\n' "$PT_OUT" "$PT_ERR" | grep -q "element is occluded"; then
+    pass_assert "plain cli click surfaces occlusion"
+  else
+    fail_assert "plain cli click surfaces occlusion"
+    echo -e "  ${RED}stdout: $PT_OUT${NC}"
+    echo -e "  ${RED}stderr: $PT_ERR${NC}"
+  fi
+
+  pt_ok click "$TARGET_REF" --mode dom
+  assert_output_contains "OK" "dom mode click succeeds"
+  pt_ok eval "JSON.stringify(window.occludedClickState)"
+  assert_json_jq "$PT_OUT" '.clicked == true and .clicks == 1' "dom mode updated click state" "dom mode did not trigger click"
+
+  pt_ok eval "window.occludedClickState = { clicked: false, clicks: 0, lastClientX: null, lastClientY: null }; JSON.stringify(window.occludedClickState)"
+  pt_ok click "$TARGET_REF" --mode dispatch
+  assert_output_contains "OK" "dispatch mode click succeeds"
+  pt_ok eval "JSON.stringify(window.occludedClickState)"
+  assert_json_jq "$PT_OUT" '.clicked == true and .clicks == 1' "dispatch mode updated click state" "dispatch mode did not trigger click"
+fi
+
+end_test
+
+# ─────────────────────────────────────────────────────────────────
 start_test "pinchtab hover <ref>"
 
 pt_ok nav "${FIXTURES_URL}/buttons.html"
@@ -99,6 +131,21 @@ assert_json_jq "$PT_OUT" '.wheelDeltaY == 240' "wheel delta Y accumulated" "whee
 end_test
 
 # ─────────────────────────────────────────────────────────────────
+start_test "pinchtab --server <url> --agent-id <id> mouse wheel <negative>"
+
+NEG_AGENT=e2e-negative-positional
+pt_ok --agent-id "$NEG_AGENT" nav "${FIXTURES_URL}/mouse-events.html"
+pt_ok --agent-id "$NEG_AGENT" mouse move --css "#mouse-target"
+pt_ok --agent-id "$NEG_AGENT" mouse wheel -120
+assert_output_contains "OK" "negative wheel delta after persistent value flags is accepted"
+
+pt_ok --agent-id "$NEG_AGENT" eval "JSON.stringify({wheelCount: window.mouseFixtureState.wheelCount, wheelDeltaY: window.mouseFixtureState.wheelDeltaY})"
+assert_json_jq "$PT_OUT" '.wheelCount == 1' "wheel count is 1" "wheel count is not 1"
+assert_json_jq "$PT_OUT" '.wheelDeltaY == -120' "wheel delta Y is negative" "wheel delta Y is not -120"
+
+end_test
+
+# ─────────────────────────────────────────────────────────────────
 start_test "pinchtab drag <from> <to>"
 
 pt_ok nav "${FIXTURES_URL}/mouse-events.html"
@@ -125,6 +172,43 @@ assert_output_contains "OK" "keydown response"
 # Release Shift key
 pt_ok keyup Shift
 assert_output_contains "OK" "keyup response"
+
+end_test
+
+# ─────────────────────────────────────────────────────────────────
+start_test "pinchtab press modifier keys are not typed as text (issue #588)"
+
+pt_ok nav "${FIXTURES_URL}/key-modifiers.html"
+pt_ok click --css "#typed"
+
+# Reset the input and the recorded key log.
+pt_ok eval "document.querySelector('#typed').value=''; window.keyState=[]; 'reset'"
+
+# Press each modifier. Before the fix these fell through to chromedp.KeyEvent and
+# the literal name (e.g. "Shift") was typed into the focused input.
+pt_ok press Shift
+pt_ok press Control
+pt_ok press Alt
+pt_ok press Meta
+
+# The focused input must remain empty — no modifier name was inserted as text.
+pt_ok eval "document.querySelector('#typed').value"
+assert_output_not_contains "Shift" "Shift must not be typed as text"
+assert_output_not_contains "Control" "Control must not be typed as text"
+assert_output_not_contains "Alt" "Alt must not be typed as text"
+assert_output_not_contains "Meta" "Meta must not be typed as text"
+
+# …but the modifiers ARE forwarded as real keydown/keyup events (issue #588 expected).
+pt_ok eval "JSON.stringify(window.keyState)"
+assert_output_contains "down:Shift" "Shift forwarded as keydown"
+assert_output_contains "up:Shift" "Shift forwarded as keyup"
+assert_output_contains "down:Control" "Control forwarded as keydown"
+
+# Control: a printable key still types into the input.
+pt_ok eval "document.querySelector('#typed').value=''; 'reset'"
+pt_ok press a
+pt_ok eval "document.querySelector('#typed').value"
+assert_output_contains "a" "printable key still types after the modifier fix"
 
 end_test
 
@@ -377,8 +461,8 @@ start_test "pinchtab reload --snap"
 pt_ok nav "${FIXTURES_URL}/form.html"
 pt_ok reload --snap
 
-# Output should contain OK and snapshot
-assert_output_contains "OK" "reload succeeded"
+# Reload prints the landed URL before the requested snapshot.
+assert_output_contains "form.html" "reload returned the landed URL"
 assert_output_contains "textbox" "snapshot contains form input"
 
 end_test

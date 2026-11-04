@@ -25,7 +25,6 @@ func (m *mockResolver) ResolveTabInstance(tabID string) (string, error) {
 func newTestScheduler(t *testing.T) (*Scheduler, *httptest.Server) {
 	t.Helper()
 
-	// Mock executor that returns success.
 	executor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]bool{"success": true}); err != nil {
@@ -33,7 +32,6 @@ func newTestScheduler(t *testing.T) (*Scheduler, *httptest.Server) {
 		}
 	}))
 
-	// Extract port from executor URL.
 	parts := strings.Split(executor.URL, ":")
 	port := parts[len(parts)-1]
 
@@ -43,7 +41,7 @@ func newTestScheduler(t *testing.T) (*Scheduler, *httptest.Server) {
 	cfg.MaxPerAgentFlight = 3
 
 	resolver := &mockResolver{port: port}
-	s := New(cfg, resolver)
+	s := New(cfg, resolver, nil)
 	s.noAutoStart = true
 
 	return s, executor
@@ -194,7 +192,7 @@ func TestSchedulerDispatchAndComplete(t *testing.T) {
 	cfg.MaxPerAgentFlight = 5
 
 	resolver := &mockResolver{port: port}
-	s := New(cfg, resolver)
+	s := New(cfg, resolver, nil)
 	s.Start()
 	defer s.Stop()
 
@@ -208,7 +206,6 @@ func TestSchedulerDispatchAndComplete(t *testing.T) {
 		t.Fatalf("submit failed: %v", err)
 	}
 
-	// Wait for task to complete.
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
@@ -243,7 +240,7 @@ func TestSchedulerDispatchFailure(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.WorkerCount = 1
 
-	s := New(cfg, &mockResolver{port: port})
+	s := New(cfg, &mockResolver{port: port}, nil)
 	s.Start()
 	defer s.Stop()
 
@@ -279,7 +276,7 @@ func TestSchedulerResolverError(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.WorkerCount = 1
 
-	s := New(cfg, &mockResolver{err: fmt.Errorf("no instance")})
+	s := New(cfg, &mockResolver{err: fmt.Errorf("no instance")}, nil)
 	s.Start()
 	defer s.Stop()
 

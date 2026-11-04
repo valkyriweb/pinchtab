@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -36,6 +37,9 @@ func (m *routeMockBridge) AddRouteRule(tabID string, rule bridge.RouteRule) erro
 }
 
 func (m *routeMockBridge) RemoveRouteRule(tabID, pattern string) (int, error) {
+	if _, routed := m.rules[tabID]; !routed {
+		return bridge.NewRouteManager(nil).Remove(context.Background(), tabID, pattern)
+	}
 	if pattern == "" {
 		n := len(m.rules[tabID])
 		delete(m.rules, tabID)
@@ -55,7 +59,72 @@ func (m *routeMockBridge) RemoveRouteRule(tabID, pattern string) (int, error) {
 }
 
 func (m *routeMockBridge) ListRouteRules(tabID string) ([]bridge.RouteRule, error) {
+	if _, routed := m.rules[tabID]; !routed {
+		return bridge.NewRouteManager(nil).List(tabID), nil
+	}
 	return m.rules[tabID], nil
+}
+
+func deleteTabRoutes(t *testing.T, h *Handlers, tabID string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("DELETE", "/tabs/"+tabID+"/network/route", nil)
+	req.SetPathValue("id", tabID)
+	w := httptest.NewRecorder()
+	h.HandleTabNetworkUnroute(w, req)
+	return w
+}
+
+func requireClearedRoutes(t *testing.T, w *httptest.ResponseRecorder, wantRemoved int) {
+	t.Helper()
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		OK      bool `json:"ok"`
+		Removed int  `json:"removed"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.Removed != wantRemoved {
+		t.Fatalf("body = %s, want ok:true removed:%d", w.Body.String(), wantRemoved)
+	}
+	if !strings.Contains(w.Body.String(), `"rules":[]`) {
+		t.Fatalf("body = %s, want rules as an empty JSON array", w.Body.String())
+	}
+}
+
+func TestHandleTabNetworkUnroute_IsIdempotentOnATabWithNoRules(t *testing.T) {
+	b := newRouteMockBridge()
+	h := newRouteHandler(b)
+
+	requireClearedRoutes(t, deleteTabRoutes(t, h, "tab1"), 0)
+
+	if err := b.AddRouteRule("tab1", bridge.RouteRule{Pattern: "a", Action: bridge.RouteActionAbort}); err != nil {
+		t.Fatal(err)
+	}
+	requireClearedRoutes(t, deleteTabRoutes(t, h, "tab1"), 1)
+	requireClearedRoutes(t, deleteTabRoutes(t, h, "tab1"), 0)
+}
+
+func TestHandleTabNetworkUnroute_UnknownTabIsStillNotFound(t *testing.T) {
+	b := newRouteMockBridge()
+	b.failTab = true
+	h := newRouteHandler(b)
+	if w := deleteTabRoutes(t, h, "nope"); w.Code != 404 {
+		t.Fatalf("status = %d, want 404 from tab resolution: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleTabNetworkRouteList_EmptyTabAnswersAnEmptyArray(t *testing.T) {
+	h := newRouteHandler(newRouteMockBridge())
+	req := httptest.NewRequest("GET", "/tabs/tab1/network/route", nil)
+	req.SetPathValue("id", "tab1")
+	w := httptest.NewRecorder()
+	h.HandleTabNetworkRouteList(w, req)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"rules":[]`) {
+		t.Fatalf("GET = %d %s, want 200 with rules as an empty JSON array", w.Code, w.Body.String())
+	}
 }
 
 func newRouteHandler(b *routeMockBridge) *Handlers {
@@ -122,6 +191,30 @@ func TestHandleTabNetworkRoute_CapabilityDisabled(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "network_intercept_disabled") {
 		t.Errorf("expected error code in body, got %s", w.Body.String())
+	}
+}
+
+func TestNetworkInterceptSecurityStateIncludesEveryGatedDirectRoute(t *testing.T) {
+	h := New(newRouteMockBridge(), &config.RuntimeConfig{}, nil, nil, nil)
+	state := h.endpointSecurityStates()["networkIntercept"]
+	want := []string{
+		"GET /network/{requestId}",
+		"GET /tabs/{id}/network/{requestId}",
+		"POST /network/clear",
+		"GET /network/route",
+		"POST /network/route",
+		"DELETE /network/route",
+		"GET /tabs/{id}/network/route",
+		"POST /tabs/{id}/network/route",
+		"DELETE /tabs/{id}/network/route",
+	}
+	if len(state.Paths) != len(want) {
+		t.Fatalf("security paths = %v, want %v", state.Paths, want)
+	}
+	for i := range want {
+		if state.Paths[i] != want[i] {
+			t.Fatalf("security path[%d] = %q, want %q", i, state.Paths[i], want[i])
+		}
 	}
 }
 

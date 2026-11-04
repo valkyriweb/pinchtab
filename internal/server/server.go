@@ -3,19 +3,21 @@ package server
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/pinchtab/pinchtab/internal/activity"
+	"github.com/pinchtab/pinchtab/internal/api/types"
 	"github.com/pinchtab/pinchtab/internal/authn"
 	"github.com/pinchtab/pinchtab/internal/bridge"
+	_ "github.com/pinchtab/pinchtab/internal/browsers/all"
+	"github.com/pinchtab/pinchtab/internal/browsers/providerhooks"
 	"github.com/pinchtab/pinchtab/internal/browsersession"
 	"github.com/pinchtab/pinchtab/internal/cli"
 	"github.com/pinchtab/pinchtab/internal/config"
@@ -27,8 +29,6 @@ import (
 	"github.com/pinchtab/pinchtab/internal/scheduler"
 	"github.com/pinchtab/pinchtab/internal/session"
 	"github.com/pinchtab/pinchtab/internal/strategy"
-
-	// Register strategies
 	_ "github.com/pinchtab/pinchtab/internal/strategy/alwayson"
 	_ "github.com/pinchtab/pinchtab/internal/strategy/autorestart"
 	_ "github.com/pinchtab/pinchtab/internal/strategy/explicit"
@@ -36,21 +36,36 @@ import (
 	_ "github.com/pinchtab/pinchtab/internal/strategy/simple"
 )
 
-func RunDashboard(cfg *config.RuntimeConfig, version string) {
-	if !cfg.VerboseStartup {
-		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	}
+var exitProcess = os.Exit
 
-	// Clean up orphaned Chrome processes from previous crashed runs
-	bridge.CleanupOrphanedChromeProcesses(cfg.ProfileDir)
+// fatalStartup writes styled operator output with hints, not a log record.
+func fatalStartup(stage string, err error) {
+	fmt.Fprintln(os.Stderr, cli.StyleStderr(cli.ErrorStyle, fmt.Sprintf("pinchtab: %s: %v", stage, err)))
+	for _, hint := range startupFatalHints(err) {
+		fmt.Fprintln(os.Stderr, cli.StyleStderr(cli.MutedStyle, "         "+hint))
+	}
+	exitProcess(1)
+}
+
+func startupFatalHints(err error) []string {
+	if !isAddrInUse(err) {
+		return nil
+	}
+	return []string{
+		"Another process is already listening on that address.",
+		"Check for a running service with `pinchtab daemon`, or stop it with `pinchtab server stop`.",
+	}
+}
+
+func RunDashboard(cfg *config.RuntimeConfig, version string) {
+	providerhooks.CleanupProfile(config.NormalizeBrowser(cfg.DefaultBrowser), cfg.ProfileDir)
 
 	dashPort := cfg.Port
 	startedAt := time.Now()
 
 	profilesDir := cfg.ProfilesBaseDir
 	if err := os.MkdirAll(profilesDir, 0755); err != nil {
-		slog.Error("cannot create profiles dir", "err", err)
-		os.Exit(1)
+		fatalStartup("cannot create profiles dir", err)
 	}
 
 	profMgr := profiles.NewProfileManager(profilesDir)
@@ -58,6 +73,9 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 	orch := orchestrator.NewOrchestrator(profilesDir)
 	orch.ApplyRuntimeConfig(cfg)
 	orch.SetProfileManager(profMgr)
+	profMgr.SetInstanceLookup(func(profileID string) (string, bool) {
+		return profileInstanceHolder(orch.List(), profileID)
+	})
 	dash.SetInstanceLister(orch)
 	dash.SetMonitoringSource(orch)
 	dash.SetServerMetricsProvider(func() dashboard.MonitoringServerMetrics {
@@ -68,25 +86,20 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 			RateBucketHosts: MetricInt(snapshot["rateBucketHosts"]),
 		}
 	})
-	configAPI := dashboard.NewConfigAPI(cfg, orch, profMgr, orch, dash, version, startedAt)
+	live := orch.LiveConfig()
+	configAPI := dashboard.NewConfigAPI(live, orch, profMgr, orch, dash, version, startedAt)
 	sessions := browsersession.NewManager(dashboard.BrowserSessionConfig(cfg))
 	configAPI.SetSessionManager(sessions)
-	authAPI := dashboard.NewAuthAPI(cfg, sessions)
+	authAPI := dashboard.NewAuthAPI(live, sessions)
 
-	// API sessions
-	sessionStore := session.NewStore(session.Config{
-		Enabled:     cfg.Sessions.Agent.Enabled,
-		Mode:        cfg.Sessions.Agent.Mode,
-		IdleTimeout: cfg.Sessions.Agent.IdleTimeout,
-		MaxLifetime: cfg.Sessions.Agent.MaxLifetime,
-		PersistPath: filepath.Join(cfg.StateDir, "sessions.json"),
-	})
+	sessionStore := session.NewStore(dashboard.AgentSessionConfig(cfg, dashboard.AgentSessionStatePath(cfg)))
+	configAPI.SetAgentSessionStore(sessionStore)
 	var sessionAPI *dashboard.SessionAPI
 	if sessionStore.Enabled() {
-		sessionAPI = dashboard.NewSessionAPI(sessionStore)
+		sessionAPI = dashboard.NewSessionAPI(sessionStore, cfg.BrowsersAvailable)
+		sessionAPI.SetSessionTabSource(orch.SessionTabIDs)
 	}
 
-	// Wire up instance events to SSE broadcast
 	orch.OnEvent(func(evt orchestrator.InstanceEvent) {
 		dash.BroadcastSystemEvent(dashboard.SystemEvent{
 			Type:     evt.Type,
@@ -124,10 +137,9 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 			MCP:          cfg.Observability.Activity.Events.MCP,
 			Other:        cfg.Observability.Activity.Events.Other,
 		},
-	}, cfg.ActivityStateDir())
+	}, cfg.ActivityLogDir())
 	if err != nil {
-		slog.Error("activity store", "err", err)
-		os.Exit(1)
+		fatalStartup("activity store", err)
 	}
 	profMgr.SetActivityRecorder(actStore)
 
@@ -146,6 +158,12 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 		ServerMetrics: handlers.SnapshotMetrics,
 	})
 	profMgr.RegisterHandlers(mux)
+	if !sessionStore.Enabled() {
+		// Without this the family is a bare mux 404, indistinguishable from a typo and
+		// from bridge mode — which is what made the CLI print a config remedy at users
+		// for whom no config could work.
+		RegisterSessionsDisabled(mux, sessionStore.DisabledBy())
+	}
 
 	syncCtx, syncCancel := context.WithCancel(context.Background())
 	go func() {
@@ -212,8 +230,7 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 		slog.Warn("unknown strategy, falling back to always-on", "strategy", strategyName, "err", err)
 		activeStrategy, err = strategy.New("always-on")
 		if err != nil {
-			slog.Error("failed to initialize fallback strategy", "strategy", "always-on", "err", err)
-			os.Exit(1)
+			fatalStartup("failed to initialize fallback strategy always-on", err)
 		}
 	}
 	if runtimeAware, ok := activeStrategy.(strategy.RuntimeConfigAware); ok {
@@ -235,7 +252,7 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 		listenStatus = "running"
 	}
 
-	if cfg.VerboseStartup {
+	if cfg.VerboseBanner {
 		cli.PrintStartupBanner(cfg, cli.StartupBannerOptions{
 			Mode:         "server",
 			ListenAddr:   cfg.Bind + ":" + dashPort,
@@ -257,58 +274,27 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 
 	var sched *scheduler.Scheduler
 	if cfg.Scheduler.Enabled {
-		schedCfg := scheduler.DefaultConfig()
-		schedCfg.Enabled = true
-		if cfg.Scheduler.Strategy != "" {
-			schedCfg.Strategy = cfg.Scheduler.Strategy
-		}
-		if cfg.Scheduler.MaxQueueSize > 0 {
-			schedCfg.MaxQueueSize = cfg.Scheduler.MaxQueueSize
-		}
-		if cfg.Scheduler.MaxPerAgent > 0 {
-			schedCfg.MaxPerAgent = cfg.Scheduler.MaxPerAgent
-		}
-		if cfg.Scheduler.MaxInflight > 0 {
-			schedCfg.MaxInflight = cfg.Scheduler.MaxInflight
-		}
-		if cfg.Scheduler.MaxPerAgentFlight > 0 {
-			schedCfg.MaxPerAgentFlight = cfg.Scheduler.MaxPerAgentFlight
-		}
-		if cfg.Scheduler.ResultTTLSec > 0 {
-			schedCfg.ResultTTL = time.Duration(cfg.Scheduler.ResultTTLSec) * time.Second
-		}
-		if cfg.Scheduler.WorkerCount > 0 {
-			schedCfg.WorkerCount = cfg.Scheduler.WorkerCount
-		}
+		schedCfg := scheduler.ConfigFromRuntime(cfg.Scheduler)
 
-		resolver := &scheduler.ManagerResolver{Mgr: orch.InstanceManager()}
-		sched = scheduler.New(schedCfg, resolver)
+		sched = scheduler.New(schedCfg, orch, liveActivity)
 		sched.RegisterHandlers(mux)
 		slog.Info("scheduler enabled (on-demand)", "strategy", schedCfg.Strategy, "workers", schedCfg.WorkerCount)
 	}
 
 	mux.HandleFunc("GET /health", configAPI.HandleHealth)
+	registerFrontDoorMetrics(mux)
+	registerFrontDoorOpenAPI(mux, live)
 	mux.HandleFunc("GET /health/background", func(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
-			"mode":    "dashboard",
+			"mode":    types.ModeDashboard,
 			"version": version,
 			"marker":  cfg.BackgroundMarker,
 		})
 	})
 
-	handler := handlers.StripInternalHeadersMiddleware(
-		handlers.RequestIDMiddleware(
-			activity.Middleware(
-				liveActivity,
-				"server",
-				handlers.SecurityHeadersMiddleware(cfg,
-					handlers.LoggingMiddleware(handlers.RateLimitMiddleware(handlers.CorsMiddleware(cfg, handlers.AuthMiddlewareWithSessions(cfg, sessions, sessionStore, mux)))),
-				),
-			),
-		),
-	)
-	if cfg.VerboseStartup {
+	handler := FrontDoorHandler(live, liveActivity, sessions, sessionStore, notFoundEnvelope(mux))
+	if cfg.VerboseBanner {
 		cli.LogSecurityWarnings(cfg)
 	}
 
@@ -316,10 +302,10 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 		Addr:              cfg.Bind + ":" + dashPort,
 		Handler:           handler,
 		MaxHeaderBytes:    maxHeaderBytes,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
 
 	if err := activeStrategy.Start(context.Background()); err != nil {
@@ -328,15 +314,17 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 
 	maintenanceCtx, maintenanceCancel := context.WithCancel(context.Background())
 	go orch.RunMaintenance(maintenanceCtx)
+	go sessionStore.RunMaintenance(maintenanceCtx)
+	go sessions.RunMaintenance(maintenanceCtx)
 
 	shutdownOnce := &sync.Once{}
 	doShutdown := func() {
 		shutdownOnce.Do(func() {
 			slog.Info("shutting down dashboard...")
-			// Kill all Chrome processes under our profiles dir immediately.
-			// This runs before strategy.Stop() to ensure cleanup happens
-			// even if launchd SIGKILL arrives during graceful shutdown.
-			bridge.KillAllPinchtabChrome()
+			// launchd may SIGKILL us shortly after SIGTERM; kill browser
+			// processes first so a mid-teardown SIGKILL can't orphan them.
+			// The hooks are idempotent process sweeps.
+			providerhooks.ShutdownAll()
 			if err := activeStrategy.Stop(); err != nil {
 				slog.Warn("strategy stop failed", "err", err)
 			}
@@ -346,7 +334,7 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 			syncCancel()
 			maintenanceCancel()
 			dash.Shutdown()
-			orch.Shutdown()
+			gracefulShutdownWithCap(orch, bridgeShutdownTotalCap)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := srv.Shutdown(ctx); err != nil {
@@ -365,9 +353,9 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 		sig := make(chan os.Signal, 2)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
-		// Kill Chrome immediately on signal — synchronous, before anything else.
-		// launchd may SIGKILL us shortly after SIGTERM, so this must happen first.
-		bridge.KillAllPinchtabChrome()
+		// Synchronous kill before the goroutine hop: the supervisor may not
+		// grant us even the scheduling delay of go doShutdown().
+		providerhooks.ShutdownAll()
 		go doShutdown()
 		<-sig
 		slog.Warn("force shutdown requested")
@@ -375,9 +363,56 @@ func RunDashboard(cfg *config.RuntimeConfig, version string) {
 		os.Exit(130)
 	}()
 
-	slog.Info("dashboard started", "port", dashPort)
-	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-		slog.Error("server", "err", err)
-		os.Exit(1)
+	listener, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		fatalStartup("cannot listen on "+srv.Addr, err)
 	}
+	slog.Info("dashboard started", "port", dashPort)
+	if err := srv.Serve(listener); err != http.ErrServerClosed {
+		fatalStartup("server error", err)
+	}
+}
+
+const bridgeShutdownTotalCap = 8 * time.Second
+
+func gracefulShutdownWithCap(orch *orchestrator.Orchestrator, cap time.Duration) bool {
+	if orch == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		orch.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(cap):
+		slog.Warn("graceful bridge shutdown exceeded cap, escalating", "cap", cap)
+		return false
+	}
+}
+
+// heldInstanceStatuses are the instance states that count as holding a profile. STOPPING is
+// in the set deliberately: the browser still has the directory open while it winds down, so
+// deleting then is the same loss as deleting while it runs. STARTING likewise — the profile
+// is claimed before the process reports running.
+//
+// This is the safety-critical half of the profile guard, so it is a named function rather
+// than a closure inside RunDashboard: as a closure nothing could reach it, and the states it
+// matches were the one part of the guard no test could see.
+var heldInstanceStatuses = map[string]bool{"starting": true, "running": true, "stopping": true}
+
+// profileInstanceHolder reports the instance holding profileID, if any. It is the exact
+// derivation handed to ProfileManager.SetInstanceLookup at composition.
+func profileInstanceHolder(instances []bridge.Instance, profileID string) (string, bool) {
+	for _, inst := range instances {
+		if inst.ProfileID != profileID {
+			continue
+		}
+		if heldInstanceStatuses[inst.Status] {
+			return inst.ID, true
+		}
+	}
+	return "", false
 }

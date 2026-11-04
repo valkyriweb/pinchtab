@@ -5,9 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/chromedp/cdproto/target"
 	"github.com/pinchtab/pinchtab/internal/bridge"
-	"github.com/pinchtab/pinchtab/internal/engine"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 )
 
@@ -15,25 +13,37 @@ type tabHandoffReader interface {
 	TabHandoffState(tabID string) (bridge.TabHandoffState, bool)
 }
 
-func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request) {
-	if h.Router != nil && h.Router.Mode() == engine.ModeLite {
-		resp := map[string]any{
-			"status": "ok",
-			"engine": "lite",
-		}
-		if hasFailureDiagnostics() {
-			resp["failures"] = FailureSnapshot()
-		}
-		if bridge.HasCrashDiagnostics() {
-			resp["crashes"] = bridge.CrashSnapshot()
-		}
-		httpx.JSON(w, http.StatusOK, resp)
-		return
-	}
+type currentTabReader interface {
+	CurrentTabID() string
+}
 
-	// Guard against nil Bridge
+var _ currentTabReader = (*bridge.Bridge)(nil)
+
+const IncludeTransientTabsQuery = "includeTransient"
+
+func includeTransientTabs(r *http.Request) bool {
+	return r.URL.Query().Get(IncludeTransientTabsQuery) == "1"
+}
+
+func (h *Handlers) listedCurrentTabID(r *http.Request, targets []bridge.TabTarget) string {
+	if !currentTabScopeFromRequest(r).IsGlobal() {
+		tabID, _ := h.scopedCurrentTabForRequest(r)
+		return tabID
+	}
+	if reader, ok := bridgeAs[currentTabReader](h.Bridge); ok {
+		if tabID := reader.CurrentTabID(); tabID != "" {
+			return tabID
+		}
+	}
+	if len(targets) > 0 {
+		return targets[0].TargetID
+	}
+	return ""
+}
+
+func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	if h.Bridge == nil {
-		httpx.JSON(w, 503, map[string]any{"status": "error", "reason": "bridge not initialized"})
+		writeUnavailable(w, 503, "bridge_unavailable", "bridge not initialized")
 		return
 	}
 	if draining, retryAfter := h.bridgeRestartStatus(); draining {
@@ -42,33 +52,37 @@ func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request) {
 			seconds = 1
 		}
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", seconds))
-		httpx.JSON(w, http.StatusServiceUnavailable, map[string]any{"status": "draining", "retryAfterSeconds": seconds})
+		httpx.JSONError(w, http.StatusServiceUnavailable, "browser_draining",
+			fmt.Sprintf("browser is restarting; retry after %ds", seconds),
+			map[string]any{"status": "draining", "retryAfterSeconds": seconds})
 		return
 	}
 
-	// Ensure Chrome is initialized before checking health
-	if err := h.ensureChrome(); err != nil {
+	if err := h.ensureBrowser(h.Config); err != nil {
 		if h.writeBridgeUnavailable(w, err) {
 			return
 		}
-		httpx.JSON(w, 503, map[string]any{"status": "error", "reason": fmt.Sprintf("chrome initialization failed: %v", err)})
+		writeUnavailable(w, 503, "browser_init_failed", fmt.Sprintf("browser initialization failed: %v", err))
 		return
 	}
-
 	targets, err := h.Bridge.ListTargets()
 	if err != nil {
-		httpx.JSON(w, 503, map[string]any{"status": "error", "reason": err.Error()})
+		writeUnavailable(w, 503, "list_targets_failed", err.Error())
 		return
 	}
 
 	resp := map[string]any{"status": "ok", "tabs": len(targets)}
+	// Server-mode /health reports version; bridge /health did not, so a bridge
+	// bug report could not state which build produced it.
+	if h.Version != "" {
+		resp["version"] = h.Version
+	}
 
-	// Include crash logs if any
 	if crashLogs := h.Bridge.GetCrashLogs(); len(crashLogs) > 0 {
 		resp["crashLogs"] = crashLogs
 	}
 	if hasFailureDiagnostics() {
-		resp["failures"] = FailureSnapshot()
+		resp["failures"] = FailureSnapshot(LayerInstance)
 	}
 	if bridge.HasCrashDiagnostics() {
 		resp["crashes"] = bridge.CrashSnapshot()
@@ -77,16 +91,25 @@ func (h *Handlers) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, 200, resp)
 }
 
+func (h *Handlers) HandleEnsureBrowser(w http.ResponseWriter, r *http.Request) {
+	h.ensureBrowserWithStatus(w, "browser_ready")
+}
+
+// HandleEnsureChrome serves the pre-rename /ensure-chrome alias and keeps the
+// legacy "chrome_ready" status for version-skewed orchestrators that match it.
 func (h *Handlers) HandleEnsureChrome(w http.ResponseWriter, r *http.Request) {
-	// Ensure Chrome is initialized for this instance
-	if err := h.ensureChrome(); err != nil {
+	h.ensureBrowserWithStatus(w, "chrome_ready")
+}
+
+func (h *Handlers) ensureBrowserWithStatus(w http.ResponseWriter, status string) {
+	if err := h.ensureBrowser(h.Config); err != nil {
 		if h.writeBridgeUnavailable(w, err) {
 			return
 		}
-		httpx.Error(w, 500, fmt.Errorf("chrome initialization failed: %w", err))
+		httpx.Error(w, 500, fmt.Errorf("browser initialization failed: %w", err))
 		return
 	}
-	httpx.JSON(w, 200, map[string]string{"status": "chrome_ready"})
+	httpx.JSON(w, 200, map[string]string{"status": status})
 }
 
 func (h *Handlers) HandleBrowserRestart(w http.ResponseWriter, r *http.Request) {
@@ -101,16 +124,12 @@ func (h *Handlers) HandleBrowserRestart(w http.ResponseWriter, r *http.Request) 
 	httpx.JSON(w, 200, map[string]string{"status": "browser_restarted"})
 }
 
+// HandleMetrics reports this process's own counters. In server mode that is an
+// instance child: the orchestrator front door answers its own /metrics, so a
+// client can read either layer without the two ever being summed.
 func (h *Handlers) HandleMetrics(w http.ResponseWriter, r *http.Request) {
-	result := map[string]any{"metrics": SnapshotMetrics()}
-	if hasFailureDiagnostics() {
-		result["failures"] = FailureSnapshot()
-	}
-	if bridge.HasCrashDiagnostics() {
-		result["crashes"] = bridge.CrashSnapshot()
-	}
+	result := DiagnosticsSnapshot(LayerInstance)
 
-	// Aggregate memory metrics across all tabs
 	if h.Bridge != nil {
 		if mem, err := h.Bridge.GetAggregatedMemoryMetrics(); err == nil && mem != nil {
 			result["memory"] = mem
@@ -121,9 +140,8 @@ func (h *Handlers) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleTabMetrics(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("missing tab id"))
+	tabID, ok := requirePathTabID(w, r)
+	if !ok {
 		return
 	}
 
@@ -137,7 +155,7 @@ func (h *Handlers) HandleTabMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mem, err := h.Bridge.GetMemoryMetrics(tabID)
+	mem, err := h.Bridge.GetAggregatedMemoryMetrics()
 	if err != nil {
 		httpx.Error(w, 500, fmt.Errorf("failed to get metrics: %w", err))
 		return
@@ -147,7 +165,6 @@ func (h *Handlers) HandleTabMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleTabs(w http.ResponseWriter, r *http.Request) {
-	// Guard against nil Bridge
 	if h.Bridge == nil {
 		httpx.Error(w, 503, fmt.Errorf("bridge not initialized"))
 		return
@@ -161,6 +178,9 @@ func (h *Handlers) HandleTabs(w http.ResponseWriter, r *http.Request) {
 		httpx.ErrorCode(w, http.StatusServiceUnavailable, "browser_draining", bridge.ErrBrowserDraining.Error(), true, map[string]any{"retryAfterSeconds": seconds})
 		return
 	}
+	if !h.ensureBrowserOrRespond(w, h.Config) {
+		return
+	}
 
 	targets, err := h.Bridge.ListTargets()
 	if err != nil {
@@ -168,25 +188,25 @@ func (h *Handlers) HandleTabs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	currentTabID := ""
-	if _, resolvedID, err := h.tabContext(r, ""); err == nil {
-		currentTabID = resolvedID
-	}
+	currentTabID := h.listedCurrentTabID(r, targets)
+	keepTransient := includeTransientTabs(r)
 
 	tabs := make([]map[string]any, 0, len(targets))
-	appendTab := func(t *target.Info) {
-		// Skip the initial about:blank tab that Chrome creates on launch
-		if bridge.IsTransientURL(t.URL, h.Config.Port) {
+	appendTab := func(t bridge.TabTarget) {
+		if !keepTransient && bridge.IsTransientURL(t.URL, h.Config.Port) {
 			return
 		}
-		tabID := string(t.TargetID)
+		tabID := t.TargetID
 		entry := map[string]any{
 			"id":    tabID,
 			"url":   t.URL,
 			"title": t.Title,
 			"type":  t.Type,
 		}
-		if hr, ok := h.Bridge.(tabHandoffReader); ok {
+		if t.BrowserContextID != "" {
+			entry["browserContextId"] = t.BrowserContextID
+		}
+		if hr, ok := bridgeAs[tabHandoffReader](h.Bridge); ok {
 			if hs, ok := hr.TabHandoffState(tabID); ok {
 				entry["status"] = hs.Status
 				entry["handoffReason"] = hs.Reason
@@ -202,15 +222,13 @@ func (h *Handlers) HandleTabs(w http.ResponseWriter, r *http.Request) {
 		tabs = append(tabs, entry)
 	}
 
-	// First pass: add the current focused tab
 	for _, t := range targets {
-		if string(t.TargetID) == currentTabID {
+		if t.TargetID == currentTabID {
 			appendTab(t)
 		}
 	}
-	// Second pass: add all other tabs
 	for _, t := range targets {
-		if string(t.TargetID) == currentTabID {
+		if t.TargetID == currentTabID {
 			continue
 		}
 		appendTab(t)

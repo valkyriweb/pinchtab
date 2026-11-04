@@ -81,8 +81,6 @@ func EnsureSessionsDir(stateDir string) (string, error) {
 	return dir, nil
 }
 
-// fileExtension returns the appropriate file extension based on whether the file
-// is encrypted. Encrypted files use .json.enc; plaintext files use .json.
 func fileExtension(encrypted bool) string {
 	if encrypted {
 		return ".json.enc"
@@ -104,6 +102,10 @@ func Save(stateDir string, sf *StateFile, encryptionKey string) (string, error) 
 		sf.Name = fmt.Sprintf("state-%d", time.Now().Unix())
 	}
 
+	// Set Encrypted before marshaling so the flag is actually persisted into
+	// the (then-encrypted) payload; otherwise Load+decrypt always reports false.
+	sf.Encrypted = encryptionKey != ""
+
 	data, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal state: %w", err)
@@ -115,7 +117,6 @@ func Save(stateDir string, sf *StateFile, encryptionKey string) (string, error) 
 			return "", fmt.Errorf("encrypt state: %w", encErr)
 		}
 		data = encrypted
-		sf.Encrypted = true
 	}
 
 	ext := fileExtension(encryptionKey != "")
@@ -125,11 +126,63 @@ func Save(stateDir string, sf *StateFile, encryptionKey string) (string, error) 
 		return "", fmt.Errorf("invalid state file name: resolved path escapes state directory")
 	}
 
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	// Atomic write: Save overwrites by name, so a torn write would destroy the
+	// previously saved state as well as the new one — and a truncated encrypted
+	// payload fails GCM authentication, losing the session entirely.
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return "", fmt.Errorf("write state file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("write state file: %w", err)
 	}
 
+	// One name is one file. Save picks its extension from whether a key was
+	// supplied, so saving a name again with the encryption flag flipped used to
+	// leave the earlier file beside the new one — and the earlier one is the
+	// plaintext copy of the same cookies whenever the flip was towards
+	// encryption. Removing the sibling is the difference between "this state is
+	// encrypted now" and "there is also an unencrypted copy of it on disk".
+	if err := removeSibling(dir, sanitizeFilename(sf.Name), ext); err != nil {
+		return path, err
+	}
+
 	return path, nil
+}
+
+// removeSibling deletes the same state name under the extension Save did not
+// write. A failure is returned rather than logged: the caller has just been told
+// the state is encrypted, and the whole point is that the other copy is gone.
+func removeSibling(dir, base, writtenExt string) error {
+	for _, ext := range stateExtensions {
+		if ext == writtenExt {
+			continue
+		}
+		path, ok := statePathWithin(dir, base, ext)
+		if !ok {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove previous %s copy of state %q: %w", ext, base, err)
+		}
+	}
+	return nil
+}
+
+// stateExtensions are the two spellings one state name can have on disk,
+// encrypted first because that is the one ResolvePath prefers.
+var stateExtensions = []string{".json.enc", ".json"}
+
+// statePathWithin joins a state file path and reports whether it stayed inside
+// dir, so every caller applies the same containment rule.
+func statePathWithin(dir, base, ext string) (string, bool) {
+	name := base + ext
+	if !filepath.IsLocal(name) {
+		return "", false
+	}
+	path := filepath.Clean(filepath.Join(dir, name))
+	return path, strings.HasPrefix(path, filepath.Clean(dir)+string(os.PathSeparator))
 }
 
 // Load reads a StateFile from disk. If encryptionKey is non-empty, the file
@@ -140,7 +193,14 @@ func Load(path, encryptionKey string) (*StateFile, error) {
 		return nil, fmt.Errorf("read state file: %w", err)
 	}
 
-	if encryptionKey != "" {
+	// The extension records what Save actually did, so trust it over the
+	// caller's key: a plaintext file must still load when a key happens to be
+	// configured. json.Valid also catches encrypted payloads written by older
+	// versions that did not use the .enc extension.
+	if strings.HasSuffix(path, fileExtension(true)) || !json.Valid(data) {
+		if encryptionKey == "" {
+			return nil, fmt.Errorf("state file is encrypted: an encryption key is required")
+		}
 		decrypted, decErr := Decrypt(data, encryptionKey)
 		if decErr != nil {
 			return nil, fmt.Errorf("decrypt state file: %w", decErr)
@@ -156,13 +216,10 @@ func Load(path, encryptionKey string) (*StateFile, error) {
 	return &sf, nil
 }
 
-// isStateFile reports whether a directory entry is a recognised state file
-// (either .json or .json.enc).
 func isStateFile(name string) bool {
 	return strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".json.enc")
 }
 
-// trimStateExt removes the state file extension (.json or .json.enc) from a filename.
 func trimStateExt(name string) string {
 	if strings.HasSuffix(name, ".json.enc") {
 		return strings.TrimSuffix(name, ".json.enc")
@@ -194,23 +251,29 @@ func List(stateDir string) ([]StateEntry, error) {
 		}
 
 		path := filepath.Join(dir, entry.Name())
+		encrypted := strings.HasSuffix(entry.Name(), ".json.enc")
 		se := StateEntry{
 			Name:      trimStateExt(entry.Name()),
 			SizeBytes: info.Size(),
+			Encrypted: encrypted,
 		}
 
-		// Try to read metadata without full decryption
-		data, readErr := os.ReadFile(path)
-		if readErr == nil {
-			var probe struct {
-				SavedAt   time.Time `json:"savedAt"`
-				Origins   []string  `json:"origins"`
-				Encrypted bool      `json:"encrypted"`
-			}
-			if json.Unmarshal(data, &probe) == nil {
-				se.SavedAt = probe.SavedAt
-				se.Origins = probe.Origins
-				se.Encrypted = probe.Encrypted
+		// Only plaintext files expose JSON metadata; encrypted (.json.enc)
+		// payloads are ciphertext, so probing them with json.Unmarshal always
+		// fails and would silently drop SavedAt/Origins. List has no decryption
+		// key, so encrypted entries legitimately list with empty SavedAt/Origins
+		// but a correct Encrypted flag (derived from the extension above).
+		if !encrypted {
+			data, readErr := os.ReadFile(path)
+			if readErr == nil {
+				var probe struct {
+					SavedAt time.Time `json:"savedAt"`
+					Origins []string  `json:"origins"`
+				}
+				if json.Unmarshal(data, &probe) == nil {
+					se.SavedAt = probe.SavedAt
+					se.Origins = probe.Origins
+				}
 			}
 		}
 
@@ -243,24 +306,31 @@ func FindByPrefix(stateDir, prefix string) ([]StateEntry, error) {
 	return matched, nil
 }
 
-// Delete removes a named state file. Tries .json.enc first, falls back to .json.
+// Delete removes a named state file under BOTH spellings. Stopping at the first
+// success reported the state deleted while leaving the other copy on disk, and
+// the copy left behind was the plaintext one whenever both existed.
 func Delete(stateDir, name string) error {
 	dir := SessionsDir(stateDir)
 	base := sanitizeFilename(name)
-	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
-	// Try encrypted extension first.
-	for _, ext := range []string{".json.enc", ".json"} {
-		path := filepath.Clean(filepath.Join(dir, base+ext))
-		if !strings.HasPrefix(path, cleanDir) {
+	removed := false
+	for _, ext := range stateExtensions {
+		path, ok := statePathWithin(dir, base, ext)
+		if !ok {
 			return fmt.Errorf("resolved path escapes sessions dir")
 		}
-		if err := os.Remove(path); err == nil {
-			return nil
-		} else if !os.IsNotExist(err) {
+		err := os.Remove(path)
+		switch {
+		case err == nil:
+			removed = true
+		case os.IsNotExist(err):
+		default:
 			return fmt.Errorf("delete state file: %w", err)
 		}
 	}
-	return fmt.Errorf("state file %q not found", name)
+	if !removed {
+		return fmt.Errorf("state file %q not found", name)
+	}
+	return nil
 }
 
 // Clean removes state files older than the given duration.
@@ -344,7 +414,6 @@ func Decrypt(ciphertext []byte, passphrase string) ([]byte, error) {
 		return nil, fmt.Errorf("encryption key required")
 	}
 
-	// Try PBKDF2-based decryption (new format: salt || nonce || ciphertext).
 	if len(ciphertext) > pbkdf2SaltSize {
 		salt := ciphertext[:pbkdf2SaltSize]
 		rest := ciphertext[pbkdf2SaltSize:]
@@ -356,7 +425,6 @@ func Decrypt(ciphertext []byte, passphrase string) ([]byte, error) {
 		}
 	}
 
-	// Fall back to legacy SHA-256 key derivation.
 	legacyHash := sha256.Sum256([]byte(passphrase))
 	return decryptWithKey(ciphertext, legacyHash[:])
 }
@@ -404,16 +472,13 @@ func sanitizeFilename(name string) string {
 	// Normalize Windows path separators so filepath.Base works on all OSes.
 	name = strings.ReplaceAll(name, "\\", "/")
 
-	// Drop any directory components.
 	name = filepath.Base(name)
 
-	// Remove leading dot-segments.
 	for strings.HasPrefix(name, "../") {
 		name = strings.TrimPrefix(name, "../")
 	}
 	name = strings.TrimPrefix(name, "./")
 
-	// Replace disallowed characters.
 	name = strings.Map(func(r rune) rune {
 		switch r {
 		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
@@ -423,7 +488,6 @@ func sanitizeFilename(name string) string {
 		}
 	}, name)
 
-	// Final safety.
 	name = strings.TrimLeft(name, ".")
 	if name == "" || name == "." || name == ".." {
 		return "state"
@@ -437,11 +501,9 @@ func sanitizeFilename(name string) string {
 func ResolvePath(stateDir, name string) string {
 	dir := SessionsDir(stateDir)
 	base := sanitizeFilename(name)
-	// Try encrypted extension first, then plaintext.
-	for _, ext := range []string{".json.enc", ".json"} {
-		resolved := filepath.Clean(filepath.Join(dir, base+ext))
-		cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
-		if !strings.HasPrefix(resolved, cleanDir) {
+	for _, ext := range stateExtensions {
+		resolved, ok := statePathWithin(dir, base, ext)
+		if !ok {
 			return ""
 		}
 		if _, err := os.Stat(resolved); err == nil {
@@ -449,9 +511,8 @@ func ResolvePath(stateDir, name string) string {
 		}
 	}
 	// File doesn't exist yet — return the .json path (for new saves).
-	resolved := filepath.Clean(filepath.Join(dir, base+".json"))
-	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
-	if !strings.HasPrefix(resolved, cleanDir) {
+	resolved, ok := statePathWithin(dir, base, ".json")
+	if !ok {
 		return ""
 	}
 	return resolved

@@ -6,19 +6,19 @@ package solvers
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/pinchtab/pinchtab/internal/autosolver"
+	"github.com/pinchtab/pinchtab/internal/cfchallenge"
 )
 
 // Cloudflare implements autosolver.Solver for Cloudflare Turnstile
-// and interstitial challenges. Unlike bridge/cloudflare.go, this
-// implementation uses the Page/ActionExecutor abstraction and has
-// zero dependency on chromedp.
+// and interstitial challenges.
 type Cloudflare struct{}
 
-func (s *Cloudflare) Name() string  { return "cloudflare" }
+func (s *Cloudflare) Name() string  { return autosolver.CloudflareSolverName }
 func (s *Cloudflare) Priority() int { return 10 }
 
 // CanHandle checks for Cloudflare challenge indicators in the page title.
@@ -29,17 +29,27 @@ func (s *Cloudflare) CanHandle(_ context.Context, page autosolver.Page) (bool, e
 // Solve attempts to resolve the Cloudflare challenge by locating the
 // Turnstile widget and clicking the checkbox.
 func (s *Cloudflare) Solve(ctx context.Context, page autosolver.Page, executor autosolver.ActionExecutor) (*autosolver.Result, error) {
-	result := &autosolver.Result{SolverUsed: "cloudflare"}
+	result := &autosolver.Result{SolverUsed: s.Name()}
 
 	if !isCFChallenge(page.Title()) {
 		result.Solved = true
 		return result, nil
 	}
 
-	// Detect challenge type.
 	challengeType, err := detectCFChallengeType(ctx, executor)
 	if err != nil {
 		return result, fmt.Errorf("detect challenge type: %w", err)
+	}
+
+	// Re-detect once after a pause when the first read finds no type. Cloudflare
+	// writes cType into the document after the interstitial paints, so an early
+	// read sees nothing and a non-interactive challenge would be driven down the
+	// clicking path instead of simply being waited out.
+	if challengeType == "" {
+		time.Sleep(cfRedetectDelay)
+		if retried, retryErr := detectCFChallengeType(ctx, executor); retryErr == nil {
+			challengeType = retried
+		}
 	}
 
 	// Non-interactive challenges resolve automatically.
@@ -47,14 +57,11 @@ func (s *Cloudflare) Solve(ctx context.Context, page autosolver.Page, executor a
 		return waitForCFResolve(ctx, page, result, 15*time.Second)
 	}
 
-	// Interactive challenge: find and click the Turnstile checkbox.
 	for attempt := 0; attempt < 3; attempt++ {
 		result.Attempts = attempt + 1
 
-		// Wait for spinner to complete.
 		waitForSpinner(ctx, executor, 10*time.Second)
 
-		// Find the Turnstile iframe bounding box.
 		box, err := findTurnstileBox(ctx, executor)
 		if err != nil {
 			// Challenge may have resolved while we were looking.
@@ -67,15 +74,16 @@ func (s *Cloudflare) Solve(ctx context.Context, page autosolver.Page, executor a
 			continue
 		}
 
-		// Click the checkbox area (left portion of the widget).
-		checkboxX := box.x + box.width*0.09
-		checkboxY := box.y + box.height*0.40
+		// Click the checkbox area (left portion of the widget), jittered: an
+		// exact-centre click on every attempt is a fingerprint, and this solver
+		// exists to get past fingerprinting.
+		checkboxX := box.x + box.width*0.09 + cfClickJitter()
+		checkboxY := box.y + box.height*0.40 + cfClickJitter()
 
 		if err := executor.Click(ctx, checkboxX, checkboxY); err != nil {
 			return result, fmt.Errorf("click turnstile: %w", err)
 		}
 
-		// Poll for resolution.
 		resolved := pollResolution(ctx, page, 15*time.Second)
 		if resolved {
 			result.Solved = true
@@ -84,23 +92,32 @@ func (s *Cloudflare) Solve(ctx context.Context, page autosolver.Page, executor a
 		}
 	}
 
-	// Final check after all attempts.
 	result.FinalTitle = page.Title()
 	result.Solved = !isCFChallenge(page.Title())
 	return result, nil
 }
 
-// --- Internal helpers ---
-
 type boundingBox struct {
 	x, y, width, height float64
 }
 
+const (
+	// cfRedetectDelay is how long to wait before re-reading the challenge type.
+	cfRedetectDelay = 2 * time.Second
+	// cfClickJitterPx is the full width of the click-position jitter window.
+	cfClickJitterPx = 8
+)
+
+// cfClickJitter returns a signed offset within half the jitter window either way.
+// Solve runs inside HTTP handler goroutines and the auto-trigger's own goroutine, so
+// two solves can jitter at once: the draw comes from the top-level source, which is
+// safe for concurrent use, never a package-level *rand.Rand, which is not.
+func cfClickJitter() float64 {
+	return (rand.Float64() - 0.5) * cfClickJitterPx // #nosec G404 -- input humanisation, not cryptography.
+}
+
 func isCFChallenge(title string) bool {
-	lower := strings.ToLower(title)
-	return strings.Contains(lower, "just a moment") ||
-		strings.Contains(lower, "attention required") ||
-		strings.Contains(lower, "checking your browser")
+	return cfchallenge.IsChallengeTitle(title)
 }
 
 func detectCFChallengeType(ctx context.Context, executor autosolver.ActionExecutor) (string, error) {
@@ -109,7 +126,7 @@ func detectCFChallengeType(ctx context.Context, executor autosolver.ActionExecut
 		return "", err
 	}
 
-	for _, ct := range []string{"non-interactive", "managed", "interactive"} {
+	for _, ct := range cfchallenge.CTypeTokens {
 		if strings.Contains(content, fmt.Sprintf("cType: '%s'", ct)) {
 			return ct, nil
 		}
@@ -117,7 +134,7 @@ func detectCFChallengeType(ctx context.Context, executor autosolver.ActionExecut
 
 	var hasEmbedded bool
 	if err := executor.Evaluate(ctx,
-		`!!document.querySelector('script[src*="challenges.cloudflare.com/turnstile/v"]')`,
+		cfchallenge.EmbeddedTurnstileScriptJS,
 		&hasEmbedded); err == nil && hasEmbedded {
 		return "embedded", nil
 	}
@@ -127,35 +144,7 @@ func detectCFChallengeType(ctx context.Context, executor autosolver.ActionExecut
 
 func findTurnstileBox(ctx context.Context, executor autosolver.ActionExecutor) (*boundingBox, error) {
 	var rawBox map[string]float64
-	err := executor.Evaluate(ctx, `(() => {
-		const patterns = [
-			'iframe[src*="challenges.cloudflare.com/cdn-cgi/challenge-platform"]',
-			'iframe[src*="challenges.cloudflare.com"]',
-		];
-		for (const sel of patterns) {
-			const iframe = document.querySelector(sel);
-			if (iframe) {
-				const r = iframe.getBoundingClientRect();
-				if (r.width > 0 && r.height > 0) {
-					return {x: r.x, y: r.y, width: r.width, height: r.height};
-				}
-			}
-		}
-		const containers = [
-			'#cf_turnstile div', '#cf-turnstile div', '.turnstile>div>div',
-			'.main-content p+div>div>div',
-		];
-		for (const sel of containers) {
-			const el = document.querySelector(sel);
-			if (el) {
-				const r = el.getBoundingClientRect();
-				if (r.width > 0 && r.height > 0) {
-					return {x: r.x, y: r.y, width: r.width, height: r.height};
-				}
-			}
-		}
-		return null;
-	})()`, &rawBox)
+	err := executor.Evaluate(ctx, cfchallenge.TurnstileBoxJS, &rawBox)
 	if err != nil {
 		return nil, fmt.Errorf("evaluate turnstile box: %w", err)
 	}
@@ -187,7 +176,7 @@ func waitForSpinner(ctx context.Context, executor autosolver.ActionExecutor, tim
 			if err := executor.Evaluate(ctx, `document.body.innerText`, &text); err != nil {
 				continue
 			}
-			if !strings.Contains(text, "Verifying you are human") {
+			if !strings.Contains(text, cfchallenge.SpinnerText) {
 				return
 			}
 		}

@@ -2,14 +2,12 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/activity"
+	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 )
 
@@ -24,9 +22,8 @@ type offlineRequest struct {
 // HandleSetOffline enables or disables network offline emulation via CDP.
 // POST /emulation/offline
 func (h *Handlers) HandleSetOffline(w http.ResponseWriter, r *http.Request) {
-	var req offlineRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
+	req, ok := decodeJSONBody[offlineRequest](w, r)
+	if !ok {
 		return
 	}
 
@@ -36,20 +33,12 @@ func (h *Handlers) HandleSetOffline(w http.ResponseWriter, r *http.Request) {
 // HandleTabSetOffline enables or disables network offline emulation for a specific tab.
 // POST /tabs/{id}/emulation/offline
 func (h *Handlers) HandleTabSetOffline(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("missing tab ID"))
+	req, ok := decodeJSONBody[offlineRequest](w, r)
+	if !ok {
 		return
 	}
-
-	var req offlineRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
-		return
-	}
-
-	if req.TabID != "" && req.TabID != tabID {
-		httpx.Error(w, 400, fmt.Errorf("tabId in body %q does not match URL path %q", req.TabID, tabID))
+	tabID, ok := h.requirePathTabIDMatch(w, r, req.TabID)
+	if !ok {
 		return
 	}
 	req.TabID = tabID
@@ -66,27 +55,20 @@ func (h *Handlers) setOffline(w http.ResponseWriter, r *http.Request, req offlin
 		req.UploadThroughput = -1
 	}
 
-	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	ctx, resolvedTabID, ok := h.guardedTabContext(w, r, req.TabID, guardDialogBlocked|guardDomainPolicy|guardHandoffPause)
+	if !ok {
 		return
 	}
 
 	tCtx, tCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer tCancel()
 
-	if err := chromedp.Run(tCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			if err := network.OverrideNetworkState(req.Offline, req.Latency, req.DownloadThroughput, req.UploadThroughput).
-				Do(ctx); err != nil {
-				return fmt.Errorf("overrideNetworkState: %w", err)
-			}
-			return nil
-		}),
-	); err != nil {
+	if err := h.Bridge.SetNetworkConditions(tCtx, bridge.NetworkConditions{
+		Offline:            req.Offline,
+		Latency:            req.Latency,
+		DownloadThroughput: req.DownloadThroughput,
+		UploadThroughput:   req.UploadThroughput,
+	}); err != nil {
 		httpx.Error(w, 500, fmt.Errorf("CDP network offline emulation: %w", err))
 		return
 	}

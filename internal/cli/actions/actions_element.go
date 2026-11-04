@@ -2,7 +2,11 @@ package actions
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -10,6 +14,7 @@ import (
 	"github.com/pinchtab/pinchtab/internal/cli"
 	"github.com/pinchtab/pinchtab/internal/cli/apiclient"
 	"github.com/pinchtab/pinchtab/internal/cli/output"
+	"github.com/pinchtab/pinchtab/internal/scroll"
 	"github.com/pinchtab/pinchtab/internal/selector"
 	"github.com/spf13/cobra"
 )
@@ -32,19 +37,32 @@ func Action(client *http.Client, base, token, kind, selectorArg string, cmd *cob
 		body["button"] = button
 	}
 	if css != "" {
-		// Explicit --css flag: send as plain CSS selector
 		body["selector"] = css
 	} else if selectorArg != "" {
-		// Unified selector: parse and split into ref vs selector for the API
 		setSelectorBody(body, selectorArg)
 	} else if !hasXY {
 		cli.Fatal("Usage: pinchtab %s <selector> or pinchtab %s --css <selector> or pinchtab %s --x <num> --y <num>", kind, kind, kind)
 	}
 
 	if kind == "click" {
+		if submit, _ := cmd.Flags().GetBool("submit"); submit {
+			body["submit"] = true
+		}
+		if dismiss, _ := cmd.Flags().GetBool("dismiss-known-interstitials"); dismiss {
+			body["dismissKnownInterstitials"] = true
+		}
 		waitNav, _ := cmd.Flags().GetBool("wait-nav")
 		if waitNav {
 			body["waitNav"] = true
+		}
+		mode, _ := cmd.Flags().GetString("mode")
+		if mode != "" {
+			body["mode"] = mode
+		}
+		if mode != "" && cmd.Flags().Changed("humanize") {
+			if humanize, _ := cmd.Flags().GetBool("humanize"); humanize {
+				cli.Fatal("Error: mode and humanize are mutually exclusive")
+			}
 		}
 		// --dismiss-banners only fires when --wait-nav is set; without nav,
 		// banners haven't changed and the dismissal pass would be wasted.
@@ -90,13 +108,8 @@ func setSelectorBody(body map[string]any, s string) {
 	case selector.KindRef:
 		body["ref"] = sel.Value
 	case selector.KindCSS:
-		// CSS is the default kind — the original string either had a
-		// `css:` prefix or was auto-detected. Send the value without a
-		// prefix; the server will re-parse as CSS.
 		body["selector"] = sel.Value
 	default:
-		// text:, xpath:, semantic:, find: — preserve the original input
-		// so the server sees the correct kind prefix when it re-parses.
 		body["selector"] = s
 	}
 }
@@ -112,41 +125,63 @@ func postActionWithHeaders(client *http.Client, base, token string, cmd *cobra.C
 		path = "/tabs/" + tabID + "/action"
 	}
 
-	// Default to terse output; --json flag enables full JSON response
+	if _, ok := body["vocab"]; !ok {
+		if vocabTab, tok := apiclient.VocabForAction(base, tabID); tok != "" {
+			body["vocab"] = tok
+			body["vocabTab"] = vocabTab
+		}
+	}
+
+	opts := []apiclient.RequestOption{apiclient.WithHeaders(headers), apiclient.CaptureVocab(namedNoTab(cmd))}
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	if jsonOutput {
-		apiclient.DoPostWithHeaders(client, base, token, path, body, headers)
+		apiclient.DoPost(client, base, token, path, body, opts...)
 		return
 	}
 
-	// Quiet mode: print simple success message
-	result := apiclient.DoPostQuietWithHeaders(client, base, token, path, body, headers)
+	result := apiclient.DoPostQuiet(client, base, token, path, body, opts...)
 	kind, _ := body["kind"].(string)
 	printActionResult(kind, result)
 
-	// If --snap or --snap-diff flag is set, fetch and output snapshot
 	snap, _ := cmd.Flags().GetBool("snap")
 	snapDiff, _ := cmd.Flags().GetBool("snap-diff")
 	if snap || snapDiff {
-		fetchAndPrintSnapshot(client, base, token, tabID, snapDiff)
+		fetchAndPrintSnapshot(client, base, token, cmd, tabID, snapDiff)
 	}
 
-	// If --text flag is set, fetch and output text content
 	text, _ := cmd.Flags().GetBool("text")
 	if text {
 		fetchAndPrintText(client, base, token, tabID)
 	}
 }
 
-func fetchAndPrintSnapshot(client *http.Client, base, token, tabID string, diff bool) {
-	params := "filter=interactive&format=compact"
+func namedNoTab(cmd *cobra.Command) bool {
+	tab, _ := cmd.Flags().GetString("tab")
+	return tab == ""
+}
+
+// fetchAndPrintSnapshot is the --snap / --snap-diff tail. It stays best-effort —
+// a transport or HTTP failure warns on stderr and returns, never exits: this tail
+// runs after an action that already succeeded, so a cosmetic snapshot failure
+// must not turn a successful action into a non-zero exit.
+func fetchAndPrintSnapshot(client *http.Client, base, token string, cmd *cobra.Command, tabID string, diff bool) {
+	params := url.Values{"filter": {"interactive"}, "format": {"compact"}}
 	if diff {
-		params += "&diff=true"
+		params.Set("diff", "true")
 	}
 	if tabID != "" {
-		params += "&tabId=" + tabID
+		params.Set("tabId", tabID)
 	}
-	apiclient.DoGetRawAndPrint(client, base, token, "/snapshot?"+params)
+	body, err := apiclient.DoRawE(client, base, token, http.MethodGet, "/snapshot", apiclient.WithQuery(params), apiclient.CaptureVocab(namedNoTab(cmd)))
+	var statusErr *apiclient.StatusError
+	switch {
+	case errors.As(err, &statusErr):
+		fmt.Fprintf(os.Stderr, "snapshot error %d: %s\n", statusErr.Status, string(statusErr.Body))
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "snapshot failed: %v\n", errors.Unwrap(err))
+	default:
+		fmt.Println(string(body))
+	}
 }
 
 func fetchAndPrintText(client *http.Client, base, token, tabID string) {
@@ -166,13 +201,11 @@ func fetchAndPrintText(client *http.Client, base, token, tabID string) {
 }
 
 func printActionResult(kind string, result map[string]any) {
-	// Check for failure
 	if success, ok := result["success"].(bool); ok && !success {
 		errMsg := "unknown error"
 		if msg, ok := result["error"].(string); ok {
 			errMsg = msg
 		}
-		// Check for recovery hints
 		if recovery, ok := result["recovery"].(map[string]any); ok {
 			if failType, ok := recovery["failure_type"].(string); ok {
 				if failType == "stale" || failType == "navigation" {
@@ -183,8 +216,55 @@ func printActionResult(kind string, result map[string]any) {
 		output.Error(kind, errMsg, output.ExitNotFound)
 		return
 	}
+	if actionResult, ok := result["result"].(map[string]any); ok {
+		// A submit reports its own bounded post-state, which says more than "it
+		// moved" — so it is the headline, and the navigation rides underneath it
+		// rather than replacing it.
+		if postState, ok := actionResult["postState"].(map[string]any); ok {
+			status, _ := postState["status"].(string)
+			signal, _ := postState["signal"].(string)
+			switch status {
+			case "pending":
+				output.Value("PENDING")
+				output.Hint("submit post-state is still pending; do not retry automatically")
+				printNavigationOutcome(actionResult)
+				return
+			case "succeeded":
+				output.Value("SUCCEEDED " + signal)
+				printNavigationOutcome(actionResult)
+				return
+			}
+		}
+		// A click that moved the page succeeded. It used to exit 1 with a 409, which
+		// is the signal every agent loop and CI harness branches on, so the natural
+		// reaction — retry — re-clicked on the page the first click had reached.
+		if actionResult["navigated"] == true {
+			landed, _ := actionResult["url"].(string)
+			output.Value("OK navigated " + landed)
+			printStaleRefsHint()
+			return
+		}
+	}
 
 	output.Success()
+}
+
+// printNavigationOutcome reports the landing for an action whose headline is
+// something else. Every form that navigates says where it landed, including the
+// forms that declare the navigation — those are the ones whose next action depends
+// on the new page, so they are the ones that most need to hear their refs are dead.
+func printNavigationOutcome(actionResult map[string]any) {
+	if actionResult["navigated"] != true {
+		return
+	}
+	if landed, _ := actionResult["url"].(string); landed != "" {
+		output.Value("navigated " + landed)
+	}
+	printStaleRefsHint()
+}
+
+func printStaleRefsHint() {
+	output.Hint("every ref from your last snapshot is dead — run `pinchtab snap -i` before the next action")
 }
 
 func setPointBody(body map[string]any, x, y float64) {
@@ -192,7 +272,41 @@ func setPointBody(body map[string]any, x, y float64) {
 	body["y"] = y
 }
 
-func readWheelDelta(cmd *cobra.Command, primary string) (int, bool) {
+// applyScrollTarget fills a scroll body from the single positional — integer pixels, then
+// direction keyword, then unified selector — or from --dy/--dx when there is no positional.
+// Pixels and directions would otherwise parse as CSS tag selectors ("up", "down"), so they
+// are intercepted before setSelectorBody.
+//
+// A negative count is only reachable through the flags: cobra reads a leading minus on a
+// positional as bundled shorthand flags.
+//
+// The positional and the flags are two spellings of ONE argument, so a positional wins
+// outright instead of merging: assigning both would build a diagonal scroll out of a flag
+// axis and a positional axis that no caller asked for. The CLI refuses that combination
+// before it gets here, but this is exported and callable without cobra's Args hook, so the
+// rule lives here rather than on loan from another package.
+func applyScrollTarget(body map[string]any, args []string, cmd *cobra.Command) {
+	if len(args) == 0 {
+		if deltaY, ok := readIntFlag(cmd, "dy"); ok {
+			body["scrollY"] = deltaY
+		}
+		if deltaX, ok := readIntFlag(cmd, "dx"); ok {
+			body["scrollX"] = deltaX
+		}
+		return
+	}
+	if px, err := strconv.Atoi(args[0]); err == nil {
+		body["scrollY"] = px
+		return
+	}
+	if direction, ok := scroll.DirectionFor(strings.ToLower(args[0])); ok {
+		body[direction.Axis] = direction.Delta
+		return
+	}
+	setSelectorBody(body, args[0])
+}
+
+func readIntFlag(cmd *cobra.Command, primary string) (int, bool) {
 	if cmd.Flags().Changed(primary) {
 		if value, err := cmd.Flags().GetInt(primary); err == nil {
 			return value, true
@@ -276,10 +390,10 @@ func MouseAction(client *http.Client, base, token, kind string, args []string, c
 				setSelectorBody(body, args[0])
 			}
 		}
-		if deltaX, ok := readWheelDelta(cmd, "dx"); ok {
+		if deltaX, ok := readIntFlag(cmd, "dx"); ok {
 			body["deltaX"] = deltaX
 		}
-		if deltaY, ok := readWheelDelta(cmd, "dy"); ok {
+		if deltaY, ok := readIntFlag(cmd, "dy"); ok {
 			if _, fromArg := body["deltaY"]; fromArg {
 				cli.Fatal("Usage: pinchtab mouse wheel <dy> [--dx <n>] or pinchtab mouse wheel [selector]")
 			}
@@ -341,12 +455,6 @@ func actionBodyForTarget(kind string, target dragTarget) map[string]any {
 }
 
 func Drag(client *http.Client, base, token string, args []string, cmd *cobra.Command) {
-	// Two modes:
-	//   1. pinchtab drag <selector> --drag-x N --drag-y N
-	//        → single HTTP "drag" action with pixel offsets (dragX/dragY).
-	//   2. pinchtab drag <from> <to>
-	//        → synthesized mouse-move → mouse-down → mouse-move → mouse-up
-	//          sequence. Each target may be "selector" or "x,y" coords.
 	hasDragX := cmd.Flags().Changed("drag-x")
 	hasDragY := cmd.Flags().Changed("drag-y")
 
@@ -371,20 +479,21 @@ func Drag(client *http.Client, base, token string, args []string, cmd *cobra.Com
 		cli.Fatal("Usage: pinchtab drag <from> <to>  or  pinchtab drag <selector> --drag-x <n> --drag-y <n>")
 	}
 
-	from := parseDragTarget(args[0])
-	to := parseDragTarget(args[1])
-
-	mouseDown := map[string]any{"kind": bridge.ActionMouseDown}
-	mouseUp := map[string]any{"kind": bridge.ActionMouseUp}
+	body := actionBodyForTarget(bridge.ActionDrag, parseDragTarget(args[0]))
+	setDragDestinationBody(body, parseDragTarget(args[1]))
 	if button, _ := cmd.Flags().GetString("button"); button != "" {
-		mouseDown["button"] = button
-		mouseUp["button"] = button
+		body["button"] = button
 	}
+	postAction(client, base, token, cmd, body)
+}
 
-	postAction(client, base, token, cmd, actionBodyForTarget(bridge.ActionMouseMove, from))
-	postAction(client, base, token, cmd, mouseDown)
-	postAction(client, base, token, cmd, actionBodyForTarget(bridge.ActionMouseMove, to))
-	postAction(client, base, token, cmd, mouseUp)
+func setDragDestinationBody(body map[string]any, target dragTarget) {
+	if target.hasXY {
+		body["toX"] = target.x
+		body["toY"] = target.y
+		return
+	}
+	body["toSelector"] = target.selector
 }
 
 func ActionSimple(client *http.Client, base, token, kind string, args []string, cmd *cobra.Command) {
@@ -392,40 +501,23 @@ func ActionSimple(client *http.Client, base, token, kind string, args []string, 
 
 	switch kind {
 	case "type":
-		// First arg is a unified selector
 		setSelectorBody(body, args[0])
 		body["text"] = strings.Join(args[1:], " ")
 	case "fill":
-		// First arg is a unified selector
 		setSelectorBody(body, args[0])
 		body["text"] = strings.Join(args[1:], " ")
+		if submit, _ := cmd.Flags().GetBool("submit"); submit {
+			body["submit"] = true
+		}
 	case "press":
-		body["key"] = args[0]
-	case "scroll":
-		// Precedence: integer pixels > direction keyword > unified selector.
-		// Pixels and directions are short, low-cardinality inputs that would
-		// otherwise also parse as CSS tag selectors (e.g. "up" / "down"), so
-		// we intercept them before handing off to setSelectorBody.
-		if px, err := strconv.Atoi(args[0]); err == nil {
-			body["scrollY"] = px
-			break
-		}
-		switch strings.ToLower(args[0]) {
-		case "down":
-			body["scrollY"] = 800
-		case "up":
-			body["scrollY"] = -800
-		case "right":
-			body["scrollX"] = 800
-		case "left":
-			body["scrollX"] = -800
-		default:
-			// Fall back to the unified selector parser so refs ("e5"),
-			// CSS ("#footer", ".class"), XPath ("//..."), text: and
-			// semantic selectors all work — same contract as `click`,
-			// `fill`, `hover`, etc. Server supports these via req.Selector.
+		if len(args) >= 2 {
 			setSelectorBody(body, args[0])
+			body["key"] = args[1]
+		} else {
+			body["key"] = args[0]
 		}
+	case "scroll":
+		applyScrollTarget(body, args, cmd)
 	case "select":
 		setSelectorBody(body, args[0])
 		body["value"] = args[1]

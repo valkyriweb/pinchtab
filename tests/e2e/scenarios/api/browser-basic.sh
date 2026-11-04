@@ -40,6 +40,15 @@ assert_json_contains "$RESULT" '.title' 'Table'
 end_test
 
 # ─────────────────────────────────────────────────────────────────
+start_test "pinchtab nav --new-tab follows the created target lifecycle"
+
+pt_post /navigate -d "{\"url\":\"${FIXTURES_URL}/navigation-extra-target.html\",\"newTab\":true,\"timeout\":3}"
+assert_ok "navigate owner target while the page spawns a loading side target"
+assert_json_contains "$RESULT" '.title' 'Navigation Target Owner'
+
+end_test
+
+# ────────────────────────────────────────────────────────────────
 start_test "pinchtab tabs"
 
 assert_tab_count_gte 2
@@ -125,6 +134,22 @@ pt_post /navigate -d "{\"url\":\"${FIXTURES_URL}/form.html\"}"
 
 pt_get /snapshot
 assert_form_page "$RESULT"
+
+end_test
+
+# ─────────────────────────────────────────────────────────────────
+start_test "pinchtab snap (snapshot-hydrated-list.html): content-visibility:auto rows in a background tab"
+
+pt_post /navigate -d "{\"url\":\"${FIXTURES_URL}/snapshot-hydrated-list.html\"}"
+assert_ok "navigate to hydrated list"
+
+pt_get "/snapshot?filter=all"
+assert_ok "snapshot hydrated list"
+assert_json_eq "$RESULT" '[.nodes[] | select(.role == "link" and (.name | startswith("Hydrated issue")))] | length' '3' "all three rows are in the snapshot"
+
+pt_post /find -d '{"query":"Hydrated issue gamma"}'
+assert_ok "find hydrated row"
+assert_json_eq "$RESULT" '.matches[0].name' 'Hydrated issue gamma' "find sees the row"
 
 end_test
 

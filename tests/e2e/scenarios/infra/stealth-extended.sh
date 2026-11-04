@@ -37,7 +37,7 @@ run_stealth_level_matrix() {
   MATRIX_STATUS="$RESULT"
   assert_json_eq "$RESULT" '.level' "$STEALTH_LEVEL" "status level matches instance"
   assert_json_exists "$RESULT" '.scriptHash' "status includes script hash"
-  assert_json_eq "$RESULT" '.flags.globalUserAgent' 'true' "status reports global launch UA"
+  assert_json_eq "$RESULT" '.flags.globalUserAgent' 'true' "status reports global launch UA is pinned (default headless config or custom UA)"
   assert_json_eq "$RESULT" '.capabilities.webdriverNativeStrategy' 'true' "status reports native webdriver strategy"
   assert_json_eq "$RESULT" '.capabilities.downlinkMax' 'true' "status reports downlinkMax capability"
   end_test
@@ -76,9 +76,16 @@ run_stealth_level_matrix() {
       assert_json_eq "$RESULT" '.capabilities.iframeIsolation' 'true' "status enables iframe isolation at medium"
     else
       assert_json_eq "$RESULT" '.capabilities.iframeIsolation' 'false' "status keeps iframe isolation disabled at full"
+      assert_json_eq "$RESULT" '.capabilities.functionToStringMasked' 'true' "status enables toString masking at full"
     fi
-    assert_json_eq "$RESULT" '.capabilities.errorStackSanitized' 'false' "status keeps stack sanitization disabled at medium+"
-    assert_json_eq "$RESULT" '.capabilities.functionToStringMasked' 'false' "status keeps toString masking disabled at medium+"
+    if [ "$STEALTH_LEVEL" = "full" ]; then
+      assert_json_eq "$RESULT" '.capabilities.errorStackSanitized' 'true' "status enables stack sanitization at full"
+    else
+      assert_json_eq "$RESULT" '.capabilities.errorStackSanitized' 'false' "status keeps stack sanitization disabled at medium"
+    fi
+    if [ "$STEALTH_LEVEL" != "full" ]; then
+      assert_json_eq "$RESULT" '.capabilities.functionToStringMasked' 'false' "status keeps toString masking disabled at medium"
+    fi
     assert_json_eq "$RESULT" '.capabilities.functionToStringNative' 'true' "status keeps native Function.prototype.toString at medium+"
   fi
   assert_json_eq "$RESULT" '.capabilities.intlLocaleCoherent' 'true' "status reports locale coherence"
@@ -153,8 +160,9 @@ run_stealth_level_matrix() {
   else
     assert_eval_poll "window.__stealthCapabilities.chromeRuntimeConnect" "false" "connect remains absent at full"
     assert_eval_poll "window.__stealthCapabilities.iframeIsolation" "false" "iframe isolation remains absent at full"
-    assert_eval_poll "window.__stealthCapabilities.errorStackSanitized" "false" "stack sanitization remains absent at full"
-    assert_eval_poll "window.__stealthCapabilities.functionToStringMasked" "false" "native-looking toString masking remains absent at full"
+    assert_eval_poll "window.__stealthCapabilities.errorStackSanitized" "true" "stack sanitization is active at full"
+    assert_eval_poll "window.__stealthCapabilities.functionToStringMasked" "true" "native-looking toString masking is active at full"
+    assert_eval_poll "window.__stealthCapabilities.iframeFunctionToStringParity" "true" "same-origin iframes get consistent toString masking at full"
   fi
   assert_eval_poll "window.__stealthCapabilities.functionToStringNative" "true" "Function.prototype.toString remains native-like"
   assert_eval_poll "window.__stealthCapabilities.webdriverDescriptorNativeLike" "true" "webdriver descriptor getter stays native-like"
@@ -405,30 +413,6 @@ run_stealth_level_matrix() {
   E2E_SERVER="$ORIG_URL"
 }
 
-if [ "${STEALTH_MATRIX:-0}" = "1" ]; then
-  matrix_levels=()
-  if [ -n "${STEALTH_LEVEL:-}" ]; then
-    matrix_levels=("${STEALTH_LEVEL}")
-  else
-    matrix_levels=(light medium full)
-  fi
-
-  original_level="${STEALTH_LEVEL:-}"
-  for matrix_level in "${matrix_levels[@]}"; do
-    STEALTH_LEVEL="${matrix_level}"
-    run_stealth_level_matrix
-  done
-  if [ -n "${original_level}" ]; then
-    STEALTH_LEVEL="${original_level}"
-  else
-    unset STEALTH_LEVEL
-  fi
-  if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    finish_suite
-  fi
-  return 0
-fi
-
 # Adds the heavier heuristics and secure-instance smoke checks on top of the
 # baseline coverage in 45-bot-detection.sh.
 
@@ -444,8 +428,13 @@ end_test
 
 start_test "bot-detect-full: outer window dimensions exist"
 
-pt_post /evaluate '{"expression":"window.outerWidth > 0 && window.outerHeight > 0"}'
-assert_json_eq "$RESULT" '.result' 'true' "outerWidth/outerHeight > 0"
+if [ "${PINCHTAB_E2E_BROWSER:-chrome}" = "cloak" ]; then
+  pt_post /evaluate '{"expression":"window.outerWidth === 0 && window.outerHeight === 0"}'
+  assert_json_eq "$RESULT" '.result' 'true' "cloak zeroes outerWidth/outerHeight"
+else
+  pt_post /evaluate '{"expression":"window.outerWidth > 0 && window.outerHeight > 0"}'
+  assert_json_eq "$RESULT" '.result' 'true' "outerWidth/outerHeight > 0"
+fi
 
 end_test
 
@@ -501,104 +490,106 @@ if [ -n "$FULL_URL" ]; then
   echo ""
   echo -e "${BLUE}Testing FULL stealth mode (permissive instance)${NC}"
 
-  ORIG_URL="$E2E_SERVER"
-  E2E_SERVER="$FULL_URL"
+  permissive_full_stealth_checks() {
+    start_test "bot-detect-full: can navigate with permissive full stealth"
 
-  start_test "bot-detect-full: can navigate with permissive full stealth"
+    pt_post /navigate "{\"url\":\"${FIXTURES_URL}/bot-detect.html\"}"
+    assert_ok "navigate to bot-detect fixture (permissive full stealth)"
 
-  pt_post /navigate "{\"url\":\"${FIXTURES_URL}/bot-detect.html\"}"
-  assert_ok "navigate to bot-detect fixture (permissive full stealth)"
+    end_test
 
-  end_test
+    start_test "bot-detect-full: WebGL not SwiftShader (full stealth spoofs GPU)"
 
-  start_test "bot-detect-full: WebGL not SwiftShader (full stealth spoofs GPU)"
+    pt_post /evaluate '{"expression":"(() => { try { const c = document.createElement(\"canvas\"); const gl = c.getContext(\"webgl\"); const d = gl.getExtension(\"WEBGL_debug_renderer_info\"); return gl.getParameter(d.UNMASKED_RENDERER_WEBGL).toLowerCase().includes(\"swiftshader\"); } catch(e) { return false; } })()"}'
+    assert_json_eq "$RESULT" '.result' 'false' "WebGL renderer not SwiftShader"
 
-  pt_post /evaluate '{"expression":"(() => { try { const c = document.createElement(\"canvas\"); const gl = c.getContext(\"webgl\"); const d = gl.getExtension(\"WEBGL_debug_renderer_info\"); return gl.getParameter(d.UNMASKED_RENDERER_WEBGL).toLowerCase().includes(\"swiftshader\"); } catch(e) { return false; } })()"}'
-  assert_json_eq "$RESULT" '.result' 'false' "WebGL renderer not SwiftShader"
+    end_test
 
-  end_test
+    start_test "bot-detect-full: WebGL renderer matches platform when observable"
 
-  start_test "bot-detect-full: WebGL renderer matches platform when observable"
-
-  pt_post /evaluate '{"expression":"(() => { try { const c = document.createElement(\"canvas\"); const gl = c.getContext(\"webgl\"); const d = gl && gl.getExtension(\"WEBGL_debug_renderer_info\"); const r = d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : \"\"; const p = navigator.platform || \"\"; const lower = r.toLowerCase(); const ok = !d || (!lower.includes(\"swiftshader\") && ((p === \"MacIntel\" && !lower.includes(\"direct3d\")) || (p.includes(\"Linux\") && !lower.includes(\"direct3d\")) || (p.includes(\"Win\") && lower.includes(\"direct3d\")))); return JSON.stringify({available: !!d, renderer: r, platform: p, ok}); } catch(e) { return JSON.stringify({available:false, renderer:\"\", platform:navigator.platform || \"\", ok:false}); } })()"}'
-  webgl_json=$(echo "$RESULT" | jq -r '.result // "{}"')
-  webgl_available=$(echo "$webgl_json" | jq -r '.available // false')
-  webgl_ok=$(echo "$webgl_json" | jq -r '.ok // false')
-  webgl_renderer=$(echo "$webgl_json" | jq -r '.renderer // ""')
-  webgl_platform=$(echo "$webgl_json" | jq -r '.platform // ""')
-  if [ "$webgl_available" = "true" ]; then
-    if [ "$webgl_ok" = "true" ]; then
-      echo -e "  ${GREEN}✓${NC} WebGL renderer matches platform (${webgl_platform})"
-      ((ASSERTIONS_PASSED++)) || true
+    pt_post /evaluate '{"expression":"(() => { try { const c = document.createElement(\"canvas\"); const gl = c.getContext(\"webgl\"); const d = gl && gl.getExtension(\"WEBGL_debug_renderer_info\"); const r = d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : \"\"; const p = navigator.platform || \"\"; const lower = r.toLowerCase(); const ok = !d || (!lower.includes(\"swiftshader\") && ((p === \"MacIntel\" && !lower.includes(\"direct3d\")) || (p.includes(\"Linux\") && !lower.includes(\"direct3d\")) || (p.includes(\"Win\") && lower.includes(\"direct3d\")))); return JSON.stringify({available: !!d, renderer: r, platform: p, ok}); } catch(e) { return JSON.stringify({available:false, renderer:\"\", platform:navigator.platform || \"\", ok:false}); } })()"}'
+    webgl_json=$(echo "$RESULT" | jq -r '.result // "{}"')
+    webgl_available=$(echo "$webgl_json" | jq -r '.available // false')
+    webgl_ok=$(echo "$webgl_json" | jq -r '.ok // false')
+    webgl_renderer=$(echo "$webgl_json" | jq -r '.renderer // ""')
+    webgl_platform=$(echo "$webgl_json" | jq -r '.platform // ""')
+    if [ "$webgl_available" = "true" ]; then
+      if [ "$webgl_ok" = "true" ]; then
+        echo -e "  ${GREEN}✓${NC} WebGL renderer matches platform (${webgl_platform})"
+        ((ASSERTIONS_PASSED++)) || true
+      else
+        echo -e "  ${RED}✗${NC} WebGL renderer mismatches platform ${webgl_platform}: ${webgl_renderer}"
+        ((ASSERTIONS_FAILED++)) || true
+      fi
     else
-      echo -e "  ${RED}✗${NC} WebGL renderer mismatches platform ${webgl_platform}: ${webgl_renderer}"
-      ((ASSERTIONS_FAILED++)) || true
+      echo -e "  ${MUTED}(skipped - WEBGL_debug_renderer_info unavailable)${NC}"
+      ((ASSERTIONS_PASSED++)) || true
     fi
-  else
-    echo -e "  ${MUTED}(skipped - WEBGL_debug_renderer_info unavailable)${NC}"
-    ((ASSERTIONS_PASSED++)) || true
-  fi
 
-  end_test
+    end_test
 
-  start_test "bot-detect-full: permissive full score check"
+    start_test "bot-detect-full: permissive full score check"
 
-  pt_post /evaluate '{"expression":"JSON.stringify(window.__botDetectScore || {})"}'
-  score_json=$(echo "$RESULT" | jq -r '.result // "{}"')
-  critical_passed=$(echo "$score_json" | jq -r '.critical // 0')
-  critical_total=$(echo "$score_json" | jq -r '.criticalTotal // 0')
+    if [ "${PINCHTAB_E2E_BROWSER:-chrome}" = "cloak" ]; then
+      skip_test "cloak removes surfaces this composite score rewards (chrome.runtime/battery/outer dims)"
+    else
+      pt_post /evaluate '{"expression":"JSON.stringify(window.__botDetectScore || {})"}'
+      score_json=$(echo "$RESULT" | jq -r '.result // "{}"')
+      critical_passed=$(echo "$score_json" | jq -r '.critical // 0')
+      critical_total=$(echo "$score_json" | jq -r '.criticalTotal // 0')
 
-  echo -e "  ${MUTED}Score: critical ${critical_passed}/${critical_total} (full)${NC}"
+      echo -e "  ${MUTED}Score: critical ${critical_passed}/${critical_total} (full)${NC}"
 
-  if [ "$critical_passed" -ge "$critical_total" ]; then
-    echo -e "  ${GREEN}✓${NC} score meets full expectations"
-    ((ASSERTIONS_PASSED++)) || true
-  else
-    echo -e "  ${RED}✗${NC} score below full expectations (${critical_passed}/${critical_total})"
-    ((ASSERTIONS_FAILED++)) || true
-  fi
+      if [ "$critical_passed" -ge "$critical_total" ]; then
+        echo -e "  ${GREEN}✓${NC} score meets full expectations"
+        ((ASSERTIONS_PASSED++)) || true
+      else
+        echo -e "  ${RED}✗${NC} score below full expectations (${critical_passed}/${critical_total})"
+        ((ASSERTIONS_FAILED++)) || true
+      fi
+    fi
 
-  end_test
+    end_test
+  }
 
-  E2E_SERVER="$ORIG_URL"
+  with_server "$FULL_URL" permissive_full_stealth_checks
 fi
 
 echo ""
 echo -e "${BLUE}Testing FULL stealth mode (restrictive instance)${NC}"
 echo -e "${YELLOW}Note: evaluate disabled on restrictive instance, testing navigation only${NC}"
 
-ORIG_URL="$E2E_SERVER"
-E2E_SERVER="$E2E_SECURE_SERVER"
+full_stealth_checks() {
+  start_test "bot-detect-full: can navigate with full stealth"
 
-start_test "bot-detect-full: can navigate with full stealth"
+  pt_post /navigate "{\"url\":\"${FIXTURES_URL}/bot-detect.html\"}"
+  assert_ok "navigate to bot-detect fixture (full stealth)"
 
-pt_post /navigate "{\"url\":\"${FIXTURES_URL}/bot-detect.html\"}"
-assert_ok "navigate to bot-detect fixture (full stealth)"
+  TAB_ID=$(echo "$RESULT" | jq -r '.tabId // empty')
+  if [ -n "$TAB_ID" ]; then
+    echo -e "  ${GREEN}✓${NC} Got tabId: $TAB_ID"
+    ((ASSERTIONS_PASSED++)) || true
+  else
+    echo -e "  ${RED}✗${NC} No tabId in response"
+    ((ASSERTIONS_FAILED++)) || true
+  fi
 
-TAB_ID=$(echo "$RESULT" | jq -r '.tabId // empty')
-if [ -n "$TAB_ID" ]; then
-  echo -e "  ${GREEN}✓${NC} Got tabId: $TAB_ID"
-  ((ASSERTIONS_PASSED++)) || true
-else
-  echo -e "  ${RED}✗${NC} No tabId in response"
-  ((ASSERTIONS_FAILED++)) || true
-fi
+  end_test
 
-end_test
+  start_test "bot-detect-full: page title loaded correctly"
 
-start_test "bot-detect-full: page title loaded correctly"
+  TITLE=$(echo "$RESULT" | jq -r '.title // empty')
+  if [ "$TITLE" = "Bot Detection Tests" ]; then
+    echo -e "  ${GREEN}✓${NC} Page title: $TITLE"
+    ((ASSERTIONS_PASSED++)) || true
+  else
+    echo -e "  ${YELLOW}⚠${NC} Unexpected title: $TITLE"
+  fi
 
-TITLE=$(echo "$RESULT" | jq -r '.title // empty')
-if [ "$TITLE" = "Bot Detection Tests" ]; then
-  echo -e "  ${GREEN}✓${NC} Page title: $TITLE"
-  ((ASSERTIONS_PASSED++)) || true
-else
-  echo -e "  ${YELLOW}⚠${NC} Unexpected title: $TITLE"
-fi
+  end_test
+}
 
-end_test
-
-E2E_SERVER="$ORIG_URL"
+with_server "$E2E_SECURE_SERVER" full_stealth_checks
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   finish_suite

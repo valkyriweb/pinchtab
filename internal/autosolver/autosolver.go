@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
+
+	"github.com/pinchtab/pinchtab/internal/htmltrim"
 )
 
 // AutoSolver orchestrates the challenge-detection and solving pipeline.
@@ -16,6 +19,8 @@ type AutoSolver struct {
 	semantic SemanticEngine
 	llm      LLMProvider
 	config   Config
+
+	warnedMissingKey sync.Map
 }
 
 // New creates an AutoSolver with the given configuration.
@@ -56,17 +61,21 @@ func (as *AutoSolver) Solve(ctx context.Context, page Page, executor ActionExecu
 		"max_attempts", as.config.MaxAttempts,
 		"llm_fallback", as.config.LLMFallback)
 
-	// Detect what kind of page we're dealing with.
 	intent, err := as.detectIntent(ctx, page)
 	if err != nil {
 		slog.Warn("autosolver: intent detection failed, proceeding with unknown",
 			"err", err, "url", page.URL())
 		intent = &Intent{Type: IntentUnknown, Confidence: 0}
 	}
-	result.Intent = intent.Type
+	// A SemanticEngine may report (nil, nil): no error, no reading. That is the
+	// same "we know nothing" the error branch above substitutes for, so it gets
+	// the same substitution here rather than a nil check at every later read.
+	if intent == nil {
+		intent = &Intent{Type: IntentUnknown, Confidence: 0}
+	}
+	result.Intent = intentTypeOf(intent)
 
-	// No challenge - nothing to solve.
-	if intent.Type == IntentNormal {
+	if intentTypeOf(intent) == IntentNormal {
 		result.Solved = true
 		result.TotalDuration = time.Since(start)
 		slog.Info("autosolver_done",
@@ -78,15 +87,13 @@ func (as *AutoSolver) Solve(ctx context.Context, page Page, executor ActionExecu
 	}
 
 	slog.Info("autosolver: challenge detected",
-		"type", intent.Type,
+		"type", intentTypeOf(intent),
 		"confidence", intent.Confidence,
 		"url", page.URL())
 
-	// Run the fallback chain with retry logic.
 	for attempt := 0; attempt < as.config.MaxAttempts; attempt++ {
 		result.Attempts = attempt + 1
 
-		// Apply backoff between retries (skip first attempt).
 		if attempt > 0 {
 			delay := as.backoffDelay(attempt)
 			slog.Info("autosolver_retry",
@@ -107,77 +114,23 @@ func (as *AutoSolver) Solve(ctx context.Context, page Page, executor ActionExecu
 			}
 		}
 
-		// Try semantic-first action before any rule-based solver.
 		solved, entry := as.trySemantic(ctx, page, executor, intent)
-		if entry != nil {
-			result.History = append(result.History, *entry)
-		}
+		appendAttempt(result, entry)
 		if solved {
-			result.Solved = true
-			result.SolverUsed = entry.Solver
-			result.FinalTitle = page.Title()
-			result.FinalURL = page.URL()
-			result.TotalDuration = time.Since(start)
-			slog.Info("autosolver_success",
-				"solver", entry.Solver,
-				"attempts", result.Attempts,
-				"duration_ms", result.TotalDuration.Milliseconds(),
-				"url", page.URL())
-			slog.Info("autosolver_done",
-				"solved", true,
-				"solver", entry.Solver,
-				"attempts", result.Attempts,
-				"duration_ms", result.TotalDuration.Milliseconds())
-			return result, nil
+			return as.finalizeSuccess(result, page, entry.Solver, start), nil
 		}
 
-		// Try registered solvers in priority order.
-		solved, entry = as.trySolvers(ctx, page, executor)
-		if entry != nil {
-			result.History = append(result.History, *entry)
-		}
+		solved, entries := as.trySolvers(ctx, page, executor)
+		result.History = append(result.History, entries...)
 		if solved {
-			result.Solved = true
-			result.SolverUsed = entry.Solver
-			result.FinalTitle = page.Title()
-			result.FinalURL = page.URL()
-			result.TotalDuration = time.Since(start)
-			slog.Info("autosolver_success",
-				"solver", entry.Solver,
-				"attempts", result.Attempts,
-				"duration_ms", result.TotalDuration.Milliseconds(),
-				"url", page.URL())
-			slog.Info("autosolver_done",
-				"solved", true,
-				"solver", entry.Solver,
-				"attempts", result.Attempts,
-				"duration_ms", result.TotalDuration.Milliseconds())
-			return result, nil
+			return as.finalizeSuccess(result, page, entries[len(entries)-1].Solver, start), nil
 		}
 
-		// Try LLM fallback if enabled and all solvers failed.
 		if as.config.LLMFallback && as.llm != nil {
 			solved, entry = as.tryLLM(ctx, page, executor, result.History)
-			if entry != nil {
-				result.History = append(result.History, *entry)
-			}
+			appendAttempt(result, entry)
 			if solved {
-				result.Solved = true
-				result.SolverUsed = "llm"
-				result.FinalTitle = page.Title()
-				result.FinalURL = page.URL()
-				result.TotalDuration = time.Since(start)
-				slog.Info("autosolver_success",
-					"solver", "llm",
-					"attempts", result.Attempts,
-					"duration_ms", result.TotalDuration.Milliseconds(),
-					"url", page.URL())
-				slog.Info("autosolver_done",
-					"solved", true,
-					"solver", "llm",
-					"attempts", result.Attempts,
-					"duration_ms", result.TotalDuration.Milliseconds())
-				return result, nil
+				return as.finalizeSuccess(result, page, llmFallbackSolverLabel, start), nil
 			}
 		}
 	}
@@ -197,8 +150,32 @@ func (as *AutoSolver) Solve(ctx context.Context, page Page, executor ActionExecu
 	return result, nil
 }
 
-// detectIntent uses the semantic engine if available, otherwise falls
-// back to basic title-based heuristics.
+func appendAttempt(result *Result, entry *AttemptEntry) {
+	if entry != nil {
+		result.History = append(result.History, *entry)
+	}
+}
+
+// finalizeSuccess records a solved result, logs success + done, and returns it.
+func (as *AutoSolver) finalizeSuccess(result *Result, page Page, solver string, start time.Time) *Result {
+	result.Solved = true
+	result.SolverUsed = solver
+	result.FinalTitle = page.Title()
+	result.FinalURL = page.URL()
+	result.TotalDuration = time.Since(start)
+	slog.Info("autosolver_success",
+		"solver", solver,
+		"attempts", result.Attempts,
+		"duration_ms", result.TotalDuration.Milliseconds(),
+		"url", page.URL())
+	slog.Info("autosolver_done",
+		"solved", true,
+		"solver", solver,
+		"attempts", result.Attempts,
+		"duration_ms", result.TotalDuration.Milliseconds())
+	return result
+}
+
 func (as *AutoSolver) detectIntent(ctx context.Context, page Page) (*Intent, error) {
 	if as.semantic != nil {
 		return as.semantic.DetectIntent(ctx, page)
@@ -206,53 +183,109 @@ func (as *AutoSolver) detectIntent(ctx context.Context, page Page) (*Intent, err
 	return detectIntentByTitle(page.Title()), nil
 }
 
-// trySolvers iterates through matching solvers and returns on first success.
-func (as *AutoSolver) trySolvers(ctx context.Context, page Page, executor ActionExecutor) (bool, *AttemptEntry) {
+func (as *AutoSolver) orderSolvers(matching []Solver) []Solver {
+	if len(as.config.Solvers) == 0 {
+		return matching
+	}
+
+	byName := make(map[string]Solver, len(matching))
+	for _, s := range matching {
+		byName[s.Name()] = s
+	}
+
+	filtered := make([]Solver, 0, len(as.config.Solvers))
+	missing := make([]string, 0, len(as.config.Solvers))
+	for _, name := range as.config.Solvers {
+		if s, ok := byName[name]; ok {
+			filtered = append(filtered, s)
+			continue
+		}
+		missing = append(missing, name)
+	}
+
+	if len(filtered) == 0 {
+		available := make([]string, 0, len(byName))
+		for name := range byName {
+			available = append(available, name)
+		}
+		sort.Strings(available)
+		// Warn, not debug: every configured solver is unavailable, so the run
+		// silently uses solvers the operator never listed. Refusing to solve
+		// would be the worse failure, so the fallback stays — but it stops
+		// being invisible at the default log level.
+		slog.Warn("autosolver: no configured solver is available, falling back to priority order",
+			"configured", as.config.Solvers,
+			"unavailable", missing,
+			"running", available)
+		return matching
+	}
+
+	as.reportMissingSolvers(missing, filtered)
+	return filtered
+}
+
+// reportMissingSolvers splits the configured-but-unavailable names by whether the
+// operator can act on them. Only an unset API key is actionable, and the names
+// here are absent from THIS page's matching set, which a working solver is too
+// whenever it does not handle this challenge — so the registry decides, never the
+// caller's slice.
+func (as *AutoSolver) reportMissingSolvers(missing []string, running []Solver) {
+	if len(missing) == 0 {
+		return
+	}
+
+	unactionable := make([]string, 0, len(missing))
+	for _, name := range missing {
+		gated, ok := KeyGatedSolverNamed(name)
+		if !ok || as.isRegistered(name) {
+			unactionable = append(unactionable, name)
+			continue
+		}
+		if _, warned := as.warnedMissingKey.LoadOrStore(name, struct{}{}); warned {
+			continue
+		}
+		slog.Warn(fmt.Sprintf("autosolver: %s is configured but its API key is not set, so it never runs", gated.Name),
+			"solver", gated.Name,
+			"config_key", gated.ConfigKey,
+			"configured", as.config.Solvers,
+			"running", solverNamesOf(running))
+	}
+
+	if len(unactionable) > 0 {
+		slog.Debug("autosolver: some configured solvers unavailable; using matched subset",
+			"configured", as.config.Solvers,
+			"missing", unactionable)
+	}
+}
+
+func (as *AutoSolver) isRegistered(name string) bool {
+	if as.registry == nil {
+		return false
+	}
+	_, ok := as.registry.Get(name)
+	return ok
+}
+
+func solverNamesOf(solvers []Solver) []string {
+	names := make([]string, 0, len(solvers))
+	for _, s := range solvers {
+		names = append(names, s.Name())
+	}
+	return names
+}
+
+func (as *AutoSolver) trySolvers(ctx context.Context, page Page, executor ActionExecutor) (bool, []AttemptEntry) {
 	solvers := as.registry.MatchingSolvers(ctx, page)
 	if len(solvers) == 0 {
-		return false, &AttemptEntry{
+		return false, []AttemptEntry{{
 			Solver: "none",
 			Status: StatusSkipped,
-		}
+		}}
 	}
 
-	orderedSolvers := solvers
-	if len(as.config.Solvers) > 0 {
-		byName := make(map[string]Solver, len(solvers))
-		for _, s := range solvers {
-			byName[s.Name()] = s
-		}
+	orderedSolvers := as.orderSolvers(solvers)
 
-		filtered := make([]Solver, 0, len(as.config.Solvers))
-		missing := make([]string, 0, len(as.config.Solvers))
-		for _, name := range as.config.Solvers {
-			if s, ok := byName[name]; ok {
-				filtered = append(filtered, s)
-				continue
-			}
-			missing = append(missing, name)
-		}
-
-		// If config names don't match available solvers, preserve default behavior.
-		if len(filtered) > 0 {
-			if len(missing) > 0 {
-				slog.Debug("autosolver: some configured solvers unavailable; using matched subset",
-					"configured", as.config.Solvers,
-					"missing", missing)
-			}
-			orderedSolvers = filtered
-		} else {
-			available := make([]string, 0, len(byName))
-			for name := range byName {
-				available = append(available, name)
-			}
-			sort.Strings(available)
-			slog.Debug("autosolver: configured solver order not found, using priority order",
-				"configured", as.config.Solvers,
-				"available", available)
-		}
-	}
-
+	entries := make([]AttemptEntry, 0, len(orderedSolvers))
 	for _, s := range orderedSolvers {
 		solverCtx, cancel := context.WithTimeout(ctx, as.config.SolverTimeout)
 		solverStart := time.Now()
@@ -264,7 +297,7 @@ func (as *AutoSolver) trySolvers(ctx context.Context, page Page, executor Action
 		solveResult, err := s.Solve(solverCtx, page, executor)
 		cancel()
 
-		entry := &AttemptEntry{
+		entry := AttemptEntry{
 			Solver:   s.Name(),
 			Duration: time.Since(solverStart),
 		}
@@ -276,12 +309,13 @@ func (as *AutoSolver) trySolvers(ctx context.Context, page Page, executor Action
 				"solver", s.Name(),
 				"error", err,
 				"duration_ms", entry.Duration.Milliseconds())
+			entries = append(entries, entry)
 			continue
 		}
 
 		if solveResult != nil && solveResult.Solved {
 			entry.Status = StatusSolved
-			return true, entry
+			return true, append(entries, entry)
 		}
 
 		entry.Status = StatusFailed
@@ -291,26 +325,18 @@ func (as *AutoSolver) trySolvers(ctx context.Context, page Page, executor Action
 		slog.Debug("autosolver: solver returned not-solved",
 			"solver", s.Name(),
 			"duration_ms", entry.Duration.Milliseconds())
+		entries = append(entries, entry)
 	}
 
-	return false, &AttemptEntry{
-		Solver: orderedSolvers[len(orderedSolvers)-1].Name(),
-		Status: StatusFailed,
-		Error:  "all matching solvers failed",
-	}
+	return false, entries
 }
 
-// trySemantic executes semantic /find-driven action planning first.
-// For high-level intents it runs a small multi-step semantic flow.
 func (as *AutoSolver) trySemantic(ctx context.Context, page Page, executor ActionExecutor, intent *Intent) (bool, *AttemptEntry) {
-	entry := &AttemptEntry{Solver: "semantic"}
+	entry := &AttemptEntry{Solver: SemanticSolverName}
 	semanticStart := time.Now()
 
 	if as.semantic == nil {
-		entry.Status = StatusSkipped
-		entry.Error = "semantic engine not configured"
-		entry.Duration = time.Since(semanticStart)
-		return false, entry
+		return as.finishSemantic(entry, semanticStart, StatusSkipped, "semantic engine not configured")
 	}
 
 	semanticCtx, cancel := context.WithTimeout(ctx, as.config.SolverTimeout)
@@ -327,8 +353,7 @@ func (as *AutoSolver) trySemantic(ctx context.Context, page Page, executor Actio
 
 	for step := 0; step < stepBudget; step++ {
 		if step > 0 {
-			nextIntent, detectErr := as.detectIntent(semanticCtx, page)
-			if detectErr != nil {
+			if nextIntent, detectErr := as.detectIntent(semanticCtx, page); detectErr != nil {
 				slog.Debug("autosolver: semantic step intent refresh failed",
 					"step", step+1,
 					"error", detectErr)
@@ -338,76 +363,81 @@ func (as *AutoSolver) trySemantic(ctx context.Context, page Page, executor Actio
 		}
 
 		if intentTypeOf(currentIntent) == IntentNormal {
-			entry.Status = StatusSolved
-			entry.Duration = time.Since(semanticStart)
-			return true, entry
+			return as.finishSemantic(entry, semanticStart, StatusSolved, "")
 		}
 
-		suggested, err := as.semantic.SuggestAction(semanticCtx, page, currentIntent)
+		action, err := as.planSemanticStep(semanticCtx, page, currentIntent, step)
 		if err != nil {
-			entry.Status = StatusFailed
-			entry.Error = fmt.Sprintf("semantic suggest action: %v", err)
-			entry.Duration = time.Since(semanticStart)
-			return false, entry
+			return as.finishSemantic(entry, semanticStart, StatusFailed, err.Error())
 		}
 
-		planned := as.planSemanticAction(currentIntent, step, suggested)
-		action, err := as.prepareSemanticAction(semanticCtx, page, currentIntent, step, planned)
-		if err != nil {
-			slog.Debug("autosolver: semantic action preparation failed",
-				"step", step+1,
-				"intent", intentTypeOf(currentIntent),
-				"error", err)
-			entry.Status = StatusFailed
-			entry.Error = fmt.Sprintf("prepare semantic action: %v", err)
-			entry.Duration = time.Since(semanticStart)
-			return false, entry
-		}
-
-		if err := executeSuggestedAction(semanticCtx, executor, action); err != nil {
-			healedAction, healErr := as.selfHealSemanticAction(semanticCtx, page, currentIntent, step, action)
-			if healErr != nil {
-				entry.Status = StatusFailed
-				entry.Error = fmt.Sprintf("execute semantic action: %v; self-heal failed: %v", err, healErr)
-				entry.Duration = time.Since(semanticStart)
-				return false, entry
-			}
-
-			if err := executeSuggestedAction(semanticCtx, executor, healedAction); err != nil {
-				entry.Status = StatusFailed
-				entry.Error = fmt.Sprintf("execute semantic self-heal action: %v", err)
-				entry.Duration = time.Since(semanticStart)
-				return false, entry
-			}
+		if err := as.executeSemanticStep(semanticCtx, page, executor, currentIntent, step, action); err != nil {
+			return as.finishSemantic(entry, semanticStart, StatusFailed, err.Error())
 		}
 
 		actionsExecuted++
 
-		postIntent, detectErr := as.detectIntent(semanticCtx, page)
-		if detectErr != nil {
+		if postIntent, detectErr := as.detectIntent(semanticCtx, page); detectErr != nil {
 			slog.Debug("autosolver: semantic post-step intent detection failed",
 				"step", step+1,
 				"error", detectErr)
 		} else {
 			currentIntent = postIntent
-			if currentIntent.Type == IntentNormal {
-				entry.Status = StatusSolved
-				entry.Duration = time.Since(semanticStart)
-				return true, entry
+			if intentTypeOf(currentIntent) == IntentNormal {
+				return as.finishSemantic(entry, semanticStart, StatusSolved, "")
 			}
 		}
 	}
 
 	if isHighLevelIntent(initialIntentType) && actionsExecuted > 0 {
-		entry.Status = StatusSolved
-		entry.Duration = time.Since(semanticStart)
-		return true, entry
+		return as.finishSemantic(entry, semanticStart, StatusSolved, "")
 	}
 
-	entry.Status = StatusFailed
-	entry.Error = fmt.Sprintf("semantic flow exhausted for intent %q", initialIntentType)
-	entry.Duration = time.Since(semanticStart)
-	return false, entry
+	return as.finishSemantic(entry, semanticStart, StatusFailed, fmt.Sprintf("semantic flow exhausted for intent %q", initialIntentType))
+}
+
+func (as *AutoSolver) finishSemantic(entry *AttemptEntry, start time.Time, status SolverStatus, errMsg string) (bool, *AttemptEntry) {
+	entry.Status = status
+	entry.Error = errMsg
+	entry.Duration = time.Since(start)
+	return status == StatusSolved, entry
+}
+
+func (as *AutoSolver) planSemanticStep(ctx context.Context, page Page, intent *Intent, step int) (*SuggestedAction, error) {
+	suggested, err := as.semantic.SuggestAction(ctx, page, intent)
+	if err != nil {
+		return nil, fmt.Errorf("semantic suggest action: %w", err)
+	}
+
+	planned := as.planSemanticAction(intent, step, suggested)
+	action, err := as.prepareSemanticAction(ctx, page, intent, step, planned)
+	if err != nil {
+		slog.Debug("autosolver: semantic action preparation failed",
+			"step", step+1,
+			"intent", intentTypeOf(intent),
+			"error", err)
+		return nil, fmt.Errorf("prepare semantic action: %w", err)
+	}
+
+	return action, nil
+}
+
+func (as *AutoSolver) executeSemanticStep(ctx context.Context, page Page, executor ActionExecutor, intent *Intent, step int, action *SuggestedAction) error {
+	err := executeSuggestedAction(ctx, executor, action)
+	if err == nil {
+		return nil
+	}
+
+	healed, healErr := as.selfHealSemanticAction(ctx, page, intent, step, action)
+	if healErr != nil {
+		return fmt.Errorf("execute semantic action: %v; self-heal failed: %v", err, healErr)
+	}
+
+	if execErr := executeSuggestedAction(ctx, executor, healed); execErr != nil {
+		return fmt.Errorf("execute semantic self-heal action: %v", execErr)
+	}
+
+	return nil
 }
 
 type semanticFlowStep struct {
@@ -443,6 +473,37 @@ func (as *AutoSolver) planSemanticAction(intent *Intent, step int, suggested *Su
 	return planned
 }
 
+// hydrateSemanticAction maps a resolved semantic match into an actionable
+// SuggestedAction: copies the match's selector/ref + coordinates (when present),
+// applies the empty-type → click fallback (filling Text from the flow value), and
+// validates that a click has a target. clickErr formats the caller-specific
+// "click needs a target" error (wording differs between execute and self-heal).
+func hydrateSemanticAction(action *SuggestedAction, match *ElementMatch, value string, clickErr func() error) error {
+	if match != nil {
+		if match.Selector != "" {
+			action.Selector = match.Selector
+		} else if match.Ref != "" {
+			action.Selector = match.Ref
+		}
+		if match.X != 0 || match.Y != 0 {
+			action.X = match.X
+			action.Y = match.Y
+		}
+	}
+
+	if action.Action == ActionType_ && action.Text == "" {
+		action.Text = value
+		if action.Text == "" {
+			action.Action = ActionClick
+		}
+	}
+
+	if action.Action == ActionClick && action.Selector == "" && action.X == 0 && action.Y == 0 {
+		return clickErr()
+	}
+	return nil
+}
+
 func (as *AutoSolver) prepareSemanticAction(ctx context.Context, page Page, intent *Intent, step int, action *SuggestedAction) (*SuggestedAction, error) {
 	if action == nil {
 		return nil, fmt.Errorf("nil action")
@@ -451,36 +512,22 @@ func (as *AutoSolver) prepareSemanticAction(ctx context.Context, page Page, inte
 	resolved := *action
 	flowStep := semanticFlowStepForIntent(intentTypeOf(intent), step, as.config.Credentials)
 
-	shouldResolveTarget := isHighLevelIntent(intentTypeOf(intent)) || actionNeedsTarget(&resolved)
-	if shouldResolveTarget {
-		match, err := as.semantic.FindElement(ctx, page, flowStep.Query)
+	var match *ElementMatch
+	if isHighLevelIntent(intentTypeOf(intent)) || actionNeedsTarget(&resolved) {
+		var err error
+		match, err = as.semantic.FindElement(ctx, page, flowStep.Query)
 		if err != nil {
 			return nil, fmt.Errorf("semantic find element query %q: %w", flowStep.Query, err)
 		}
-		if match != nil {
-			if match.Selector != "" {
-				resolved.Selector = match.Selector
-			} else if match.Ref != "" {
-				resolved.Selector = match.Ref
-			}
-			if match.X != 0 || match.Y != 0 {
-				resolved.X = match.X
-				resolved.Y = match.Y
-			}
-		} else if actionNeedsTarget(&resolved) {
+		if match == nil && actionNeedsTarget(&resolved) {
 			return nil, fmt.Errorf("semantic find returned no match for query %q", flowStep.Query)
 		}
 	}
 
-	if resolved.Action == ActionType_ && resolved.Text == "" {
-		resolved.Text = flowStep.Value
-		if resolved.Text == "" {
-			resolved.Action = ActionClick
-		}
-	}
-
-	if resolved.Action == ActionClick && resolved.Selector == "" && resolved.X == 0 && resolved.Y == 0 {
-		return nil, fmt.Errorf("semantic action requires selector or coordinates for query %q", flowStep.Query)
+	if err := hydrateSemanticAction(&resolved, match, flowStep.Value, func() error {
+		return fmt.Errorf("semantic action requires selector or coordinates for query %q", flowStep.Query)
+	}); err != nil {
+		return nil, err
 	}
 
 	return &resolved, nil
@@ -501,25 +548,10 @@ func (as *AutoSolver) selfHealSemanticAction(ctx context.Context, page Page, int
 	}
 
 	healed := *original
-	if match.Selector != "" {
-		healed.Selector = match.Selector
-	} else if match.Ref != "" {
-		healed.Selector = match.Ref
-	}
-	if match.X != 0 || match.Y != 0 {
-		healed.X = match.X
-		healed.Y = match.Y
-	}
-
-	if healed.Action == ActionType_ && healed.Text == "" {
-		healed.Text = flowStep.Value
-		if healed.Text == "" {
-			healed.Action = ActionClick
-		}
-	}
-
-	if healed.Action == ActionClick && healed.Selector == "" && healed.X == 0 && healed.Y == 0 {
-		return nil, fmt.Errorf("semantic self-heal match for query %q had no actionable selector or coordinates", flowStep.Query)
+	if err := hydrateSemanticAction(&healed, match, flowStep.Value, func() error {
+		return fmt.Errorf("semantic self-heal match for query %q had no actionable selector or coordinates", flowStep.Query)
+	}); err != nil {
+		return nil, err
 	}
 
 	return &healed, nil
@@ -719,10 +751,17 @@ func resolveSelectorCenter(ctx context.Context, executor ActionExecutor, selecto
 	return coords.X, coords.Y, nil
 }
 
-// tryLLM builds a trimmed request and asks the LLM for the next action.
+// llmFallbackSolverLabel names the LLM fallback stage in an AttemptEntry and in the
+// success result. It is deliberately NOT one of the solver-name constants beside
+// SemanticSolverName: those are config-selectable — catalog collects them, so config
+// validation accepts them in autoSolver.solvers — while this is only an attempt-entry
+// label. Moving it into that group would invite adding it to the catalog, at which
+// point autoSolver.solvers: ["llm"] would validate and then match no solver at all.
+const llmFallbackSolverLabel = "llm"
+
 func (as *AutoSolver) tryLLM(ctx context.Context, page Page, executor ActionExecutor, history []AttemptEntry) (bool, *AttemptEntry) {
 	llmStart := time.Now()
-	entry := &AttemptEntry{Solver: "llm"}
+	entry := &AttemptEntry{Solver: llmFallbackSolverLabel}
 
 	html, err := page.HTML()
 	if err != nil {
@@ -732,15 +771,10 @@ func (as *AutoSolver) tryLLM(ctx context.Context, page Page, executor ActionExec
 		return false, entry
 	}
 
-	// Trim HTML to reduce token usage (max ~4000 chars).
-	if len(html) > 4000 {
-		html = html[:4000]
-	}
-
 	resp, err := as.llm.SuggestNextAction(ctx, LLMRequest{
 		PageTitle:    page.Title(),
 		PageURL:      page.URL(),
-		TrimmedHTML:  html,
+		TrimmedHTML:  htmltrim.TrimHTML(html),
 		DetectedType: IntentUnknown,
 		PrevAttempts: history,
 	})
@@ -751,7 +785,6 @@ func (as *AutoSolver) tryLLM(ctx context.Context, page Page, executor ActionExec
 		return false, entry
 	}
 
-	// Execute the LLM's suggested action.
 	if err := executeAction(ctx, executor, resp); err != nil {
 		entry.Status = StatusFailed
 		entry.Error = fmt.Sprintf("execute llm action: %v", err)
@@ -764,38 +797,26 @@ func (as *AutoSolver) tryLLM(ctx context.Context, page Page, executor ActionExec
 	return true, entry
 }
 
-// executeAction translates an LLMResponse into an ActionExecutor call.
+// suggestedActionFromLLM adapts an LLMResponse to a SuggestedAction so the LLM
+// path runs through the single executeSuggestedAction executor instead of a
+// divergent copy. The LLM response carries no X/Y/Expr, so those stay zero.
+func suggestedActionFromLLM(resp *LLMResponse) *SuggestedAction {
+	return &SuggestedAction{
+		Action:   resp.Action,
+		Selector: resp.Selector,
+		Text:     resp.Text,
+		URL:      resp.URL,
+		Reason:   resp.Reasoning,
+	}
+}
+
 func executeAction(ctx context.Context, executor ActionExecutor, resp *LLMResponse) error {
 	if resp == nil {
 		return fmt.Errorf("nil response")
 	}
-
-	switch resp.Action {
-	case ActionClick:
-		if resp.Selector != "" {
-			x, y, err := resolveSelectorCenter(ctx, executor, resp.Selector)
-			if err != nil {
-				return err
-			}
-			return executor.Click(ctx, x, y)
-		}
-		return fmt.Errorf("click action requires selector")
-
-	case ActionType_:
-		return executor.Type(ctx, resp.Text)
-
-	case ActionNavigate:
-		return executor.Navigate(ctx, resp.URL)
-
-	case ActionNone:
-		return nil
-
-	default:
-		return fmt.Errorf("unsupported action: %s", resp.Action)
-	}
+	return executeSuggestedAction(ctx, executor, suggestedActionFromLLM(resp))
 }
 
-// backoffDelay calculates exponential backoff with jitter.
 func (as *AutoSolver) backoffDelay(attempt int) time.Duration {
 	base := as.config.RetryBaseDelay
 	if base <= 0 {

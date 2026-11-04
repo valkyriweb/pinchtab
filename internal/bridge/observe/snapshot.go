@@ -4,37 +4,111 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/dom"
+	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/chromedp"
+	"github.com/pinchtab/pinchtab/internal/cdptk"
 )
 
+// MaskedValue stands in for a sensitive field's content in snapshots. Its width
+// is fixed on purpose: snapshots are persisted and rendered elsewhere, so a
+// length-proportional mask would leak the secret's length. It says "there is a
+// value here", nothing more — an empty sensitive field carries no value at all.
+const MaskedValue = "••••••••"
+
+const maskRune = '\u2022'
+
+func normalizeMaskedValue(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return v
+	}
+	for _, r := range trimmed {
+		if r != maskRune {
+			return v
+		}
+	}
+	return MaskedValue
+}
+
+// IsSensitiveAutocomplete reports whether an autocomplete token marks a field
+// whose content must never be printed.
+func IsSensitiveAutocomplete(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "current-password", "new-password":
+		return true
+	}
+	return false
+}
+
+// CheckedState is the accessibility tree's own "checked" property, verbatim. A bool
+// could not carry it: "mixed" is a real state that both a native indeterminate
+// checkbox and aria-checked="mixed" report, and absent has to mean "this node has no
+// checkedness" rather than "off".
+type CheckedState string
+
+const (
+	CheckedTrue  CheckedState = "true"
+	CheckedFalse CheckedState = "false"
+	CheckedMixed CheckedState = "mixed"
+)
+
+func checkedStateFromAX(value string) (CheckedState, bool) {
+	switch CheckedState(value) {
+	case CheckedTrue, CheckedFalse, CheckedMixed:
+		return CheckedState(value), true
+	}
+	return "", false
+}
+
+// A11yNode is one snapshot node. Visible is a pointer because nil (absent on
+// the wire) means the bounds pass never measured this node, which is a
+// different statement from a measured false: it is set exactly when
+// BoundingBox is.
 type A11yNode struct {
-	Ref            string `json:"ref"`
-	Role           string `json:"role"`
-	Name           string `json:"name"`
-	Depth          int    `json:"depth"`
-	Value          string `json:"value,omitempty"`
-	Label          string `json:"label,omitempty"`
-	Placeholder    string `json:"placeholder,omitempty"`
-	Alt            string `json:"alt,omitempty"`
-	Title          string `json:"title,omitempty"`
-	TestID         string `json:"testid,omitempty"`
-	Text           string `json:"text,omitempty"`
-	Tag            string `json:"tag,omitempty"`
-	Disabled       bool   `json:"disabled,omitempty"`
-	Focused        bool   `json:"focused,omitempty"`
-	Hidden         bool   `json:"hidden,omitempty"`
-	NodeID         int64  `json:"nodeId,omitempty"`
-	FrameID        string `json:"frameId,omitempty"`
-	FrameURL       string `json:"frameUrl,omitempty"`
-	FrameName      string `json:"frameName,omitempty"`
-	ChildFrameID   string `json:"childFrameId,omitempty"`
-	ChildFrameURL  string `json:"childFrameUrl,omitempty"`
-	ChildFrameName string `json:"childFrameName,omitempty"`
+	Ref            string       `json:"ref"`
+	Role           string       `json:"role"`
+	Name           string       `json:"name"`
+	Depth          int          `json:"depth"`
+	Value          string       `json:"value,omitempty"`
+	Label          string       `json:"label,omitempty"`
+	Placeholder    string       `json:"placeholder,omitempty"`
+	Alt            string       `json:"alt,omitempty"`
+	Title          string       `json:"title,omitempty"`
+	TestID         string       `json:"testid,omitempty"`
+	Text           string       `json:"text,omitempty"`
+	Tag            string       `json:"tag,omitempty"`
+	Disabled       bool         `json:"disabled,omitempty"`
+	Focused        bool         `json:"focused,omitempty"`
+	Checked        CheckedState `json:"checked,omitempty"`
+	Hidden         bool         `json:"hidden,omitempty"`
+	NodeID         int64        `json:"nodeId,omitempty"`
+	FrameID        string       `json:"frameId,omitempty"`
+	FrameURL       string       `json:"frameUrl,omitempty"`
+	FrameName      string       `json:"frameName,omitempty"`
+	ChildFrameID   string       `json:"childFrameId,omitempty"`
+	ChildFrameURL  string       `json:"childFrameUrl,omitempty"`
+	ChildFrameName string       `json:"childFrameName,omitempty"`
+	BoundingBox    *BoundingBox `json:"boundingBox,omitempty"`
+	Visible        *bool        `json:"visible,omitempty"`
+}
+
+// BoundingBox is a CSS-pixel rectangle for a snapshot node. Populated only by
+// PairedCapture when CaptureOpts.WithBounds is true. Coordinate space depends
+// on PairedResult.CoordinateSpace: viewport-relative by default, document
+// coordinates when BeyondViewport is on, and clip-relative when selector
+// scoping crops the image.
+type BoundingBox struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	W float64 `json:"w"`
+	H float64 `json:"h"`
 }
 
 type RawAXNode struct {
@@ -57,9 +131,10 @@ type RawAXTreeResponse struct {
 }
 
 type RawFrame struct {
-	ID   string `json:"id"`
-	URL  string `json:"url,omitempty"`
-	Name string `json:"name,omitempty"`
+	ID       string `json:"id"`
+	URL      string `json:"url,omitempty"`
+	Name     string `json:"name,omitempty"`
+	LoaderID string `json:"loaderId,omitempty"`
 }
 
 type RawFrameTree struct {
@@ -67,7 +142,6 @@ type RawFrameTree struct {
 	ChildFrames []RawFrameTree `json:"childFrames"`
 }
 
-// FrameIDs returns every frame id in a frame tree, including descendants.
 func FrameIDs(tree RawFrameTree) []string {
 	ids := make([]string, 0, 1+len(tree.ChildFrames))
 	var walk func(RawFrameTree)
@@ -83,7 +157,6 @@ func FrameIDs(tree RawFrameTree) []string {
 	return ids
 }
 
-// FrameMap returns frame metadata keyed by frame id.
 func FrameMap(tree RawFrameTree) map[string]RawFrame {
 	frames := make(map[string]RawFrame, 1+len(tree.ChildFrames))
 	var walk func(RawFrameTree)
@@ -99,7 +172,6 @@ func FrameMap(tree RawFrameTree) map[string]RawFrame {
 	return frames
 }
 
-// FrameOwnerMap returns iframe owner backend node IDs keyed by child frame id.
 func FrameOwnerMap(ctx context.Context, tree RawFrameTree) map[string]int64 {
 	owners := make(map[string]int64, len(tree.ChildFrames))
 	var walk func(RawFrameTree)
@@ -140,16 +212,73 @@ func FetchFrameTree(ctx context.Context) (RawFrameTree, error) {
 	return frameResp.FrameTree, nil
 }
 
-// FetchAXTree returns the merged accessibility tree for the current page and any child frames.
+// FrameContext bundles the request-scoped frame metadata derived from a single
+// Page.getFrameTree fetch: the raw tree, the id→frame map, and the
+// child-frame-id→owner-backend-node map. It is the shared substrate for both
+// FetchAXTree's per-frame merge and frame-scope resolution in the handlers, so
+// the getFrameTree + per-child GetFrameOwner sequence is issued once per call.
+type FrameContext struct {
+	Tree   RawFrameTree
+	Frames map[string]RawFrame
+	Owners map[string]int64
+}
+
+// FetchFrameContext fetches the frame tree once and derives the frame and owner
+// maps from it. It returns the error from the underlying tree fetch unchanged;
+// callers that can tolerate a missing tree (e.g. FetchAXTree's single-frame
+// fallback) handle that error themselves.
+func FetchFrameContext(ctx context.Context) (FrameContext, error) {
+	tree, err := FetchFrameTree(ctx)
+	if err != nil {
+		return FrameContext{}, err
+	}
+	return FrameContext{
+		Tree:   tree,
+		Frames: FrameMap(tree),
+		Owners: FrameOwnerMap(ctx, tree),
+	}, nil
+}
+
+const hiddenPageRenderWait = time.Second
+
+const awaitRenderedFrameJS = `new Promise(resolve => {
+	const fallback = setTimeout(resolve, 500);
+	requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(fallback); resolve(); }));
+})`
+
+func renderHiddenPage(ctx context.Context, topFrameID string) error {
+	var visibility string
+	if err := cdptk.EvaluateInIsolatedWorld(ctx, topFrameID, `document.visibilityState`, &visibility); err != nil {
+		return fmt.Errorf("read visibility state: %w", err)
+	}
+	if visibility != "hidden" {
+		return nil
+	}
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return emulation.SetFocusEmulationEnabled(true).Do(ctx)
+	})); err != nil {
+		return fmt.Errorf("enable focus emulation: %w", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, hiddenPageRenderWait)
+	defer cancel()
+	if err := cdptk.EvaluateInIsolatedWorld(waitCtx, topFrameID, awaitRenderedFrameJS, nil); err != nil {
+		return fmt.Errorf("await rendered frame: %w", err)
+	}
+	return nil
+}
+
 func FetchAXTree(ctx context.Context) ([]RawAXNode, error) {
-	frameTree, err := FetchFrameTree(ctx)
+	fc, err := FetchFrameContext(ctx)
 	if err != nil {
 		return fetchAXTreeForFrame(ctx, "")
 	}
+	if err := renderHiddenPage(ctx, fc.Tree.Frame.ID); err != nil {
+		slog.Debug("render hidden page before accessibility read", "err", err)
+	}
 
-	frameMap := FrameMap(frameTree)
-	ownerMap := FrameOwnerMap(ctx, frameTree)
-	ids := FrameIDs(frameTree)
+	frameMap := fc.Frames
+	ownerMap := fc.Owners
+	ids := FrameIDs(fc.Tree)
 	if len(ids) == 0 {
 		return fetchAXTreeForFrame(ctx, "")
 	}
@@ -263,9 +392,8 @@ var ContextRoles = map[string]bool{
 
 const FilterInteractive = "interactive"
 
-// isAXNodeHidden checks whether a raw accessibility node has properties
-// indicating it is hidden from the user (aria-hidden, display:none, etc.).
-// Chrome's accessibility tree marks these via the "hidden" boolean property.
+// Chrome's accessibility tree marks aria-hidden/display:none nodes via the
+// "hidden" boolean property.
 func isAXNodeHidden(n RawAXNode) bool {
 	for _, prop := range n.Properties {
 		if prop.Name == "hidden" && prop.Value.String() == "true" {
@@ -318,7 +446,6 @@ func BuildSnapshot(nodes []RawAXNode, filter string, maxDepth int) ([]A11yNode, 
 			hiddenNodes[n.NodeID] = true
 		}
 	}
-	// Propagate: if a parent is hidden, all descendants inherit hidden status.
 	isHidden := func(nodeID string) bool {
 		cur := nodeID
 		for range maxAncestorWalk {
@@ -401,7 +528,7 @@ func BuildSnapshot(nodes []RawAXNode, filter string, maxDepth int) ([]A11yNode, 
 		}
 
 		if v := n.Value.String(); v != "" {
-			entry.Value = v
+			entry.Value = normalizeMaskedValue(v)
 		}
 		if n.BackendDOMNodeID != 0 {
 			entry.NodeID = n.BackendDOMNodeID
@@ -415,11 +542,25 @@ func BuildSnapshot(nodes []RawAXNode, filter string, maxDepth int) ([]A11yNode, 
 			if prop.Name == "focused" && prop.Value.String() == "true" {
 				entry.Focused = true
 			}
-			if prop.Name == "autocomplete" {
-				v := strings.ToLower(prop.Value.String())
-				if v == "current-password" || v == "new-password" {
-					entry.Value = "••••••••"
+			// The accessibility tree already answers this for checkboxes, radios,
+			// menuitemcheckbox/radio and any custom role carrying aria-checked, and
+			// it answers "mixed" for a native indeterminate box too. Reading it here
+			// costs nothing: no DOM access and no extra round trip. The other route
+			// — evaluating aria-checked in the page, as /checked and the check action
+			// do — would add a page call to every snapshot and would have to run in
+			// the best-effort DOM pass, where a failure produces an absent field that
+			// every consumer reads as unchecked.
+			if prop.Name == "checked" {
+				if state, ok := checkedStateFromAX(prop.Value.String()); ok {
+					entry.Checked = state
 				}
+			}
+			// Unconditional by design: this pass has no DOM access, and the DOM
+			// enrichment that knows whether the field is empty is best-effort. If
+			// it never runs, this mask is what keeps a password out of the
+			// snapshot, so it must not depend on a signal available only there.
+			if prop.Name == "autocomplete" && IsSensitiveAutocomplete(prop.Value.String()) {
+				entry.Value = MaskedValue
 			}
 		}
 
@@ -523,10 +664,12 @@ func FilterSubtree(nodes []RawAXNode, scopeBackendID int64) []RawAXNode {
 
 	include := make(map[string]bool)
 	include[scopeAXID] = true
+	// Head-index BFS: advance a cursor while appending children rather than
+	// re-slicing (queue = queue[1:]) on every pop. include dedupes, so the queue
+	// is bounded by the subtree size.
 	queue := []string{scopeAXID}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for head := 0; head < len(queue); head++ {
+		cur := queue[head]
 		for _, cid := range childMap[cur] {
 			if !include[cid] {
 				include[cid] = true
@@ -558,7 +701,7 @@ func DiffSnapshot(prev, curr []A11yNode) (added, changed, removed []A11yNode) {
 		old, existed := prevMap[key]
 		if !existed {
 			added = append(added, n)
-		} else if old.Value != n.Value || old.Focused != n.Focused || old.Disabled != n.Disabled {
+		} else if old.Value != n.Value || old.Focused != n.Focused || old.Disabled != n.Disabled || old.Checked != n.Checked {
 			changed = append(changed, n)
 		}
 	}

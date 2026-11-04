@@ -1,90 +1,21 @@
 package handlers
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 	"github.com/pinchtab/pinchtab/internal/state"
 )
 
-type tabLoadState struct {
-	ReadyState           string `json:"readyState,omitempty"`
-	NavigationInProgress bool   `json:"navigationInProgress"`
-	NetworkIdle          *bool  `json:"networkIdle,omitempty"`
-	State                string `json:"state"`
-}
-
-type tabStateResponse struct {
-	TabID         string       `json:"tabId"`
-	URL           string       `json:"url,omitempty"`
-	Title         string       `json:"title,omitempty"`
-	DialogPresent bool         `json:"dialogPresent"`
-	Dialog        interface{}  `json:"dialog,omitempty"`
-	Load          tabLoadState `json:"load"`
-	Actionability string       `json:"actionability"`
-}
-
-type currentBrowserStateResponse struct {
-	TabID    string                         `json:"tabId"`
-	URL      string                         `json:"url,omitempty"`
-	Title    string                         `json:"title,omitempty"`
-	Origins  []string                       `json:"origins"`
-	Cookies  []state.Cookie                 `json:"cookies"`
-	Storage  map[string]state.OriginStorage `json:"storage"`
-	Metadata map[string]interface{}         `json:"metadata,omitempty"`
-}
-
-type capturedBrowserState struct {
-	tabID string
-	url   string
-	title string
-	file  *state.StateFile
-}
-
 func (h *Handlers) stateExportEnabled() bool {
 	return h != nil && h.Config != nil && h.Config.AllowStateExport
-}
-
-// HandleStateCurrent returns the current gated browser state for a tab.
-func (h *Handlers) HandleStateCurrent(w http.ResponseWriter, r *http.Request) {
-	if !h.ensureStateExportEnabled(w) {
-		return
-	}
-
-	tabID := r.URL.Query().Get("tabId")
-	ctx, resolvedTabID, err := h.tabContext(r, tabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
-		return
-	}
-
-	captured, err := h.captureBrowserState(ctx, resolvedTabID, nil)
-	if err != nil {
-		httpx.Error(w, 500, fmt.Errorf("capture state: %w", err))
-		return
-	}
-
-	httpx.JSON(w, 200, currentBrowserStateResponse{
-		TabID:    captured.tabID,
-		URL:      captured.url,
-		Title:    captured.title,
-		Origins:  captured.file.Origins,
-		Cookies:  captured.file.Cookies,
-		Storage:  captured.file.Storage,
-		Metadata: captured.file.Metadata,
-	})
 }
 
 // HandleStateList lists all saved state files.
@@ -116,14 +47,30 @@ func (h *Handlers) HandleStateShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encryptionKey := os.Getenv("PINCHTAB_STATE_KEY")
+	encryptionKey := h.stateEncryptionKey()
 	path := state.ResolvePath(h.Config.StateDir, name)
 	sf, err := state.Load(path, encryptionKey)
 	if err != nil {
 		httpx.Error(w, 500, fmt.Errorf("load state: %w", err))
 		return
 	}
-	httpx.JSON(w, 200, sf)
+	httpx.JSON(w, 200, h.stateFileInScope(sf))
+}
+
+// stateEncryptionKey resolves the key the state files are encrypted with. The
+// environment variable wins so an operator can override per process, and
+// security.stateEncryptionKey answers otherwise — it is the documented knob,
+// it is redacted by the dashboard config API, and it was reachable by
+// `config set` while nothing read it, so setting it stored a secret that did
+// nothing and the request still refused for want of a key.
+func (h *Handlers) stateEncryptionKey() string {
+	if key := strings.TrimSpace(os.Getenv("PINCHTAB_STATE_KEY")); key != "" {
+		return key
+	}
+	if h == nil || h.Config == nil {
+		return ""
+	}
+	return strings.TrimSpace(h.Config.StateEncryptionKey)
 }
 
 type stateSaveRequest struct {
@@ -147,19 +94,15 @@ func (h *Handlers) HandleStateSave(w http.ResponseWriter, r *http.Request) {
 
 	encryptionKey := ""
 	if req.Encrypt {
-		encryptionKey = os.Getenv("PINCHTAB_STATE_KEY")
+		encryptionKey = h.stateEncryptionKey()
 		if err := state.ValidateEncryptionKey(encryptionKey); err != nil {
-			httpx.Error(w, 400, fmt.Errorf("encryption key required: set PINCHTAB_STATE_KEY environment variable"))
+			httpx.Error(w, 400, fmt.Errorf("encryption key required: set security.stateEncryptionKey or the PINCHTAB_STATE_KEY environment variable"))
 			return
 		}
 	}
 
-	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	ctx, resolvedTabID, ok := h.guardedTabContext(w, r, req.TabID, guardDialogBlocked|guardDomainPolicy)
+	if !ok {
 		return
 	}
 
@@ -194,257 +137,6 @@ func (h *Handlers) HandleStateSave(w http.ResponseWriter, r *http.Request) {
 		"origins":   sf.Origins,
 		"encrypted": req.Encrypt,
 	})
-}
-
-// HandleStateLoad reads a state file and restores cookies and storage.
-func (h *Handlers) HandleStateLoad(w http.ResponseWriter, r *http.Request) {
-	if !h.ensureStateExportEnabled(w) {
-		return
-	}
-
-	var req struct {
-		Name  string `json:"name"`
-		TabID string `json:"tabId"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
-		return
-	}
-	if req.Name == "" {
-		httpx.Error(w, 400, fmt.Errorf("name is required"))
-		return
-	}
-
-	encryptionKey := os.Getenv("PINCHTAB_STATE_KEY")
-	path := state.ResolvePath(h.Config.StateDir, req.Name)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		matches, matchErr := state.FindByPrefix(h.Config.StateDir, req.Name)
-		if matchErr == nil && len(matches) > 0 {
-			path = state.ResolvePath(h.Config.StateDir, matches[0].Name)
-		}
-	}
-	sf, err := state.Load(path, encryptionKey)
-	if err != nil {
-		sf, err = state.Load(path, "")
-		if err != nil {
-			httpx.Error(w, 500, fmt.Errorf("load state: %w", err))
-			return
-		}
-	}
-
-	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
-		return
-	}
-
-	tCtx, tCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer tCancel()
-
-	cookiesRestored := 0
-	if len(sf.Cookies) > 0 {
-		if err := chromedp.Run(tCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-			for _, c := range sf.Cookies {
-				params := network.SetCookie(c.Name, c.Value).
-					WithDomain(c.Domain).
-					WithPath(c.Path).
-					WithSecure(c.Secure).
-					WithHTTPOnly(c.HTTPOnly)
-
-				if c.SameSite != "" {
-					var sameSite network.CookieSameSite
-					switch c.SameSite {
-					case "Strict":
-						sameSite = network.CookieSameSiteStrict
-					case "Lax":
-						sameSite = network.CookieSameSiteLax
-					case "None":
-						sameSite = network.CookieSameSiteNone
-					}
-					if sameSite != "" {
-						params = params.WithSameSite(sameSite)
-					}
-				}
-
-				if err := chromedp.Run(tCtx, params); err == nil {
-					cookiesRestored++
-				}
-			}
-			return nil
-		})); err != nil {
-			httpx.Error(w, 500, fmt.Errorf("restore cookies: %w", err))
-			return
-		}
-	}
-
-	storageRestored := 0
-	for _, originStorage := range sf.Storage {
-		for k, v := range originStorage.Local {
-			keyJSON, _ := json.Marshal(k)
-			valueJSON, _ := json.Marshal(v)
-			script := fmt.Sprintf(`localStorage.setItem(%s, %s)`, string(keyJSON), string(valueJSON))
-			if err := chromedp.Run(tCtx, chromedp.Evaluate(script, nil)); err == nil {
-				storageRestored++
-			}
-		}
-		for k, v := range originStorage.Session {
-			keyJSON, _ := json.Marshal(k)
-			valueJSON, _ := json.Marshal(v)
-			script := fmt.Sprintf(`sessionStorage.setItem(%s, %s)`, string(keyJSON), string(valueJSON))
-			if err := chromedp.Run(tCtx, chromedp.Evaluate(script, nil)); err == nil {
-				storageRestored++
-			}
-		}
-	}
-
-	slog.Info("state loaded",
-		"name", req.Name,
-		"path", path,
-		"cookiesRestored", cookiesRestored,
-		"storageItemsRestored", storageRestored,
-		"tabId", resolvedTabID,
-		"remoteAddr", r.RemoteAddr,
-	)
-
-	httpx.JSON(w, 200, map[string]any{
-		"name":                 req.Name,
-		"cookiesRestored":      cookiesRestored,
-		"storageItemsRestored": storageRestored,
-		"origins":              sf.Origins,
-	})
-}
-
-func (h *Handlers) captureBrowserState(ctx context.Context, resolvedTabID string, extraMetadata map[string]interface{}) (*capturedBrowserState, error) {
-	tCtx, tCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer tCancel()
-
-	var cookies []*network.Cookie
-	if err := chromedp.Run(tCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-		var err error
-		cookies, err = network.GetCookies().Do(ctx)
-		return err
-	})); err != nil {
-		return nil, fmt.Errorf("get cookies: %w", err)
-	}
-
-	storageScript := `
-		(function() {
-			try {
-				var localEntries = {};
-				for (var i = 0; i < localStorage.length; i++) {
-					var k = localStorage.key(i);
-					localEntries[k] = localStorage.getItem(k);
-				}
-				var sessionEntries = {};
-				for (var i = 0; i < sessionStorage.length; i++) {
-					var k = sessionStorage.key(i);
-					sessionEntries[k] = sessionStorage.getItem(k);
-				}
-				return JSON.stringify({
-					local: localEntries,
-					session: sessionEntries,
-					url: window.location.href,
-					title: document.title,
-					origin: window.location.origin,
-					userAgent: navigator.userAgent
-				});
-			} catch(e) {
-				return JSON.stringify({
-					error: e.message,
-					local: {},
-					session: {},
-					url: window.location.href,
-					title: document.title,
-					origin: window.location.origin,
-					userAgent: navigator.userAgent
-				});
-			}
-		})()
-	`
-
-	var storageJSON string
-	if err := chromedp.Run(tCtx, chromedp.Evaluate(storageScript, &storageJSON)); err != nil {
-		return nil, fmt.Errorf("evaluate storage: %w", err)
-	}
-
-	var storageResult struct {
-		Local     map[string]string `json:"local"`
-		Session   map[string]string `json:"session"`
-		URL       string            `json:"url"`
-		Title     string            `json:"title"`
-		Origin    string            `json:"origin"`
-		UserAgent string            `json:"userAgent"`
-		Error     string            `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(storageJSON), &storageResult); err != nil {
-		return nil, fmt.Errorf("parse storage result: %w", err)
-	}
-
-	stateCookies := make([]state.Cookie, len(cookies))
-	for i, c := range cookies {
-		stateCookies[i] = state.Cookie{
-			Name:     c.Name,
-			Value:    c.Value,
-			Domain:   c.Domain,
-			Path:     c.Path,
-			Secure:   c.Secure,
-			HTTPOnly: c.HTTPOnly,
-			SameSite: c.SameSite.String(),
-			Expires:  c.Expires,
-		}
-	}
-	if storageResult.Local == nil {
-		storageResult.Local = map[string]string{}
-	}
-	if storageResult.Session == nil {
-		storageResult.Session = map[string]string{}
-	}
-
-	origins := []string{}
-	storageMap := map[string]state.OriginStorage{}
-	if storageResult.Origin != "" {
-		origins = append(origins, storageResult.Origin)
-		storageMap[storageResult.Origin] = state.OriginStorage{
-			Local:   storageResult.Local,
-			Session: storageResult.Session,
-		}
-	}
-
-	metadata := map[string]interface{}{
-		"url":       storageResult.URL,
-		"title":     storageResult.Title,
-		"origin":    storageResult.Origin,
-		"userAgent": storageResult.UserAgent,
-	}
-	if storageResult.Error != "" {
-		metadata["storageError"] = storageResult.Error
-	}
-	for k, v := range extraMetadata {
-		metadata[k] = v
-	}
-
-	return &capturedBrowserState{
-		tabID: resolvedTabID,
-		url:   storageResult.URL,
-		title: storageResult.Title,
-		file: &state.StateFile{
-			SavedAt:  time.Now(),
-			Origins:  origins,
-			Cookies:  stateCookies,
-			Storage:  storageMap,
-			Metadata: metadata,
-		},
-	}, nil
-}
-
-func firstOrigin(origins []string) string {
-	if len(origins) == 0 {
-		return ""
-	}
-	return origins[0]
 }
 
 // HandleStateDelete removes a saved state file.
@@ -494,87 +186,4 @@ func (h *Handlers) HandleStateClean(w http.ResponseWriter, r *http.Request) {
 		"olderThanHours": req.OlderThanHours,
 		"sessionsDir":    filepath.Base(state.SessionsDir(h.Config.StateDir)),
 	})
-}
-
-// HandleTabState returns lightweight tab/page state signals for agent workflows.
-func (h *Handlers) HandleTabState(w http.ResponseWriter, r *http.Request) {
-	if h.Bridge == nil {
-		httpx.ErrorCode(w, http.StatusServiceUnavailable, "bridge_unavailable", "browser bridge unavailable", false, nil)
-		return
-	}
-
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		tabID = r.PathValue("tabId")
-	}
-	if tabID == "" {
-		httpx.ErrorCode(w, http.StatusBadRequest, "missing_tab_id", "missing tab id", false, nil)
-		return
-	}
-
-	_, resolvedTabID, err := h.Bridge.TabContext(tabID)
-	if err != nil {
-		WriteTabContextError(w, err, http.StatusNotFound)
-		return
-	}
-
-	resp := tabStateResponse{
-		TabID:         resolvedTabID,
-		DialogPresent: false,
-		Load:          tabLoadState{State: "unknown"},
-		Actionability: "ready",
-	}
-
-	if targets, err := h.Bridge.ListTargets(); err == nil {
-		for _, t := range targets {
-			if string(t.TargetID) == resolvedTabID {
-				resp.URL = t.URL
-				resp.Title = t.Title
-				break
-			}
-		}
-	}
-
-	if dm := h.Bridge.GetDialogManager(); dm != nil {
-		if dialog := dm.GetPending(resolvedTabID); dialog != nil {
-			resp.Dialog = dialog
-			resp.DialogPresent = true
-			resp.Actionability = "blocked"
-		}
-	}
-
-	if bridgeWithState, ok := h.Bridge.(interface {
-		GetDocumentReadyState(string) (string, error)
-		IsNetworkIdle(string) (bool, bool)
-	}); ok {
-		if readyState, err := bridgeWithState.GetDocumentReadyState(resolvedTabID); err == nil {
-			resp.Load.ReadyState = readyState
-			switch readyState {
-			case "loading":
-				resp.Load.State = "loading"
-				resp.Load.NavigationInProgress = true
-				if resp.Actionability == "ready" {
-					resp.Actionability = "caution"
-				}
-			case "interactive":
-				resp.Load.State = "interactive"
-				if resp.Actionability == "ready" {
-					resp.Actionability = "caution"
-				}
-			case "complete":
-				resp.Load.State = "complete"
-			}
-		}
-		if idle, ok := bridgeWithState.IsNetworkIdle(resolvedTabID); ok {
-			resp.Load.NetworkIdle = &idle
-			if !idle && resp.Load.State == "complete" {
-				resp.Load.State = "busy"
-				if resp.Actionability == "ready" {
-					resp.Actionability = "caution"
-				}
-			}
-		}
-	}
-
-	httpx.JSON(w, http.StatusOK, resp)
 }

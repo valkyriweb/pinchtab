@@ -98,7 +98,7 @@ assert_contains() {
   local needle="$2"
   local desc="${3:-contains '$needle'}"
 
-  if echo "$haystack" | grep -q "$needle"; then
+  if grep -q -- "$needle" <<<"$haystack"; then
     pass_assert "$desc"
   else
     fail_assert "$desc (not found)"
@@ -110,7 +110,7 @@ assert_not_contains() {
   local needle="$2"
   local desc="${3:-does not contain '$needle'}"
 
-  if echo "$haystack" | grep -q "$needle"; then
+  if grep -q -- "$needle" <<<"$haystack"; then
     fail_assert "$desc (found when should be absent)"
   else
     pass_assert "$desc"
@@ -162,7 +162,7 @@ assert_input_not_contains() {
   local value
   value=$(echo "$RESULT" | jq -r '.result // empty')
 
-  if echo "$value" | grep -qi "$forbidden"; then
+  if grep -qi -- "$forbidden" <<<"$value"; then
     fail_assert "$desc: found '$forbidden' in value '$value'"
     return 1
   fi
@@ -171,18 +171,25 @@ assert_input_not_contains() {
   return 0
 }
 
+# assert_http_error checks the RESPONSE status, not a `.status` field in the
+# body — PinchTab error bodies are {"code","error"} and never carry one, so the
+# old body lookup was empty for every call and the assertion rested entirely on
+# its pattern. error_pattern is an extended regex matched against the body; pass
+# "" to assert the status alone.
 assert_http_error() {
   local expected_status="$1"
-  local error_pattern="${2:-error}"
+  local error_pattern="${2:-}"
   local desc="${3:-HTTP $expected_status error}"
-  local actual_status
-  actual_status=$(echo "$RESULT" | jq -r '.status // empty')
 
-  if [ "$actual_status" = "$expected_status" ] || grep -q "$error_pattern" <<< "$RESULT"; then
-    pass_assert "$desc"
-  else
-    soft_pass_assert "$desc (got: $actual_status)"
+  if [ "$HTTP_STATUS" != "$expected_status" ]; then
+    fail_assert "$desc (want HTTP $expected_status, got $HTTP_STATUS: $RESULT)"
+    return
   fi
+  if [ -n "$error_pattern" ] && ! grep -qE "$error_pattern" <<< "$RESULT"; then
+    fail_assert "$desc (HTTP $expected_status but no match for /$error_pattern/ in: $RESULT)"
+    return
+  fi
+  pass_assert "$desc"
 }
 
 assert_contains_any() {
@@ -190,10 +197,10 @@ assert_contains_any() {
   local patterns="$2"
   local desc="${3:-contains expected pattern}"
 
-  if echo "$haystack" | grep -qE "$patterns"; then
+  if grep -qE -- "$patterns" <<<"$haystack"; then
     pass_assert "$desc"
   else
-    soft_pass_assert "$desc (not found)"
+    fail_assert "$desc (no match for /$patterns/ in: $haystack)"
   fi
 }
 
@@ -235,9 +242,9 @@ assert_table_page() {
   local text="$1"
   local checks=0
 
-  echo "$text" | grep -q "Alice Johnson" && ((checks++))
-  echo "$text" | grep -q "bob@example.com" && ((checks++))
-  echo "$text" | grep -q "Active" && ((checks++))
+  grep -q -- "Alice Johnson" <<<"$text" && ((checks++))
+  grep -q -- "bob@example.com" <<<"$text" && ((checks++))
+  grep -q -- "Active" <<<"$text" && ((checks++))
 
   if [ "$checks" -ge 3 ]; then
     pass_assert "table.html: found expected table data"
@@ -249,7 +256,9 @@ assert_table_page() {
 assert_index_page() {
   local snap="$1"
 
-  if echo "$snap" | jq -e '.title' | grep -q "E2E Test"; then
+  local snap_title
+  snap_title=$(jq -r '.title // empty' <<<"$snap")
+  if grep -q -- "E2E Test" <<<"$snap_title"; then
     pass_assert "index.html: correct title"
   else
     fail_assert "index.html: wrong title"

@@ -2,12 +2,17 @@ package bridge
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/config"
+	"github.com/pinchtab/pinchtab/internal/testbrowser"
 )
 
 func TestClickAction_UsesCoordinatePathIncludingZeroZero(t *testing.T) {
@@ -124,7 +129,7 @@ func TestMouseWheelAction_UsesExplicitWheelDeltas(t *testing.T) {
 	})
 
 	called := false
-	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY int) error {
+	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY, modifiers int) error {
 		called = true
 		if x != 50 || y != 75 {
 			t.Fatalf("wheel coordinates = (%v, %v), want (50, 75)", x, y)
@@ -157,6 +162,66 @@ func TestMouseWheelAction_UsesExplicitWheelDeltas(t *testing.T) {
 	}
 }
 
+func TestClickAction_ForwardsModifiers(t *testing.T) {
+	b := New(context.TODO(), nil, &config.RuntimeConfig{})
+
+	origClick := clickByCoordinateAction
+	t.Cleanup(func() { clickByCoordinateAction = origClick })
+
+	var gotModifiers int
+	called := false
+	clickByCoordinateAction = func(ctx context.Context, x, y float64, modifiers int) error {
+		called = true
+		gotModifiers = modifiers
+		return nil
+	}
+
+	// Shift+click from the screencast UI: modifier bitmask 8 must reach the
+	// CDP pointer dispatch so the page sees a held Shift.
+	if _, err := b.Actions[ActionClick](context.Background(), ActionRequest{
+		HasXY:     true,
+		X:         40,
+		Y:         60,
+		Modifiers: 8,
+	}); err != nil {
+		t.Fatalf("click returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected coordinate click path to be used")
+	}
+	if gotModifiers != 8 {
+		t.Fatalf("click modifiers = %d, want 8 (Shift)", gotModifiers)
+	}
+}
+
+func TestMouseWheelAction_ForwardsModifiers(t *testing.T) {
+	b := New(context.TODO(), nil, &config.RuntimeConfig{})
+
+	origScroll := scrollByCoordinateAction
+	t.Cleanup(func() { scrollByCoordinateAction = origScroll })
+
+	var gotModifiers int
+	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY, modifiers int) error {
+		gotModifiers = modifiers
+		return nil
+	}
+
+	// Shift+wheel (horizontal scroll intent): the bitmask must reach the wheel
+	// dispatch.
+	if _, err := b.Actions[ActionMouseWheel](context.Background(), ActionRequest{
+		HasXY:     true,
+		X:         10,
+		Y:         20,
+		DeltaY:    120,
+		Modifiers: 8,
+	}); err != nil {
+		t.Fatalf("mouse wheel returned error: %v", err)
+	}
+	if gotModifiers != 8 {
+		t.Fatalf("wheel modifiers = %d, want 8 (Shift)", gotModifiers)
+	}
+}
+
 func TestMouseActions_TrackCurrentPointerPosition(t *testing.T) {
 	b := New(context.TODO(), nil, &config.RuntimeConfig{})
 
@@ -176,7 +241,7 @@ func TestMouseActions_TrackCurrentPointerPosition(t *testing.T) {
 		}
 		return nil
 	}
-	mouseUpByCoordinateAction = func(ctx context.Context, x, y float64, button string) error {
+	mouseUpByCoordinateAction = func(ctx context.Context, x, y float64, button string, modifiers int) error {
 		upCalled = true
 		if x != 15 || y != 25 {
 			t.Fatalf("up coordinates = (%v, %v), want (15, 25)", x, y)
@@ -212,7 +277,7 @@ func TestMouseDownAction_UsesTrackedPointerWhenTargetMissing(t *testing.T) {
 		mouseDownByCoordinateAction = origDown
 	})
 
-	mouseDownByCoordinateAction = func(ctx context.Context, x, y float64, button string) error {
+	mouseDownByCoordinateAction = func(ctx context.Context, x, y float64, button string, modifiers int) error {
 		if x != 33 || y != 44 {
 			t.Fatalf("down coordinates = (%v, %v), want (33, 44)", x, y)
 		}
@@ -244,7 +309,7 @@ func TestMouseWheelAction_UsesViewportCenterWhenPointerMissing(t *testing.T) {
 		return 300, 200, nil
 	}
 	called := false
-	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY int) error {
+	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY, modifiers int) error {
 		called = true
 		if x != 300 || y != 200 {
 			t.Fatalf("wheel coordinates = (%v, %v), want (300, 200)", x, y)
@@ -343,10 +408,84 @@ func TestRemovedHumanActionKindsAreUnknown(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected %s to be rejected", kind)
 			}
-			if !strings.Contains(err.Error(), "unknown action") {
-				t.Fatalf("expected unknown action error for %s, got: %v", kind, err)
+			if !errors.Is(err, ErrUnknownAction) || !strings.Contains(err.Error(), kind) {
+				t.Fatalf("expected ErrUnknownAction naming %s, got: %v", kind, err)
 			}
 		})
+	}
+}
+
+func TestExecuteAction_ClickRejectsModeAndEffectiveHumanizeTogether(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *config.RuntimeConfig
+		req    ActionRequest
+	}{
+		{
+			name:   "request humanize true",
+			config: &config.RuntimeConfig{},
+			req: ActionRequest{
+				Kind:     ActionClick,
+				Ref:      "e5",
+				Mode:     "dom",
+				Humanize: boolPtr(true),
+			},
+		},
+		{
+			name:   "instance humanize default",
+			config: &config.RuntimeConfig{Humanize: true},
+			req: ActionRequest{
+				Kind: ActionClick,
+				Ref:  "e5",
+				Mode: "dispatch",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := New(context.TODO(), nil, tc.config)
+			_, err := b.ExecuteAction(context.Background(), ActionClick, tc.req)
+			if err == nil {
+				t.Fatal("expected error when mode and humanize are both set")
+			}
+			if !strings.Contains(err.Error(), "mutually exclusive") {
+				t.Fatalf("expected mutually exclusive error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecuteAction_ClickModeAllowedWhenHumanizeOverrideDisablesDefault(t *testing.T) {
+	origJSClick := jsClickByBackendNodeAction
+	t.Cleanup(func() {
+		jsClickByBackendNodeAction = origJSClick
+	})
+
+	called := false
+	jsClickByBackendNodeAction = func(ctx context.Context, nodeID int64) error {
+		called = true
+		if nodeID != 42 {
+			t.Fatalf("nodeID = %d, want 42", nodeID)
+		}
+		return nil
+	}
+
+	b := New(context.TODO(), nil, &config.RuntimeConfig{Humanize: true})
+	res, err := b.ExecuteAction(context.Background(), ActionClick, ActionRequest{
+		Kind:     ActionClick,
+		NodeID:   42,
+		Mode:     "dom",
+		Humanize: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("expected raw mode click to be allowed when humanize=false overrides default, got: %v", err)
+	}
+	if !called {
+		t.Fatal("expected dom mode click path to run")
+	}
+	if clicked, _ := res["clicked"].(bool); !clicked {
+		t.Fatalf("expected clicked result, got %#v", res)
 	}
 }
 
@@ -382,6 +521,50 @@ func TestClickAction_HumanizeOptInUsesHumanizedPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "need selector") {
 		t.Fatalf("humanized click should require selector/ref/nodeId, got: %v", err)
+	}
+}
+
+func TestClickAction_HumanizedDialogActionArmsAutoHandler(t *testing.T) {
+	origClickElement := clickElementAction
+	t.Cleanup(func() {
+		clickElementAction = origClickElement
+	})
+
+	b := New(context.TODO(), nil, &config.RuntimeConfig{Humanize: true})
+	dm := b.GetDialogManager()
+
+	clickElementAction = func(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
+		if backendNodeID != 42 {
+			return errors.New("unexpected backend node id")
+		}
+		armed := dm.TakeAutoHandler("tab-dialog")
+		if armed == nil {
+			return errors.New("dialog auto-handler was not armed")
+		}
+		if armed.Action != "accept" || armed.Text != "typed response" {
+			return errors.New("dialog auto-handler had wrong action or text")
+		}
+		return nil
+	}
+
+	res, err := b.ExecuteAction(context.Background(), ActionClick, ActionRequest{
+		Kind:         ActionClick,
+		TabID:        "tab-dialog",
+		NodeID:       42,
+		DialogAction: "accept",
+		DialogText:   "typed response",
+	})
+	if err != nil {
+		t.Fatalf("humanized click with dialogAction returned error: %v", err)
+	}
+	if clicked, _ := res["clicked"].(bool); !clicked {
+		t.Fatalf("expected clicked result, got %#v", res)
+	}
+	if human, _ := res["human"].(bool); !human {
+		t.Fatalf("expected human=true result, got %#v", res)
+	}
+	if dm.HasAutoHandler("tab-dialog") {
+		t.Fatal("dialog auto-handler should be consumed or cleaned up after click")
 	}
 }
 
@@ -498,6 +681,75 @@ func TestClickByNodeIDWithJSFallback_SkipsFallbackOnCancelledCtx(t *testing.T) {
 	}
 }
 
+func TestClickSubmitUsesOneJSTransactionWithoutFallback(t *testing.T) {
+	origJS := jsClickByBackendNodeAction
+	origTrusted := clickByNodeIDAction
+	origFlyout := clickFloatingFlyoutItemAction
+	t.Cleanup(func() {
+		jsClickByBackendNodeAction = origJS
+		clickByNodeIDAction = origTrusted
+		clickFloatingFlyoutItemAction = origFlyout
+	})
+
+	jsCalls := 0
+	trustedCalls := 0
+	flyoutCalls := 0
+	jsClickByBackendNodeAction = func(_ context.Context, nodeID int64) error {
+		jsCalls++
+		if nodeID != 42 {
+			t.Fatalf("nodeID = %d, want 42", nodeID)
+		}
+		return context.DeadlineExceeded
+	}
+	clickByNodeIDAction = func(context.Context, int64) error {
+		trustedCalls++
+		return nil
+	}
+	clickFloatingFlyoutItemAction = func(context.Context, int64) (bool, error) {
+		flyoutCalls++
+		return false, nil
+	}
+
+	b := New(context.Background(), nil, &config.RuntimeConfig{Humanize: true})
+	_, err := b.actionClick(context.Background(), ActionRequest{
+		Kind:   ActionClick,
+		NodeID: 42,
+		Submit: true,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("submit click error = %v, want deadline", err)
+	}
+	if jsCalls != 1 || trustedCalls != 0 || flyoutCalls != 0 {
+		t.Fatalf("dispatch counts = js:%d trusted:%d flyout:%d, want 1/0/0", jsCalls, trustedCalls, flyoutCalls)
+	}
+}
+
+func TestValidateSubmitAction(t *testing.T) {
+	trueValue := true
+	tests := []struct {
+		name    string
+		kind    string
+		req     ActionRequest
+		wantErr bool
+	}{
+		{name: "fill unchanged", kind: ActionFill, req: ActionRequest{Submit: true}},
+		{name: "click element", kind: ActionClick, req: ActionRequest{Submit: true, NodeID: 1}},
+		{name: "coordinates", kind: ActionClick, req: ActionRequest{Submit: true, HasXY: true}, wantErr: true},
+		{name: "wait nav", kind: ActionClick, req: ActionRequest{Submit: true, WaitNav: true}, wantErr: true},
+		{name: "mode", kind: ActionClick, req: ActionRequest{Submit: true, Mode: "dom"}, wantErr: true},
+		{name: "humanize", kind: ActionClick, req: ActionRequest{Submit: true, Humanize: &trueValue}, wantErr: true},
+		{name: "other action", kind: ActionType, req: ActionRequest{Submit: true}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSubmitAction(tt.kind, tt.req)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateSubmitAction() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestTypeAction_HumanizeOptInUsesHumanizedPath(t *testing.T) {
 	raw := New(context.TODO(), nil, &config.RuntimeConfig{Humanize: true})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -541,7 +793,7 @@ func TestScrollAction_UsesCoordinateWheelPath(t *testing.T) {
 	})
 
 	called := false
-	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY int) error {
+	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY, modifiers int) error {
 		called = true
 		if x != 12.5 || y != 34.5 {
 			t.Fatalf("wheel coordinates = (%v, %v), want (12.5, 34.5)", x, y)
@@ -588,7 +840,7 @@ func TestScrollAction_UsesViewportCenterWhenCoordinatesMissing(t *testing.T) {
 	}
 
 	called := false
-	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY int) error {
+	scrollByCoordinateAction = func(ctx context.Context, x, y float64, deltaX, deltaY, modifiers int) error {
 		called = true
 		if x != 400 || y != 300 {
 			t.Fatalf("wheel coordinates = (%v, %v), want (400, 300)", x, y)
@@ -627,7 +879,7 @@ func TestScrollAction_PropagatesViewportCenterError(t *testing.T) {
 	scrollViewportCenter = func(context.Context) (float64, float64, error) {
 		return 0, 0, context.Canceled
 	}
-	scrollByCoordinateAction = func(context.Context, float64, float64, int, int) error {
+	scrollByCoordinateAction = func(context.Context, float64, float64, int, int, int) error {
 		t.Fatal("wheel dispatch should not be called when viewport center resolution fails")
 		return nil
 	}
@@ -708,7 +960,19 @@ func TestUncheckAction_WithSelector_UsesCSSPath(t *testing.T) {
 	}
 }
 
-// ── Keyboard action tests ──────────────────────────────────────────────
+func TestFinishFillSubmitIsOptInAndDispatchesEnter(t *testing.T) {
+	result := map[string]any{"filled": true}
+	got, err := finishFill(context.Background(), result, false)
+	if err != nil || got["submitted"] != nil {
+		t.Fatalf("non-submit fill = (%v, %v), want unchanged result", got, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := finishFill(ctx, map[string]any{"filled": true}, true); err == nil || !strings.Contains(err.Error(), "submit filled field") {
+		t.Fatalf("submit fill error = %v, want Enter dispatch attempt", err)
+	}
+}
 
 func TestKeyboardTypeAction_Registered(t *testing.T) {
 	b := New(context.TODO(), nil, &config.RuntimeConfig{})
@@ -771,6 +1035,50 @@ func TestKeyDownAction_RequiresKey(t *testing.T) {
 	}
 }
 
+func TestParsePressChord(t *testing.T) {
+	tests := []struct {
+		input         string
+		wantKey       string
+		wantModifiers int
+		wantChord     bool
+		wantError     string
+	}{
+		{input: "Enter", wantKey: "Enter"},
+		{input: "+", wantKey: "+"},
+		{input: "Control+A", wantKey: "A", wantModifiers: 2, wantChord: true},
+		{input: "Ctrl+Shift+ArrowLeft", wantKey: "ArrowLeft", wantModifiers: 10, wantChord: true},
+		{input: "Cmd+C", wantKey: "C", wantModifiers: 4, wantChord: true},
+		{input: "Banana+A", wantChord: true, wantError: "invalid press chord modifier"},
+		{input: "Ctrl+", wantChord: true, wantError: "invalid press chord"},
+		{input: "Ctrl+Control+A", wantChord: true, wantError: "duplicate press chord modifier"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			key, modifiers, chord, err := parsePressChord(tt.input)
+			if key != tt.wantKey || modifiers != tt.wantModifiers || chord != tt.wantChord {
+				t.Fatalf("parsePressChord(%q) = (%q, %d, %v), want (%q, %d, %v)",
+					tt.input, key, modifiers, chord, tt.wantKey, tt.wantModifiers, tt.wantChord)
+			}
+			if tt.wantError == "" && err != nil {
+				t.Fatalf("parsePressChord(%q) unexpected error: %v", tt.input, err)
+			}
+			if tt.wantError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantError)) {
+				t.Fatalf("parsePressChord(%q) error = %v, want %q", tt.input, err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestPressChordRejectsAmbiguousModifierInputsBeforeDispatch(t *testing.T) {
+	b := New(context.TODO(), nil, &config.RuntimeConfig{})
+	_, err := b.Actions[ActionPress](context.Background(), ActionRequest{
+		Key: "Control+A", Modifiers: 2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "also supplied modifiers") {
+		t.Fatalf("press ambiguous chord error = %v", err)
+	}
+}
+
 func TestKeyUpAction_RequiresKey(t *testing.T) {
 	b := New(context.TODO(), nil, &config.RuntimeConfig{})
 	_, err := b.Actions[ActionKeyUp](context.Background(), ActionRequest{})
@@ -822,8 +1130,6 @@ func TestKeyUpAction_WithCancelledContext(t *testing.T) {
 	}
 }
 
-// ── ScrollIntoView action tests ────────────────────────────────────────
-
 func TestScrollIntoViewAction_Registered(t *testing.T) {
 	b := New(context.TODO(), nil, &config.RuntimeConfig{})
 	if _, ok := b.Actions[ActionScrollIntoView]; !ok {
@@ -865,5 +1171,142 @@ func TestScrollIntoViewAction_WithSelector_UsesCSSPath(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "need selector") {
 		t.Fatalf("expected CSS path, got validation error: %v", err)
+	}
+}
+
+func TestHoverAction_HumanizeRoutesEveryTargetForm(t *testing.T) {
+	origElement := hoverElementAction
+	origCoordinate := hoverCoordinateAction
+	t.Cleanup(func() {
+		hoverElementAction = origElement
+		hoverCoordinateAction = origCoordinate
+	})
+
+	var nodes []cdp.BackendNodeID
+	var points [][2]float64
+	hoverElementAction = func(ctx context.Context, backendNodeID cdp.BackendNodeID) error {
+		nodes = append(nodes, backendNodeID)
+		return nil
+	}
+	hoverCoordinateAction = func(ctx context.Context, x, y float64) error {
+		points = append(points, [2]float64{x, y})
+		return nil
+	}
+
+	tests := []struct {
+		name       string
+		config     *config.RuntimeConfig
+		req        ActionRequest
+		wantNodes  []cdp.BackendNodeID
+		wantPoints [][2]float64
+		wantHuman  bool
+	}{
+		{
+			name:      "nodeId with request opt-in",
+			config:    &config.RuntimeConfig{},
+			req:       ActionRequest{NodeID: 77, Humanize: boolPtr(true)},
+			wantNodes: []cdp.BackendNodeID{77},
+			wantHuman: true,
+		},
+		{
+			name:       "coordinates with instance default",
+			config:     &config.RuntimeConfig{Humanize: true},
+			req:        ActionRequest{HasXY: true, X: 12, Y: 34},
+			wantPoints: [][2]float64{{12, 34}},
+			wantHuman:  true,
+		},
+		{
+			name:      "explicit false opts out of the humanized path",
+			config:    &config.RuntimeConfig{Humanize: true},
+			req:       ActionRequest{NodeID: 77, Humanize: boolPtr(false)},
+			wantHuman: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes, points = nil, nil
+			b := New(context.TODO(), nil, tc.config)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			res, err := b.Actions[ActionHover](ctx, tc.req)
+
+			if tc.wantHuman {
+				if err != nil {
+					t.Fatalf("humanized hover returned error: %v", err)
+				}
+				if hovered, _ := res["hovered"].(bool); !hovered {
+					t.Fatalf("result = %#v, want hovered=true", res)
+				}
+				if human, _ := res["human"].(bool); !human {
+					t.Fatalf("result = %#v, want human=true", res)
+				}
+			} else if _, ok := res["human"]; ok {
+				t.Fatalf("raw hover result = %#v, want no human key", res)
+			}
+
+			if len(nodes) != len(tc.wantNodes) || (len(nodes) == 1 && nodes[0] != tc.wantNodes[0]) {
+				t.Fatalf("element hovers = %v, want %v", nodes, tc.wantNodes)
+			}
+			if len(points) != len(tc.wantPoints) || (len(points) == 1 && points[0] != tc.wantPoints[0]) {
+				t.Fatalf("coordinate hovers = %v, want %v", points, tc.wantPoints)
+			}
+		})
+	}
+}
+
+func TestHoverAction_HumanizedStillRequiresATarget(t *testing.T) {
+	b := New(context.TODO(), nil, &config.RuntimeConfig{Humanize: true})
+
+	_, err := b.Actions[ActionHover](context.Background(), ActionRequest{})
+	if err == nil || !strings.Contains(err.Error(), "need selector") {
+		t.Fatalf("targetless humanized hover error = %v, want the target requirement", err)
+	}
+}
+
+// Browser-backed: the selector form resolves through firstNodeBySelector, which
+// has no browserless seam, so this is where selector routing and the real
+// trail landing on the target are pinned.
+func TestHoverAction_HumanizedSelectorLandsOnTheTarget(t *testing.T) {
+	chromePath := testbrowser.Path(t)
+	alloc, cancelAlloc := chromedp.NewExecAllocator(context.Background(), append(
+		chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.ExecPath(chromePath),
+		chromedp.Flag("headless", true),
+		chromedp.Flag("no-sandbox", true),
+	)...)
+	defer cancelAlloc()
+	ctx, cancel := chromedp.NewContext(alloc)
+	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelTimeout()
+
+	html := `<style>#target { position: absolute; top: 100px; left: 100px; width: 120px; height: 40px; }</style>
+	<div id="target">hover me</div>
+	<script>
+		window.hovered = false;
+		document.getElementById("target").addEventListener("mouseover", () => window.hovered = true);
+	</script>`
+	dataURL := "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(html))
+	if err := chromedp.Run(ctx, chromedp.Navigate(dataURL)); err != nil {
+		t.Fatal(err)
+	}
+
+	b := New(context.Background(), nil, &config.RuntimeConfig{Humanize: true})
+	res, err := b.Actions[ActionHover](ctx, ActionRequest{Selector: "#target"})
+	if err != nil {
+		t.Fatalf("humanized selector hover: %v", err)
+	}
+	if human, _ := res["human"].(bool); !human {
+		t.Fatalf("result = %#v, want human=true", res)
+	}
+
+	var hovered bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`window.hovered`, &hovered)); err != nil {
+		t.Fatal(err)
+	}
+	if !hovered {
+		t.Fatal("humanized hover did not fire mouseover on the selector target")
 	}
 }

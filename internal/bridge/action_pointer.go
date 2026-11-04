@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/dom"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -16,12 +17,24 @@ var scrollByCoordinateAction = ScrollByCoordinate
 var mouseMoveByCoordinateAction = MouseMoveByCoordinate
 var mouseDownByCoordinateAction = MouseDownByCoordinate
 var mouseUpByCoordinateAction = MouseUpByCoordinate
+var clickByCoordinateAction = ClickByCoordinate
+var clickElementAction = ClickElement
+var hoverElementAction = HoverElement
+var hoverCoordinateAction = Hover
 var clickByNodeIDAction = ClickByNodeID
 var jsClickByBackendNodeAction = JSClickByBackendNode
+var dispatchClickByBackendNodeAction = JSDispatchClickByBackendNode
+var clickFloatingFlyoutItemAction = clickFloatingFlyoutItem
 var doubleClickByNodeIDAction = DoubleClickByNodeID
 var jsDoubleClickByBackendNodeAction = JSDoubleClickByBackendNode
 
-const trustedNodeClickTimeout = 100 * time.Millisecond
+// trustedNodeClickTimeout bounds each of the trusted CDP click and its JS
+// fallback. It is kept short so a dialog-blocked JS fallback cannot hang for
+// the whole action timeout, but 100ms proved too tight under heavy CPU
+// contention (e.g. many concurrent browser instances): a legitimate CDP click
+// could exceed it, fall back to JS, and time out there too, failing the
+// action. 250ms keeps the dialog-hang bound small while surviving contention.
+const trustedNodeClickTimeout = 250 * time.Millisecond
 
 func clickByNodeIDWithJSFallback(ctx context.Context, nodeID int64) error {
 	trustedCtx, cancel := context.WithTimeout(ctx, trustedNodeClickTimeout)
@@ -47,6 +60,66 @@ func clickByNodeIDWithJSFallback(ctx context.Context, nodeID int64) error {
 		return jsClickByBackendNodeAction(jsCtx, nodeID)
 	}
 	return err
+}
+
+func clickByNodeIDWithMode(ctx context.Context, nodeID int64, mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "default":
+		handled, err := clickFloatingFlyoutItemAction(ctx, nodeID)
+		if err != nil || handled {
+			return err
+		}
+		return clickByNodeIDWithJSFallback(ctx, nodeID)
+	case "dom":
+		return jsClickByBackendNodeAction(ctx, nodeID)
+	case "dispatch":
+		return dispatchClickByBackendNodeAction(ctx, nodeID)
+	default:
+		return fmt.Errorf("invalid click mode: %s", mode)
+	}
+}
+
+// clickFloatingFlyoutItem avoids DOM.scrollIntoViewIfNeeded for portal-backed
+// menu options: scrolling their floating owner can rerender and detach the node
+// before the pointer dispatch. A DOM click is intentional for this narrow role
+// and positioning combination; all other nodes retain the trusted pointer path.
+func clickFloatingFlyoutItem(ctx context.Context, nodeID int64) (handled bool, err error) {
+	err = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		node, err := dom.DescribeNode().WithBackendNodeID(cdp.BackendNodeID(nodeID)).Do(ctx)
+		if err != nil {
+			return err
+		}
+		role := strings.ToLower(strings.TrimSpace(node.AttributeValue("role")))
+		if role != "menuitem" && role != "option" {
+			return nil
+		}
+
+		object, err := dom.ResolveNode().WithBackendNodeID(cdp.BackendNodeID(nodeID)).Do(ctx)
+		if err != nil {
+			return err
+		}
+		result, exception, err := runtime.CallFunctionOn(`function() {
+			if (!this.isConnected) return false;
+			for (var el = this; el && el.nodeType === 1; el = el.parentElement) {
+				var position = getComputedStyle(el).position;
+				if (position === 'fixed' || position === 'absolute') {
+					try { this.focus({preventScroll: true}); } catch (e) {}
+					this.click();
+					return true;
+				}
+			}
+			return false;
+		}`).WithObjectID(object.ObjectID).WithReturnByValue(true).Do(ctx)
+		if err != nil {
+			return err
+		}
+		if exception != nil {
+			return exception
+		}
+		handled = string(result.Value) == "true"
+		return nil
+	}))
+	return handled, err
 }
 
 func doubleClickByNodeIDWithJSFallback(ctx context.Context, nodeID int64) error {
@@ -115,83 +188,88 @@ var scrollViewportCenter = func(ctx context.Context) (float64, float64, error) {
 	return viewport.X, viewport.Y, nil
 }
 
-// submitFormIfButton checks whether the target element is a submit button and,
-// if so, uses requestSubmit() for a single-shot submission: constraint
-// validation + submit event (so JS handlers run) + actual submission.
-// Falls back to CDP click if the element is not a submit button or on error.
-func submitFormIfButton(ctx context.Context, selector string) (bool, error) {
-	var isSubmit bool
-	err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
-		(function() {
-			var el = document.querySelector(%q);
-			if (!el) return false;
-			var tag = el.tagName.toLowerCase();
-			var type = (el.type || '').toLowerCase();
-			return (tag === 'button' && (type === 'submit' || type === '')) ||
-			       (tag === 'input' && type === 'submit');
-		})()
-	`, selector), &isSubmit))
-	if err != nil || !isSubmit {
-		return false, err
+// settle finalizes the popup auto-switch from a deferred call in the click
+// handlers: on success it adopts/focuses any opened tab and augments result; on
+// error it cancels — without restore when the error is a blocking dialog, so
+// the popup isn't torn down mid-dialog. nil-safe so handlers can defer it
+// unconditionally. Centralizes the finish/cancel branching that actionClick,
+// actionDoubleClick, and actionHumanizedClick would otherwise each copy.
+func (s *autoSwitchSession) settle(ctx context.Context, result map[string]any, err error) map[string]any {
+	if s == nil {
+		return result
 	}
-	// Fire full event chain via requestSubmit(el):
-	// - runs constraint validation
-	// - dispatches the submit event (so JS handlers like Odoo's fire)
-	// - submits the form if nothing cancels it
-	// One call, no double-fire (replaces manual dispatchEvent + form.submit).
-	var submitted bool
-	err = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
-		(function() {
-			var el = document.querySelector(%q);
-			if (!el) return false;
-			el.focus();
-			var opts = {bubbles: true, cancelable: true};
-			el.dispatchEvent(new MouseEvent('mousedown', opts));
-			el.dispatchEvent(new MouseEvent('mouseup', opts));
-			el.dispatchEvent(new MouseEvent('click', opts));
-			var form = el.closest('form');
-			if (form) { form.requestSubmit(el); }
-			return true;
-		})()
-	`, selector), &submitted))
-	return submitted, err
+	if err == nil {
+		return s.finish(ctx, result)
+	}
+	var dialogErr *ErrDialogBlocking
+	if errors.As(err, &dialogErr) {
+		s.cancelWithoutRestore()
+	} else {
+		s.cancel(ctx)
+	}
+	return result
+}
+
+// armDialogAutoHandler arms a one-shot dialog auto-handler when the request
+// names a DialogAction and the tab has a dialog manager. It returns the manager
+// (possibly nil) and whether a handler was armed. Shared by actionClick and
+// actionHumanizedClick.
+func (b *Bridge) armDialogAutoHandler(req ActionRequest) (*DialogManager, bool) {
+	dm := b.GetDialogManager()
+	if req.DialogAction != "" && req.TabID != "" && dm != nil {
+		dm.ArmAutoHandler(req.TabID, req.DialogAction, req.DialogText)
+		return dm, true
+	}
+	return dm, false
+}
+
+// dialogBlocking returns a populated *ErrDialogBlocking when a blocking dialog
+// is pending on the tab, or nil otherwise. Shared by the click handlers' dialog
+// poll loops so the pending-check and error construction stay identical.
+func dialogBlocking(dm *DialogManager, tabID string) error {
+	pending := dm.GetPending(tabID)
+	if pending == nil {
+		return nil
+	}
+	return &ErrDialogBlocking{
+		DialogType:    pending.Type,
+		DialogMessage: pending.Message,
+	}
+}
+
+// scaleScreencastCoords rescales req.X/Y from the screencast frame pixel space
+// (req.FrameW/FrameH) into the live CSS viewport. Dashboard input maps a click on
+// the frame to frame-pixel coordinates; on HiDPI the frame is larger than the CSS
+// viewport (e.g. 2x), so without this the click would land at the wrong position
+// and miss its target. No-op when FrameW/FrameH are unset (coords already CSS px).
+func scaleScreencastCoords(ctx context.Context, req *ActionRequest) {
+	if !req.HasXY || req.FrameW <= 0 || req.FrameH <= 0 {
+		return
+	}
+	vw, vh := fetchViewportSize(ctx)
+	if vw <= 0 || vh <= 0 {
+		return
+	}
+	req.X = req.X * vw / req.FrameW
+	req.Y = req.Y * vh / req.FrameH
 }
 
 func (b *Bridge) actionClick(ctx context.Context, req ActionRequest) (result map[string]any, err error) {
-	if b.effectiveHumanize(req) {
+	scaleScreencastCoords(ctx, &req)
+	if !req.Submit && b.effectiveHumanize(req) {
 		return b.actionHumanizedClick(ctx, req)
 	}
 
 	// Arm popup-aware auto-switch: if this click opens a new tab, we adopt
 	// + focus it and surface the new tab ID on the response.
 	auto := b.beginAutoSwitch(req)
-	defer func() {
-		if auto == nil {
-			return
-		}
-		if err == nil {
-			result = auto.finish(ctx, result)
-		} else {
-			var dialogErr *ErrDialogBlocking
-			if errors.As(err, &dialogErr) {
-				auto.cancelWithoutRestore()
-			} else {
-				auto.cancel(ctx)
-			}
-		}
-	}()
+	defer func() { result = auto.settle(ctx, result, err) }()
 
 	// Arm a one-shot dialog auto-handler if the caller expects the click
 	// to open a native JS dialog. Without this, the click would hang
 	// waiting for the dialog to be handled from a separate request.
-	dm := b.GetDialogManager()
-	armedDialog := false
-	if req.DialogAction != "" && req.TabID != "" && dm != nil {
-		dm.ArmAutoHandler(req.TabID, req.DialogAction, req.DialogText)
-		armedDialog = true
-	}
+	dm, armedDialog := b.armDialogAutoHandler(req)
 
-	// If no dialog-action was provided, detect blocking dialogs early and fail fast.
 	detectDialog := !armedDialog && req.TabID != "" && dm != nil
 	var clickCtx context.Context
 	var clickCancel context.CancelFunc
@@ -202,7 +280,6 @@ func (b *Bridge) actionClick(ctx context.Context, req ActionRequest) (result map
 		clickCtx = ctx
 	}
 
-	// Channel to receive click result
 	type clickResult struct {
 		err error
 	}
@@ -214,17 +291,27 @@ func (b *Bridge) actionClick(ctx context.Context, req ActionRequest) (result map
 		if auto != nil {
 			auto.prepareWindowOpenCapture(clickCtx)
 		}
-		if req.Selector != "" {
-			// For submit buttons, use requestSubmit() to fire constraint validation,
-			// JS submit handlers, and actual submission in one shot (issue #411).
-			submitted, subErr := submitFormIfButton(clickCtx, req.Selector)
-			if subErr != nil {
-				slog.Debug("submitFormIfButton failed, falling back to JS click",
-					"selector", req.Selector, "error", subErr)
-			} else if submitted {
-				resultCh <- clickResult{err: nil}
+		if req.Submit {
+			nodeID := req.NodeID
+			if nodeID == 0 && req.Selector != "" {
+				node, nodeErr := firstNodeBySelector(clickCtx, req.Selector)
+				if nodeErr != nil {
+					resultCh <- clickResult{err: nodeErr}
+					return
+				}
+				nodeID = int64(node.BackendNodeID)
+			}
+			if nodeID <= 0 {
+				resultCh <- clickResult{err: fmt.Errorf("click submit requires a selector, ref, or nodeId")}
 				return
 			}
+			if auto != nil {
+				auto.prepareNode(clickCtx, nodeID)
+			}
+			// One DOM click only. In particular, do not use the trusted-click
+			// timeout fallback: its second dispatch can double-submit a slow SPA.
+			err = jsClickByBackendNodeAction(clickCtx, nodeID)
+		} else if req.Selector != "" {
 			node, nodeErr := firstNodeBySelector(clickCtx, req.Selector)
 			if nodeErr != nil {
 				resultCh <- clickResult{err: nodeErr}
@@ -233,22 +320,21 @@ func (b *Bridge) actionClick(ctx context.Context, req ActionRequest) (result map
 			if auto != nil {
 				auto.prepareNode(clickCtx, int64(node.BackendNodeID))
 			}
-			err = clickByNodeIDWithJSFallback(clickCtx, int64(node.BackendNodeID))
+			err = clickByNodeIDWithMode(clickCtx, int64(node.BackendNodeID), req.Mode)
 		} else if req.NodeID > 0 {
 			if auto != nil {
 				auto.prepareNode(clickCtx, req.NodeID)
 			}
-			err = clickByNodeIDWithJSFallback(clickCtx, req.NodeID)
+			err = clickByNodeIDWithMode(clickCtx, req.NodeID, req.Mode)
 		} else if req.HasXY {
-			err = ClickByCoordinate(clickCtx, req.X, req.Y)
+			err = clickByCoordinateAction(clickCtx, req.X, req.Y, req.Modifiers)
 		} else {
-			resultCh <- clickResult{err: fmt.Errorf("need selector, ref, nodeId, or x/y coordinates")}
+			resultCh <- clickResult{err: NewInvalidActionRequestError("need selector, ref, nodeId, or x/y coordinates")}
 			return
 		}
 		resultCh <- clickResult{err: err}
 	}()
 
-	// Poll for blocking dialogs while click is running
 	if detectDialog {
 		ticker := time.NewTicker(dialogAutoHandlePollInterval)
 		defer ticker.Stop()
@@ -263,12 +349,9 @@ func (b *Bridge) actionClick(ctx context.Context, req ActionRequest) (result map
 				}
 				return map[string]any{"clicked": true}, nil
 			case <-ticker.C:
-				if pending := dm.GetPending(req.TabID); pending != nil {
+				if e := dialogBlocking(dm, req.TabID); e != nil {
 					clickCancel()
-					return nil, &ErrDialogBlocking{
-						DialogType:    pending.Type,
-						DialogMessage: pending.Message,
-					}
+					return nil, e
 				}
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -276,7 +359,6 @@ func (b *Bridge) actionClick(ctx context.Context, req ActionRequest) (result map
 		}
 	}
 
-	// Wait for click result (dialog-action was provided or no tab ID)
 	res := <-resultCh
 	if res.err != nil {
 		return nil, res.err
@@ -315,21 +397,7 @@ func waitForArmedDialogSettle(dm *DialogManager, tabID string, timeout time.Dura
 
 func (b *Bridge) actionDoubleClick(ctx context.Context, req ActionRequest) (result map[string]any, err error) {
 	auto := b.beginAutoSwitch(req)
-	defer func() {
-		if auto == nil {
-			return
-		}
-		if err == nil {
-			result = auto.finish(ctx, result)
-		} else {
-			var dialogErr *ErrDialogBlocking
-			if errors.As(err, &dialogErr) {
-				auto.cancelWithoutRestore()
-			} else {
-				auto.cancel(ctx)
-			}
-		}
-	}()
+	defer func() { result = auto.settle(ctx, result, err) }()
 	if req.Selector != "" {
 		node, nodeErr := firstNodeBySelector(ctx, req.Selector)
 		if nodeErr != nil {
@@ -350,7 +418,7 @@ func (b *Bridge) actionDoubleClick(ctx context.Context, req ActionRequest) (resu
 		}
 		err = DoubleClickByCoordinate(ctx, req.X, req.Y)
 	} else {
-		return nil, fmt.Errorf("need selector, ref, nodeId, or x/y coordinates")
+		return nil, NewInvalidActionRequestError("need selector, ref, nodeId, or x/y coordinates")
 	}
 	if err != nil {
 		return nil, err
@@ -359,6 +427,9 @@ func (b *Bridge) actionDoubleClick(ctx context.Context, req ActionRequest) (resu
 }
 
 func (b *Bridge) actionHover(ctx context.Context, req ActionRequest) (map[string]any, error) {
+	if b.effectiveHumanize(req) {
+		return b.actionHumanizedHover(ctx, req)
+	}
 	if req.NodeID > 0 {
 		return map[string]any{"hovered": true}, HoverByNodeID(ctx, req.NodeID)
 	}
@@ -372,7 +443,29 @@ func (b *Bridge) actionHover(ctx context.Context, req ActionRequest) (map[string
 	if req.HasXY {
 		return map[string]any{"hovered": true}, HoverByCoordinate(ctx, req.X, req.Y)
 	}
-	return nil, fmt.Errorf("need selector, ref, nodeId, or x/y coordinates")
+	return nil, NewInvalidActionRequestError("need selector, ref, nodeId, or x/y coordinates")
+}
+
+func (b *Bridge) actionHumanizedHover(ctx context.Context, req ActionRequest) (map[string]any, error) {
+	var err error
+	switch {
+	case req.NodeID > 0:
+		err = hoverElementAction(ctx, cdp.BackendNodeID(req.NodeID))
+	case req.Selector != "":
+		node, nodeErr := firstNodeBySelector(ctx, req.Selector)
+		if nodeErr != nil {
+			return nil, nodeErr
+		}
+		err = hoverElementAction(ctx, node.BackendNodeID)
+	case req.HasXY:
+		err = hoverCoordinateAction(ctx, req.X, req.Y)
+	default:
+		return nil, NewInvalidActionRequestError("need selector, ref, nodeId, or x/y coordinates")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"hovered": true, "human": true}, nil
 }
 
 func (b *Bridge) rememberPointerPosition(tabID string, x, y float64) {
@@ -401,7 +494,7 @@ func pointerTargetRequiredError(req ActionRequest, allowCurrent bool) error {
 	if allowCurrent && strings.TrimSpace(req.TabID) != "" {
 		return fmt.Errorf("no pointer position known for tab %s; move pointer first or provide selector, ref, nodeId, or x/y coordinates", req.TabID)
 	}
-	return fmt.Errorf("need selector, ref, nodeId, or x/y coordinates")
+	return NewInvalidActionRequestError("need selector, ref, nodeId, or x/y coordinates")
 }
 
 func (b *Bridge) pointerCoordinatesFromRequest(ctx context.Context, req ActionRequest, allowCurrent bool) (float64, float64, error) {
@@ -447,7 +540,7 @@ func (b *Bridge) actionMouseDown(ctx context.Context, req ActionRequest) (map[st
 	if button == "" {
 		button = "left"
 	}
-	if err := mouseDownByCoordinateAction(ctx, x, y, button); err != nil {
+	if err := mouseDownByCoordinateAction(ctx, x, y, button, req.Modifiers); err != nil {
 		return nil, err
 	}
 	b.rememberPointerPosition(req.TabID, x, y)
@@ -463,7 +556,7 @@ func (b *Bridge) actionMouseUp(ctx context.Context, req ActionRequest) (map[stri
 	if button == "" {
 		button = "left"
 	}
-	if err := mouseUpByCoordinateAction(ctx, x, y, button); err != nil {
+	if err := mouseUpByCoordinateAction(ctx, x, y, button, req.Modifiers); err != nil {
 		return nil, err
 	}
 	b.rememberPointerPosition(req.TabID, x, y)
@@ -471,6 +564,12 @@ func (b *Bridge) actionMouseUp(ctx context.Context, req ActionRequest) (map[stri
 }
 
 func (b *Bridge) actionMouseWheel(ctx context.Context, req ActionRequest) (map[string]any, error) {
+	// Resolved before the pointer target, so a request that cannot scroll is refused
+	// without reaching CDP at all.
+	deltaX, deltaY, err := wheelDelta(req)
+	if err != nil {
+		return nil, err
+	}
 	x, y, err := b.pointerCoordinatesFromRequest(ctx, req, true)
 	if err != nil {
 		if req.HasXY || req.NodeID > 0 || req.Selector != "" || req.TabID == "" {
@@ -481,23 +580,42 @@ func (b *Bridge) actionMouseWheel(ctx context.Context, req ActionRequest) (map[s
 			return nil, fmt.Errorf("resolve wheel viewport center: %w", err)
 		}
 	}
-	deltaX := req.DeltaX
-	deltaY := req.DeltaY
-	if deltaX == 0 && deltaY == 0 {
-		deltaX = req.ScrollX
-		deltaY = req.ScrollY
-	}
-	if deltaX == 0 && deltaY == 0 {
-		deltaY = 120
-	}
-	if err := scrollByCoordinateAction(ctx, x, y, deltaX, deltaY); err != nil {
+	if err := scrollByCoordinateAction(ctx, x, y, deltaX, deltaY, req.Modifiers); err != nil {
 		return nil, err
 	}
 	b.rememberPointerPosition(req.TabID, x, y)
 	return map[string]any{"wheel": true, "x": x, "y": y, "deltaX": deltaX, "deltaY": deltaY}, nil
 }
 
+const defaultScrollNotch = 120
+
+func resolveScrollDelta(x, y int, explicit bool, spelling string) (int, int, error) {
+	if x != 0 || y != 0 {
+		return x, y, nil
+	}
+	if explicit {
+		return 0, 0, fmt.Errorf("a zero delta is not a scroll: pass a non-zero %s", spelling)
+	}
+	return 0, defaultScrollNotch, nil
+}
+
+func scrollDeltaFromRequest(primaryX, primaryY, fallbackX, fallbackY int, explicit bool, spelling string) (int, int, error) {
+	if primaryX == 0 && primaryY == 0 {
+		primaryX, primaryY = fallbackX, fallbackY
+	}
+	return resolveScrollDelta(primaryX, primaryY, explicit, spelling)
+}
+
+func wheelDelta(req ActionRequest) (int, int, error) {
+	return scrollDeltaFromRequest(req.DeltaX, req.DeltaY, req.ScrollX, req.ScrollY, req.HasDelta || req.HasScroll, "deltaX/deltaY")
+}
+
+func scrollDelta(req ActionRequest) (int, int, error) {
+	return scrollDeltaFromRequest(req.ScrollX, req.ScrollY, req.DeltaX, req.DeltaY, req.HasScroll || req.HasDelta, "scrollX/scrollY, or a selector to scroll into view")
+}
+
 func (b *Bridge) actionScroll(ctx context.Context, req ActionRequest) (map[string]any, error) {
+	scaleScreencastCoords(ctx, &req)
 	if req.NodeID > 0 {
 		return map[string]any{"scrolled": true}, ScrollByNodeID(ctx, req.NodeID)
 	}
@@ -509,16 +627,14 @@ func (b *Bridge) actionScroll(ctx context.Context, req ActionRequest) (map[strin
 		return map[string]any{"scrolled": true}, ScrollByNodeID(ctx, int64(node.BackendNodeID))
 	}
 
-	scrollX := req.ScrollX
-	scrollY := req.ScrollY
-	if scrollX == 0 && scrollY == 0 {
-		scrollY = 120
+	scrollX, scrollY, err := scrollDelta(req)
+	if err != nil {
+		return nil, err
 	}
 
 	scrollTargetX := req.X
 	scrollTargetY := req.Y
 	if !req.HasXY {
-		var err error
 		scrollTargetX, scrollTargetY, err = scrollViewportCenter(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("resolve scroll viewport center: %w", err)
@@ -535,15 +651,21 @@ func (b *Bridge) actionScroll(ctx context.Context, req ActionRequest) (map[strin
 			"deltaX":  scrollX,
 			"deltaY":  scrollY,
 		},
-		scrollByCoordinateAction(ctx, scrollTargetX, scrollTargetY, scrollX, scrollY)
+		scrollByCoordinateAction(ctx, scrollTargetX, scrollTargetY, scrollX, scrollY, req.Modifiers)
 }
 
 func (b *Bridge) actionDrag(ctx context.Context, req ActionRequest) (map[string]any, error) {
+	if req.hasDragDestination() {
+		if req.DragX != 0 || req.DragY != 0 {
+			return nil, NewInvalidActionRequestError("drag takes a destination (toSelector/toNodeId/toX+toY) or an offset (dragX/dragY), not both")
+		}
+		return b.dragToDestination(ctx, req)
+	}
 	if req.DragX == 0 && req.DragY == 0 {
-		return nil, fmt.Errorf("dragX or dragY required for drag")
+		return nil, NewInvalidActionRequestError("dragX or dragY required for drag")
 	}
 	if req.NodeID > 0 {
-		err := DragByNodeID(ctx, req.NodeID, req.DragX, req.DragY)
+		err := DragByNodeID(ctx, req.NodeID, req.DragX, req.DragY, req.Button)
 		if err != nil {
 			return nil, err
 		}
@@ -554,32 +676,66 @@ func (b *Bridge) actionDrag(ctx context.Context, req ActionRequest) (map[string]
 		if err != nil {
 			return nil, err
 		}
-		err = DragByNodeID(ctx, int64(node.BackendNodeID), req.DragX, req.DragY)
+		err = DragByNodeID(ctx, int64(node.BackendNodeID), req.DragX, req.DragY, req.Button)
 		if err != nil {
 			return nil, err
 		}
 		return map[string]any{"dragged": true, "dragX": req.DragX, "dragY": req.DragY}, nil
 	}
-	return nil, fmt.Errorf("need selector, ref, or nodeId")
+	return nil, NewInvalidActionRequestError("need selector, ref, or nodeId")
+}
+
+func (b *Bridge) dragToDestination(ctx context.Context, req ActionRequest) (map[string]any, error) {
+	fromX, fromY, err := dragPointFor(ctx, dragEnd{nodeID: req.NodeID, selector: req.Selector, x: req.X, y: req.Y, hasPoint: req.HasXY})
+	if err != nil {
+		return nil, fmt.Errorf("drag source: %w", err)
+	}
+	toX, toY, err := dragPointFor(ctx, dragEnd{nodeID: req.ToNodeID, selector: req.ToSelector, x: req.ToX, y: req.ToY, hasPoint: req.HasToXY})
+	if err != nil {
+		return nil, fmt.Errorf("drag destination: %w", err)
+	}
+	if err := DragBetweenPoints(ctx, fromX, fromY, toX, toY, req.Button); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"dragged": true,
+		"fromX":   fromX,
+		"fromY":   fromY,
+		"toX":     toX,
+		"toY":     toY,
+	}, nil
+}
+
+type dragEnd struct {
+	nodeID   int64
+	selector string
+	x, y     float64
+	hasPoint bool
+}
+
+func dragPointFor(ctx context.Context, end dragEnd) (float64, float64, error) {
+	switch {
+	case end.nodeID > 0:
+		return PointerPointForNode(ctx, end.nodeID, true)
+	case end.selector != "":
+		node, err := firstNodeBySelector(ctx, end.selector)
+		if err != nil {
+			return 0, 0, err
+		}
+		return PointerPointForNode(ctx, int64(node.BackendNodeID), true)
+	case end.hasPoint:
+		return end.x, end.y, nil
+	}
+	return 0, 0, NewInvalidActionRequestError("need selector, ref, nodeId, or coordinates")
+}
+
+func (r ActionRequest) hasDragDestination() bool {
+	return r.ToNodeID > 0 || r.ToSelector != "" || r.HasToXY
 }
 
 func (b *Bridge) actionHumanizedClick(ctx context.Context, req ActionRequest) (result map[string]any, err error) {
 	auto := b.beginAutoSwitch(req)
-	defer func() {
-		if auto == nil {
-			return
-		}
-		if err == nil {
-			result = auto.finish(ctx, result)
-		} else {
-			var dialogErr *ErrDialogBlocking
-			if errors.As(err, &dialogErr) {
-				auto.cancelWithoutRestore()
-			} else {
-				auto.cancel(ctx)
-			}
-		}
-	}()
+	defer func() { result = auto.settle(ctx, result, err) }()
 	var backendNodeID cdp.BackendNodeID
 	switch {
 	case req.NodeID > 0:
@@ -597,15 +753,20 @@ func (b *Bridge) actionHumanizedClick(ctx context.Context, req ActionRequest) (r
 			auto.prepareNode(ctx, int64(node.BackendNodeID))
 		}
 	default:
-		return nil, fmt.Errorf("need selector, ref, or nodeId")
+		return nil, NewInvalidActionRequestError("need selector, ref, or nodeId")
 	}
 
+	// If the caller expects this click to open a native JS dialog, arm a
+	// one-shot auto-handler so it gets accepted/dismissed instead of leaving the
+	// renderer blocked. Without this the humanized path can only ever report
+	// dialog_blocking. Mirrors actionClick's non-humanized branch.
+	dm, armedDialog := b.armDialogAutoHandler(req)
+
 	// Run the multi-step humanized click (bezier mouse-move + press + release) in
-	// a goroutine and poll for blocking dialogs. Without this, a dialog or
-	// dialog-like popup opened by the click would hang the renderer for the
-	// full action timeout. Mirrors the wrapping used by actionClick.
-	dm := b.GetDialogManager()
-	detectDialog := req.TabID != "" && dm != nil
+	// a goroutine. When no dialog-action was provided, poll for an unexpected
+	// blocking dialog so it surfaces as ErrDialogBlocking rather than hanging the
+	// renderer for the full action timeout.
+	detectDialog := !armedDialog && req.TabID != "" && dm != nil
 	clickCtx := ctx
 	var clickCancel context.CancelFunc
 	if detectDialog {
@@ -615,7 +776,7 @@ func (b *Bridge) actionHumanizedClick(ctx context.Context, req ActionRequest) (r
 
 	resultCh := make(chan error, 1)
 	go func() {
-		resultCh <- ClickElement(clickCtx, backendNodeID)
+		resultCh <- clickElementAction(clickCtx, backendNodeID)
 	}()
 
 	if detectDialog {
@@ -629,12 +790,9 @@ func (b *Bridge) actionHumanizedClick(ctx context.Context, req ActionRequest) (r
 				}
 				return map[string]any{"clicked": true, "human": true}, nil
 			case <-ticker.C:
-				if pending := dm.GetPending(req.TabID); pending != nil {
+				if e := dialogBlocking(dm, req.TabID); e != nil {
 					clickCancel()
-					return nil, &ErrDialogBlocking{
-						DialogType:    pending.Type,
-						DialogMessage: pending.Message,
-					}
+					return nil, e
 				}
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -644,6 +802,9 @@ func (b *Bridge) actionHumanizedClick(ctx context.Context, req ActionRequest) (r
 
 	if err := <-resultCh; err != nil {
 		return nil, err
+	}
+	if armedDialog {
+		waitForArmedDialogSettle(dm, req.TabID, dialogAutoHandleTimeout)
 	}
 	return map[string]any{"clicked": true, "human": true}, nil
 }
@@ -659,5 +820,5 @@ func (b *Bridge) actionScrollIntoView(ctx context.Context, req ActionRequest) (m
 		}
 		return ScrollIntoViewAndGetBox(ctx, nid)
 	}
-	return nil, fmt.Errorf("need selector or ref")
+	return nil, NewInvalidActionRequestError("need selector or ref")
 }

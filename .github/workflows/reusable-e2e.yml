@@ -15,6 +15,10 @@ on:
       timeout_minutes:
         required: true
         type: number
+      browser:
+        required: false
+        type: string
+        default: 'chrome'
       extra_scenarios:
         required: false
         type: string
@@ -63,18 +67,18 @@ jobs:
       failures: ${{ steps.e2e.outputs.failures }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install E2E runtime deps
         run: |
@@ -107,7 +111,7 @@ jobs:
           rm -f tests/e2e/results/summary*.txt tests/e2e/results/report*.md tests/e2e/results/output*.log
 
           EXTRA="${{ inputs.extra_scenarios }}"
-          args=(e2e --suite "${{ inputs.suite }}" --logs hide)
+          args=(e2e --suite "${{ inputs.suite }}" --browser "${{ inputs.browser }}" --logs hide)
           if [ -n "$EXTRA" ]; then
             args+=(--extra "$EXTRA")
           fi
@@ -118,9 +122,9 @@ jobs:
 
       - name: Upload E2E artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: e2e-results-${{ inputs.suite }}
+          name: e2e-results-${{ inputs.suite }}-${{ inputs.browser }}
           path: |
             tests/e2e/results/
           if-no-files-found: warn

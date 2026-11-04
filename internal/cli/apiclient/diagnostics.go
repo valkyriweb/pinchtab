@@ -23,7 +23,7 @@ func CheckServerAndGuide(client *http.Client, base, token string) bool {
 			fmt.Fprintln(os.Stderr, "To start the server")
 			fmt.Fprintln(os.Stderr, "  pinchtab # Run in foreground (recommended for beginners)")
 			fmt.Fprintln(os.Stderr, "  pinchtab & # Run in background")
-			fmt.Fprintln(os.Stderr, "  PINCHTAB_PORT=9868 pinchtab # Use different port")
+			fmt.Fprintln(os.Stderr, "  pinchtab server --port 9868 # Use different port")
 			fmt.Fprintln(os.Stderr)
 			fmt.Fprintln(os.Stderr, "Then try your command again")
 			fmt.Fprintf(os.Stderr, "  %s\n", strings.Join(os.Args, " "))
@@ -31,7 +31,6 @@ func CheckServerAndGuide(client *http.Client, base, token string) bool {
 			fmt.Fprintln(os.Stderr, "Learn more: https://github.com/pinchtab/pinchtab#quick-start")
 			return false
 		}
-		// Other connection errors
 		fmt.Fprintf(os.Stderr, "Cannot connect to Pinchtab server: %v\n", err)
 		return false
 	}
@@ -43,6 +42,10 @@ func CheckServerAndGuide(client *http.Client, base, token string) bool {
 	}
 
 	if resp.StatusCode >= 400 {
+		// The read error is discarded on purpose here, unlike in the transport: this
+		// body is only interpolated into an error message the caller is already
+		// failing on, so a partial read costs a few characters of context and
+		// nothing else.
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "Server error %d: %s\n", resp.StatusCode, string(body))
 		return false
@@ -94,7 +97,6 @@ type refInfo struct {
 func extractRefs(data map[string]any) []refInfo {
 	var refs []refInfo
 
-	// Handle different snapshot formats
 	if elements, ok := data["elements"].([]any); ok {
 		for _, elem := range elements {
 			if m, ok := elem.(map[string]any); ok {

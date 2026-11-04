@@ -65,6 +65,29 @@ assert_ok "hover on button"
 end_test
 
 # ─────────────────────────────────────────────────────────────────
+start_test "HTTP: click submit dispatches once and reports terminal post-state"
+
+# The submit contract is deliberately distinct from a normal click: it must
+# dispatch only once, avoid retry/recovery, and return the observed outcome.
+pt_post /navigate -d "{\"url\":\"${FIXTURES_URL}/js-submit.html\"}"
+assert_ok "navigate submit fixture"
+
+pt_post /action -d '{"kind":"fill","selector":"#username","text":"admin"}'
+assert_ok "fill username"
+pt_post /action -d '{"kind":"fill","selector":"#password","text":"secret"}'
+assert_ok "fill password"
+pt_post /action -d '{"kind":"click","selector":"#submit-btn","submit":true}'
+assert_ok "submit click"
+assert_result_jq '.result.postState.status == "pending" and .result.postState.signal == "no_terminal_change"' \
+  "inline submit reports pending post-state" "inline submit did not report the expected pending post-state"
+
+pt_post /evaluate -d '{"expression":"document.getElementById(\"result-success\")?.textContent"}'
+assert_ok "read submit outcome"
+assert_json_eq "$RESULT" '.result' 'LOGIN_SUCCESS' "submit handler ran once"
+
+end_test
+
+# ─────────────────────────────────────────────────────────────────
 start_test "pinchtab low-level mouse actions"
 
 pt_post /navigate "{\"url\":\"${FIXTURES_URL}/mouse-events.html\"}"
@@ -113,6 +136,49 @@ assert_json_eq "$RESULT" '.result' '1' "wheel count is 1"
 pt_post /evaluate '{"expression":"window.mouseFixtureState.wheelDeltaY"}'
 assert_ok "evaluate wheel delta"
 assert_json_eq "$RESULT" '.result' '240' "wheel delta Y accumulated"
+
+end_test
+
+# ─────────────────────────────────────────────────────────────────
+start_test "pinchtab occluded click supports dom and dispatch modes"
+
+pt_post /navigate "{\"url\":\"${FIXTURES_URL}/occluded-click.html\"}"
+assert_ok "navigate"
+
+pt_get "/snapshot?filter=interactive"
+assert_ok "snapshot"
+require_ref "button" "Proceed" TARGET_REF && {
+  pt_post /action "{\"kind\":\"click\",\"ref\":\"${TARGET_REF}\"}"
+  assert_http_status "500" "occluded ref click returns action failure"
+  assert_json_contains "$RESULT" '.error' 'element is occluded' "occluded error surfaced"
+
+  pt_get "/box?ref=${TARGET_REF}"
+  assert_ok "box lookup by ref"
+  assert_result_jq '.box.width > 0 and .box.height > 0' "box returns positive dimensions" "box dimensions missing"
+
+  pt_post /action "{\"kind\":\"mouse-move\",\"ref\":\"${TARGET_REF}\"}"
+  assert_ok "mouse-move by ref yields coordinates"
+  assert_result_jq '.result.x > 0 and .result.y > 0' "mouse-move exposes positive coordinates" "mouse-move coordinates missing"
+
+  pt_post /action "{\"kind\":\"click\",\"ref\":\"${TARGET_REF}\",\"mode\":\"dom\"}"
+  assert_ok "dom mode click succeeds despite occlusion"
+
+  pt_post /evaluate '{"expression":"window.occludedClickState"}'
+  assert_ok "evaluate click state after dom mode"
+  assert_json_eq "$RESULT" '.result.clicked' 'true' "dom mode triggered click"
+  assert_json_eq "$RESULT" '.result.clicks' '1' "dom mode fired one click"
+
+  pt_post /evaluate '{"expression":"window.occludedClickState = { clicked: false, clicks: 0, lastClientX: null, lastClientY: null }; window.occludedClickState"}'
+  assert_ok "reset click state"
+
+  pt_post /action "{\"kind\":\"click\",\"ref\":\"${TARGET_REF}\",\"mode\":\"dispatch\"}"
+  assert_ok "dispatch mode click succeeds despite occlusion"
+
+  pt_post /evaluate '{"expression":"window.occludedClickState"}'
+  assert_ok "evaluate click state after dispatch mode"
+  assert_json_eq "$RESULT" '.result.clicked' 'true' "dispatch mode triggered click"
+  assert_json_eq "$RESULT" '.result.clicks' '1' "dispatch mode fired one click"
+}
 
 end_test
 
@@ -443,12 +509,6 @@ assert_not_ok "unscoped selector cannot type into cross-origin iframe"
 
 end_test
 
-# Regression test for GitHub issue #236: press action was typing key names
-# as literal text instead of dispatching keyboard events.
-
-# Use permissive instance (needs evaluate enabled)
-E2E_SERVER="http://pinchtab:9999"
-
 # ─────────────────────────────────────────────────────────────────
 start_test "press Enter: does not type 'Enter' as text"
 
@@ -629,7 +689,7 @@ end_test
 # JavaScript dialog handling via click --dialog-action
 # ─────────────────────────────────────────────────────────────────
 
-start_test "click alert without dialogAction: fast-fail with dialog_blocking error"
+start_test "click alert without dialogAction: fast-fail with dialog_blocked error"
 
 pt_post /navigate "{\"url\":\"${FIXTURES_URL}/buttons.html\"}"
 assert_ok "navigate to buttons"
@@ -637,13 +697,13 @@ assert_ok "navigate to buttons"
 pt_get /snapshot
 ALERT_REF=$(echo "$RESULT" | jq -r '[.nodes[] | select(.name == "Trigger Alert")][0].ref // empty')
 
-# Click without dialogAction should fail fast with dialog_blocking error
+# Click without dialogAction should fail fast with dialog_blocked error.
 _CLICK_T0=$(get_time_ms)
 pt_post /action "{\"kind\":\"click\",\"ref\":\"${ALERT_REF}\"}"
 _CLICK_T1=$(get_time_ms)
 
 assert_not_ok "click without dialogAction fails"
-assert_json_eq "$RESULT" '.code' 'dialog_blocking' "error code is dialog_blocking"
+assert_json_eq "$RESULT" '.code' 'dialog_blocked' "error code is dialog_blocked"
 
 # Verify fast-fail: should complete in under 2 seconds (not 30s timeout)
 _CLICK_ELAPSED=$((_CLICK_T1 - _CLICK_T0))

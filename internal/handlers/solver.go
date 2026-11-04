@@ -1,12 +1,8 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -54,24 +50,17 @@ func (h *Handlers) HandleSolve(w http.ResponseWriter, r *http.Request) {
 		Timeout     float64 `json:"timeout"`
 	}
 
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
+	if !decodeOptionalJSON(w, r, &req) {
 		return
 	}
 
-	// If a solver name is provided in the path, use it.
 	if name := r.PathValue("name"); name != "" {
 		req.Solver = name
 	}
 
-	// Validate solver name early.
-	if req.Solver != "" {
-		if !h.isAvailableAutoSolver(req.Solver) {
-			httpx.ErrorCode(w, 400, "unknown_solver",
-				fmt.Sprintf("unknown solver %q (available: %v)", req.Solver, h.availableAutoSolverNames()),
-				false, nil)
-			return
-		}
+	if req.Solver != "" && !h.isAvailableAutoSolver(req.Solver) {
+		h.rejectUnavailableSolver(w, req.Solver)
+		return
 	}
 
 	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
@@ -86,7 +75,7 @@ func (h *Handlers) HandleSolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	if _, ok := h.applyTabGuards(w, r, ctx, resolvedTabID, guardDialogBlocked|guardDomainPolicy|guardHandoffPause); !ok {
 		return
 	}
 
@@ -111,9 +100,7 @@ func (h *Handlers) HandleSolve(w http.ResponseWriter, r *http.Request) {
 		cfg.Solvers = []string{req.Solver}
 	}
 
-	// Explicit named solvers should run directly without semantic-first flow,
-	// except when the caller explicitly requested the semantic solver.
-	includeSemantic := req.Solver == "" || req.Solver == "semantic"
+	includeSemantic := req.Solver == "" || req.Solver == coreautosolver.SemanticSolverName
 	as := h.buildAutoSolver(cfg, includeSemantic)
 
 	timeout := 30 * time.Second
@@ -140,9 +127,7 @@ func (h *Handlers) HandleSolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Re-check domain policy after solve — the page may have redirected
-	// to a different domain once the challenge was resolved.
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	if _, ok := h.applyTabGuards(w, r, ctx, resolvedTabID, guardDomainPolicy); !ok {
 		return
 	}
 
@@ -183,32 +168,9 @@ func (h *Handlers) HandleSolve(w http.ResponseWriter, r *http.Request) {
 // @Endpoint POST /tabs/{id}/solve
 // @Description Solve a browser challenge on a specific tab
 func (h *Handlers) HandleTabSolve(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("tab id required"))
-		return
-	}
-
-	body := map[string]any{}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize))
-	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
-		return
-	}
-
-	body["tabId"] = tabID
-	payload, err := json.Marshal(body)
-	if err != nil {
-		httpx.Error(w, 500, fmt.Errorf("encode: %w", err))
-		return
-	}
-
-	cloned := r.Clone(r.Context())
-	cloned.Body = io.NopCloser(bytes.NewReader(payload))
-	cloned.ContentLength = int64(len(payload))
-	cloned.Header = r.Header.Clone()
-	cloned.Header.Set("Content-Type", "application/json")
-	h.HandleSolve(w, cloned)
+	// Reject (not silently overwrite) a body tabId that disagrees with the
+	// path id; the path id is canonical and forwarded to HandleSolve.
+	h.withPathTabIDBody(w, r, h.HandleSolve)
 }
 
 // HandleListSolvers returns the list of registered solver names.
@@ -255,6 +217,23 @@ func (h *Handlers) HandleAutoSolverConfig(w http.ResponseWriter, r *http.Request
 		"llmProvider":       llmProvider,
 		"llmFallback":       cfg.LLMFallback,
 	})
+}
+
+// rejectUnavailableSolver distinguishes the two reasons a named solver cannot
+// run. A key-gated solver reaching here is always a keyless one — with its key
+// set it would be available — so it gets its own code and names the config key,
+// rather than being reported as a typo. Config validation deliberately accepts
+// the same name without its key; see docs/endpoints.md.
+func (h *Handlers) rejectUnavailableSolver(w http.ResponseWriter, name string) {
+	if gated, ok := coreautosolver.KeyGatedSolverNamed(name); ok {
+		httpx.ErrorCode(w, 400, "solver_key_missing",
+			fmt.Sprintf("solver %q is configured but its API key is not set; set %s to use it", gated.Name, gated.ConfigKey),
+			false, nil)
+		return
+	}
+	httpx.ErrorCode(w, 400, "unknown_solver",
+		fmt.Sprintf("unknown solver %q (available: %v)", name, h.availableAutoSolverNames()),
+		false, nil)
 }
 
 func deriveChallengeType(result *coreautosolver.Result, page coreautosolver.Page) string {

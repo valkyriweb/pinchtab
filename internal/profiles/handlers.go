@@ -1,22 +1,69 @@
 package profiles
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strconv"
-	"strings"
+	"time"
 
 	"github.com/pinchtab/pinchtab/internal/authn"
+	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 )
+
+type profileResponse struct {
+	ID                string    `json:"id"`
+	Name              string    `json:"name"`
+	Path              string    `json:"path"`
+	PathExists        bool      `json:"pathExists"`
+	Created           time.Time `json:"created"`
+	LastUsed          time.Time `json:"lastUsed"`
+	DiskUsage         int64     `json:"diskUsage"`
+	SizeMB            float64   `json:"sizeMB"`
+	Running           bool      `json:"running"`
+	Quarantined       bool      `json:"quarantined"`
+	Temporary         bool      `json:"temporary"`
+	Source            string    `json:"source"`
+	ChromeProfileName string    `json:"chromeProfileName"`
+	AccountEmail      string    `json:"accountEmail"`
+	AccountName       string    `json:"accountName"`
+	HasAccount        bool      `json:"hasAccount"`
+	UseWhen           string    `json:"useWhen"`
+	Description       string    `json:"description"`
+}
+
+func newProfileResponse(p bridge.ProfileInfo) profileResponse {
+	return profileResponse{
+		ID:                p.ID,
+		Name:              p.Name,
+		Path:              p.Path,
+		PathExists:        p.PathExists,
+		Created:           p.Created,
+		LastUsed:          p.LastUsed,
+		DiskUsage:         p.DiskUsage,
+		SizeMB:            float64(p.DiskUsage) / (1024 * 1024),
+		Running:           p.Running,
+		Quarantined:       p.Quarantined,
+		Temporary:         p.Temporary,
+		Source:            p.Source,
+		ChromeProfileName: p.ChromeProfileName,
+		AccountEmail:      p.AccountEmail,
+		AccountName:       p.AccountName,
+		HasAccount:        p.HasAccount,
+		UseWhen:           p.UseWhen,
+		Description:       p.Description,
+	}
+}
 
 func profileMutationStatus(err error) int {
 	switch {
 	case err == nil:
 		return http.StatusOK
-	case isProfileNameValidationError(err):
+	case errors.Is(err, ErrInvalidProfileName):
 		return http.StatusBadRequest
-	case strings.Contains(err.Error(), "already exists"):
+	case errors.Is(err, ErrProfileExists), errors.Is(err, ErrProfileDirExists), errors.Is(err, ErrProfileInUse):
 		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
@@ -30,6 +77,7 @@ func (pm *ProfileManager) RegisterHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("GET /profiles/{id}", pm.handleGetByID)
 
 	mux.HandleFunc("POST /profiles/import", pm.handleImport)
+	mux.HandleFunc("POST /profiles/prune", pm.handlePruneQuarantined)
 	mux.HandleFunc("PATCH /profiles/meta", pm.handleUpdateMeta)
 	mux.HandleFunc("POST /profiles/{id}/reset", pm.handleResetByIDOrName)
 	mux.HandleFunc("GET /profiles/{id}/logs", pm.handleLogsByIDOrName)
@@ -45,37 +93,20 @@ func (pm *ProfileManager) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One shape for both branches. all=true used to serve bridge.ProfileInfo directly, so
+	// the only listing that CAN contain a temporary profile was also the only one missing
+	// the fields the response type declares (sizeMB among them) — which is how a client
+	// reading `temporary` could never see it: absent from the filtered branch by design,
+	// and absent from the response shape in the other.
 	showAll := r.URL.Query().Get("all") == "true"
-	if !showAll {
-		filtered := []map[string]any{}
-		for _, p := range profiles {
-			if !p.Temporary {
-				sizeMB := float64(p.DiskUsage) / (1024 * 1024)
-				filtered = append(filtered, map[string]any{
-					"id":                p.ID,
-					"name":              p.Name,
-					"path":              p.Path,
-					"pathExists":        p.PathExists,
-					"created":           p.Created,
-					"lastUsed":          p.LastUsed,
-					"diskUsage":         p.DiskUsage,
-					"sizeMB":            sizeMB,
-					"running":           p.Running,
-					"source":            p.Source,
-					"chromeProfileName": p.ChromeProfileName,
-					"accountEmail":      p.AccountEmail,
-					"accountName":       p.AccountName,
-					"hasAccount":        p.HasAccount,
-					"useWhen":           p.UseWhen,
-					"description":       p.Description,
-				})
-			}
+	out := []profileResponse{}
+	for _, p := range profiles {
+		if !showAll && p.Temporary {
+			continue
 		}
-		httpx.JSON(w, 200, filtered)
-		return
+		out = append(out, newProfileResponse(p))
 	}
-
-	httpx.JSON(w, 200, profiles)
+	httpx.JSON(w, 200, out)
 }
 
 func (pm *ProfileManager) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -181,37 +212,96 @@ func (pm *ProfileManager) handleGetByID(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var foundProfile map[string]any
-
 	for _, p := range profiles {
 		if p.ID != id && p.Name != id {
 			continue
 		}
-		foundProfile = map[string]any{
-			"id":                p.ID,
-			"name":              p.Name,
-			"path":              p.Path,
-			"pathExists":        p.PathExists,
-			"created":           p.Created,
-			"diskUsage":         p.DiskUsage,
-			"sizeMB":            float64(p.DiskUsage) / (1024 * 1024),
-			"source":            p.Source,
-			"chromeProfileName": p.ChromeProfileName,
-			"accountEmail":      p.AccountEmail,
-			"accountName":       p.AccountName,
-			"hasAccount":        p.HasAccount,
-			"useWhen":           p.UseWhen,
-			"description":       p.Description,
-		}
-		break
-	}
-
-	if foundProfile == nil {
-		httpx.Error(w, 404, fmt.Errorf("profile %q not found", id))
+		httpx.JSON(w, 200, newProfileResponse(p))
 		return
 	}
 
-	httpx.JSON(w, 200, foundProfile)
+	httpx.Error(w, 404, fmt.Errorf("profile %q not found", id))
+}
+
+type pruneQuarantinedRequest struct {
+	Profile string `json:"profile"`
+	Confirm bool   `json:"confirm"`
+}
+
+// handlePruneQuarantined reclaims quarantine backlog on demand. It is destructive only
+// on an explicit confirm: without one it answers what it WOULD remove, because an agent
+// piping this command must not free disk by accident.
+//
+// It reaches bridge's quarantine deleter, never pm.Delete: that one resolves a name
+// through the profile listing and removes whatever it finds with no eligibility rule, so
+// routing a reclaim through it would make this a second, looser way to remove a live
+// profile. TestReclaimNeverReachesTheUnguardedProfileDeleter holds that.
+func (pm *ProfileManager) handlePruneQuarantined(w http.ResponseWriter, r *http.Request) {
+	req, err := decodePruneRequest(w, r)
+	if err != nil {
+		httpx.Error(w, httpx.StatusForJSONDecodeError(err), err)
+		return
+	}
+
+	if !req.Confirm {
+		reclaimable, err := bridge.ReclaimableQuarantinedProfiles(pm.baseDir, req.Profile)
+		if err != nil {
+			httpx.Error(w, 400, err)
+			return
+		}
+		httpx.JSON(w, 200, quarantineReclaimResponse(reclaimable, false))
+		return
+	}
+
+	removed, err := bridge.ReclaimQuarantinedProfiles(pm.baseDir, req.Profile)
+	if err != nil {
+		httpx.Error(w, 400, err)
+		return
+	}
+	authn.AuditLog(r, "profiles.quarantine.reclaimed", "count", len(removed), "bytes", totalReclaimedBytes(removed))
+	httpx.JSON(w, 200, quarantineReclaimResponse(removed, true))
+}
+
+// decodePruneRequest accepts the selection from the body or the query string, and treats
+// an absent body as the bare invocation rather than a malformed one — the dry run is what
+// a caller sending nothing is asking for.
+func decodePruneRequest(w http.ResponseWriter, r *http.Request) (pruneQuarantinedRequest, error) {
+	var req pruneQuarantinedRequest
+	if err := httpx.DecodeOptionalJSONBody(w, r, 0, &req); err != nil {
+		return req, err
+	}
+	if req.Profile == "" {
+		req.Profile = r.URL.Query().Get("profile")
+	}
+	if r.URL.Query().Get("confirm") == "true" {
+		req.Confirm = true
+	}
+	return req, nil
+}
+
+func quarantineReclaimResponse(removals []bridge.QuarantineRemoval, removed bool) map[string]any {
+	profiles := make([]map[string]any, 0, len(removals))
+	for _, removal := range removals {
+		profiles = append(profiles, map[string]any{
+			"name":  filepath.Base(removal.Path),
+			"path":  removal.Path,
+			"bytes": removal.Bytes,
+		})
+	}
+	return map[string]any{
+		"removed":    removed,
+		"count":      len(removals),
+		"totalBytes": totalReclaimedBytes(removals),
+		"profiles":   profiles,
+	}
+}
+
+func totalReclaimedBytes(removals []bridge.QuarantineRemoval) int64 {
+	var total int64
+	for _, removal := range removals {
+		total += removal.Bytes
+	}
+	return total
 }
 
 func (pm *ProfileManager) handleDeleteByID(w http.ResponseWriter, r *http.Request) {
@@ -223,8 +313,23 @@ func (pm *ProfileManager) handleDeleteByID(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if r.URL.Query().Get("force") == "true" {
+		orphaned, err := pm.ForceDelete(name)
+		if err != nil {
+			httpx.Error(w, profileMutationStatus(err), err)
+			return
+		}
+		authn.AuditLog(r, "profile.deleted", "profileId", id, "profileName", name, "force", "true", "orphanedInstance", orphaned)
+		resp := map[string]any{"status": "deleted", "id": id, "name": name}
+		if orphaned != "" {
+			resp["orphanedInstance"] = orphaned
+		}
+		httpx.JSON(w, 200, resp)
+		return
+	}
+
 	if err := pm.Delete(name); err != nil {
-		httpx.Error(w, 500, err)
+		httpx.Error(w, profileMutationStatus(err), err)
 		return
 	}
 
@@ -265,7 +370,7 @@ func (pm *ProfileManager) handleUpdateByID(w http.ResponseWriter, r *http.Reques
 		Description *string `json:"description"`
 	}
 	if err := httpx.DecodeJSONBody(w, r, 0, &req); err != nil {
-		httpx.Error(w, httpx.StatusForJSONDecodeError(err), fmt.Errorf("invalid JSON"))
+		httpx.Error(w, httpx.StatusForJSONDecodeError(err), err)
 		return
 	}
 
@@ -305,7 +410,7 @@ func (pm *ProfileManager) handleResetByIDOrName(w http.ResponseWriter, r *http.R
 	}
 
 	if err := pm.Reset(name); err != nil {
-		httpx.Error(w, 500, err)
+		httpx.Error(w, profileMutationStatus(err), err)
 		return
 	}
 	authn.AuditLog(r, "profile.reset", "profileId", id, "profileName", name)

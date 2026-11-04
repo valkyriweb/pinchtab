@@ -2,14 +2,12 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/chromedp/cdproto/emulation"
-	"github.com/chromedp/chromedp"
 	"github.com/pinchtab/pinchtab/internal/activity"
+	"github.com/pinchtab/pinchtab/internal/bridge"
 	"github.com/pinchtab/pinchtab/internal/httpx"
 )
 
@@ -24,9 +22,8 @@ type viewportRequest struct {
 // HandleSetViewport sets the browser viewport dimensions via CDP emulation.
 // POST /emulation/viewport
 func (h *Handlers) HandleSetViewport(w http.ResponseWriter, r *http.Request) {
-	var req viewportRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
+	req, ok := decodeJSONBody[viewportRequest](w, r)
+	if !ok {
 		return
 	}
 
@@ -36,20 +33,12 @@ func (h *Handlers) HandleSetViewport(w http.ResponseWriter, r *http.Request) {
 // HandleTabSetViewport sets the browser viewport dimensions for a specific tab.
 // POST /tabs/{id}/emulation/viewport
 func (h *Handlers) HandleTabSetViewport(w http.ResponseWriter, r *http.Request) {
-	tabID := r.PathValue("id")
-	if tabID == "" {
-		httpx.Error(w, 400, fmt.Errorf("missing tab ID"))
+	req, ok := decodeJSONBody[viewportRequest](w, r)
+	if !ok {
 		return
 	}
-
-	var req viewportRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodySize)).Decode(&req); err != nil {
-		httpx.Error(w, 400, fmt.Errorf("decode: %w", err))
-		return
-	}
-
-	if req.TabID != "" && req.TabID != tabID {
-		httpx.Error(w, 400, fmt.Errorf("tabId in body %q does not match URL path %q", req.TabID, tabID))
+	tabID, ok := h.requirePathTabIDMatch(w, r, req.TabID)
+	if !ok {
 		return
 	}
 	req.TabID = tabID
@@ -67,29 +56,20 @@ func (h *Handlers) setViewport(w http.ResponseWriter, r *http.Request, req viewp
 		req.DeviceScaleFactor = 1.0
 	}
 
-	ctx, resolvedTabID, err := h.tabContext(r, req.TabID)
-	if err != nil {
-		WriteTabContextError(w, err, 404)
-		return
-	}
-	if _, ok := h.enforceCurrentTabDomainPolicy(w, r, ctx, resolvedTabID); !ok {
+	ctx, resolvedTabID, ok := h.guardedTabContext(w, r, req.TabID, guardDialogBlocked|guardDomainPolicy|guardHandoffPause)
+	if !ok {
 		return
 	}
 
 	tCtx, tCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer tCancel()
 
-	if err := chromedp.Run(tCtx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			if err := emulation.SetDeviceMetricsOverride(int64(req.Width), int64(req.Height), req.DeviceScaleFactor, req.Mobile).
-				WithScreenWidth(int64(req.Width)).
-				WithScreenHeight(int64(req.Height)).
-				Do(ctx); err != nil {
-				return fmt.Errorf("setDeviceMetricsOverride: %w", err)
-			}
-			return nil
-		}),
-	); err != nil {
+	if err := h.Bridge.SetViewport(tCtx, bridge.ViewportParams{
+		Width:             int64(req.Width),
+		Height:            int64(req.Height),
+		DeviceScaleFactor: req.DeviceScaleFactor,
+		Mobile:            req.Mobile,
+	}); err != nil {
 		httpx.Error(w, 500, fmt.Errorf("CDP viewport override: %w", err))
 		return
 	}
